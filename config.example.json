@@ -1,0 +1,15 @@
+{
+  "event_queue_size": 1000,
+  "max_concurrent_tasks": 5,
+  "task_timeout_seconds": 300,
+  "sandbox_enabled": true,
+  "sandbox_memory_limit_mb": 256,
+  "sandbox_cpu_timeout": 60,
+  "auto_approve": true,
+  "http_host": "0.0.0.0",
+  "http_port": 8900,
+  "llm_provider": "spark",
+  "llm_api_key": "YOUR_API_KEY_HERE",
+  "llm_model": "generalv3.5",
+  "llm_base_url": "https://spark-api-open.xf-yun.com/v1"
+}

@@ -1,0 +1,13 @@
+{
+  "name": "git_helper",
+  "version": "1.0.0",
+  "description": "Git 操作助手：查看日志、diff 总结、分支管理",
+  "trigger_words": ["git", "提交", "分支", "日志", "diff", "commit", "branch"],
+  "aliases": ["git助手", "代码助手"],
+  "intent_tags": ["development", "utility"],
+  "risk_level": "low",
+  "requires_approval": false,
+  "timeout_seconds": 30,
+  "entry": "main.py",
+  "permissions": ["subprocess"]
+}

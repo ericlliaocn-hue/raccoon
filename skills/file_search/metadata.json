@@ -1,0 +1,13 @@
+{
+  "name": "file_search",
+  "version": "1.0.0",
+  "description": "搜索本地文件并推送给用户，支持按关键词、扩展名、时间范围检索",
+  "trigger_words": ["找文件", "搜索文件", "查找文件", "找一下", "搜一下", "find file", "search file"],
+  "aliases": ["文件搜索", "搜索"],
+  "intent_tags": ["file", "search"],
+  "risk_level": "low",
+  "requires_approval": false,
+  "timeout_seconds": 30,
+  "entry": "main.py",
+  "permissions": []
+}

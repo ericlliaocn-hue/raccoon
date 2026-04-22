@@ -1,0 +1,13 @@
+{
+  "name": "clipboard",
+  "version": "1.0.0",
+  "description": "读写剪贴板内容（macOS：pbcopy/pbpaste）",
+  "trigger_words": ["剪贴板", "粘贴板", "复制到剪贴板", "读取剪贴板", "剪贴板内容", "clipboard", "粘贴内容", "复制内容"],
+  "aliases": ["粘贴板"],
+  "intent_tags": ["clipboard", "utility"],
+  "risk_level": "medium",
+  "requires_approval": false,
+  "timeout_seconds": 10,
+  "entry": "main.py",
+  "permissions": ["clipboard_read", "clipboard_write"]
+}

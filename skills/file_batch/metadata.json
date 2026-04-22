@@ -1,0 +1,13 @@
+{
+  "name": "file_batch",
+  "version": "1.0.0",
+  "description": "批量文件操作：重命名、压缩、格式转换、归类整理",
+  "trigger_words": ["批量", "重命名", "压缩", "归类", "整理", "batch", "rename", "zip"],
+  "aliases": ["批量操作", "文件批量"],
+  "intent_tags": ["filesystem", "utility"],
+  "risk_level": "medium",
+  "requires_approval": true,
+  "timeout_seconds": 120,
+  "entry": "main.py",
+  "permissions": ["filesystem"]
+}

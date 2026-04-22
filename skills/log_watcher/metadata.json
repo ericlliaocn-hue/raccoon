@@ -1,0 +1,13 @@
+{
+  "name": "log_watcher",
+  "version": "1.0.0",
+  "description": "日志监控：tail 日志文件，关键词匹配，异常检测",
+  "trigger_words": ["日志", "监控", "tail", "log", "watch"],
+  "aliases": ["日志监控"],
+  "intent_tags": ["monitor", "development"],
+  "risk_level": "low",
+  "requires_approval": false,
+  "timeout_seconds": 30,
+  "entry": "main.py",
+  "permissions": ["filesystem"]
+}

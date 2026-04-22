@@ -1,0 +1,13 @@
+{
+  "name": "web_browse",
+  "version": "1.0.0",
+  "description": "打开网页/获取网页标题和摘要",
+  "trigger_words": ["打开网页", "访问网页", "打开网站", "打开链接", "浏览网页", "open url", "open website", "访问链接", "打开url"],
+  "aliases": ["网页浏览", "浏览"],
+  "intent_tags": ["web", "browse"],
+  "risk_level": "low",
+  "requires_approval": false,
+  "timeout_seconds": 15,
+  "entry": "main.py",
+  "permissions": []
+}

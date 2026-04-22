@@ -1,0 +1,13 @@
+{
+  "name": "screenshot",
+  "version": "1.0.0",
+  "description": "截取屏幕截图并推送给用户（macOS）",
+  "trigger_words": ["截图", "截屏", "屏幕截图", "截个图", "截一下", "screenshot", "抓屏"],
+  "aliases": ["截屏"],
+  "intent_tags": ["screen", "capture"],
+  "risk_level": "medium",
+  "requires_approval": true,
+  "timeout_seconds": 10,
+  "entry": "main.py",
+  "permissions": ["screen_capture"]
+}

@@ -1,0 +1,13 @@
+{
+  "name": "system_info",
+  "version": "1.0.0",
+  "description": "查看系统信息：CPU/内存/磁盘/进程/网络/系统版本等",
+  "trigger_words": ["系统信息", "电脑状态", "内存使用", "CPU使用", "磁盘空间", "进程列表", "系统状态", "电脑信息", "系统监控", "内存占用", "磁盘占用"],
+  "aliases": ["系统", "电脑信息"],
+  "intent_tags": ["system", "monitor"],
+  "risk_level": "low",
+  "requires_approval": false,
+  "timeout_seconds": 15,
+  "entry": "main.py",
+  "permissions": []
+}

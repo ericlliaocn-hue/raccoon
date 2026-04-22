@@ -1,0 +1,574 @@
+#!/usr/bin/env python3
+"""浣熊 (Project Raccoon) CLI 入口
+
+命令：
+  raccoon                          # CLI 交互模式（前台）
+  raccoon --http                   # HTTP Web UI 模式（前台）
+  raccoon start                    # 后台启动
+  raccoon stop                     # 停止
+  raccoon restart                  # 重启
+  raccoon status                   # 查看运行状态
+  raccoon update                   # 自更新
+  raccoon config [get|set|list]    # 配置管理
+  raccoon skills [list|install|uninstall|info]  # Skill 管理
+  raccoon logs                     # 查看日志
+  raccoon doctor                   # 诊断检查
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# 确保项目根目录在 sys.path
+PROJECT_ROOT = Path(__file__).resolve().parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="🦝 浣熊 - 事件驱动的 AI 智能体框架",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    sub = parser.add_subparsers(dest="command", help="子命令")
+
+    # ─── start ────────────────────────────────────────────────
+    p_start = sub.add_parser("start", help="后台启动 Raccoon")
+    p_start.add_argument("--host", default="0.0.0.0", help="监听地址")
+    p_start.add_argument("--port", type=int, default=8900, help="监听端口")
+    p_start.add_argument("--cli", action="store_true", help="以 CLI 模式启动（默认 HTTP）")
+
+    # ─── stop ─────────────────────────────────────────────────
+    sub.add_parser("stop", help="停止后台 Raccoon")
+
+    # ─── restart ──────────────────────────────────────────────
+    p_restart = sub.add_parser("restart", help="重启后台 Raccoon")
+    p_restart.add_argument("--host", default="0.0.0.0", help="监听地址")
+    p_restart.add_argument("--port", type=int, default=8900, help="监听端口")
+    p_restart.add_argument("--cli", action="store_true", help="以 CLI 模式重启")
+
+    # ─── status ───────────────────────────────────────────────
+    sub.add_parser("status", help="查看运行状态")
+
+    # ─── update ───────────────────────────────────────────────
+    p_update = sub.add_parser("update", help="自更新 Raccoon")
+    p_update.add_argument("--version", default=None, help="指定版本号（默认最新）")
+    p_update.add_argument("--check", action="store_true", help="仅检查是否有新版本")
+
+    # ─── config ───────────────────────────────────────────────
+    p_config = sub.add_parser("config", help="配置管理")
+    p_config.add_argument("action", nargs="?", default="list", choices=["list", "get", "set"], help="操作")
+    p_config.add_argument("key", nargs="?", default=None, help="配置键")
+    p_config.add_argument("value", nargs="?", default=None, help="配置值（set 时需要）")
+
+    # ─── skills ───────────────────────────────────────────────
+    p_skills = sub.add_parser("skills", help="Skill 管理")
+    p_skills.add_argument("action", nargs="?", default="list", choices=["list", "install", "uninstall", "info"], help="操作")
+    p_skills.add_argument("target", nargs="?", default=None, help="Skill 名称或安装源")
+    p_skills.add_argument("--force", action="store_true", help="强制安装（跳过冲突检测）")
+
+    # ─── logs ─────────────────────────────────────────────────
+    p_logs = sub.add_parser("logs", help="查看运行日志")
+    p_logs.add_argument("-n", "--lines", type=int, default=50, help="显示行数")
+    p_logs.add_argument("-f", "--follow", action="store_true", help="持续跟踪")
+    p_logs.add_argument("--audit", action="store_true", help="查看审计日志")
+
+    # ─── doctor ───────────────────────────────────────────────
+    sub.add_parser("doctor", help="诊断检查")
+
+    # ─── schedule ─────────────────────────────────────────────
+    p_schedule = sub.add_parser("schedule", help="定时任务管理")
+    p_schedule.add_argument("action", nargs="?", default="list", choices=["list", "add", "remove", "toggle"], help="操作")
+    p_schedule.add_argument("--name", default=None, help="任务名称（add 时需要）")
+    p_schedule.add_argument("--cron", default=None, help="cron 表达式，如 '0 8 * * *'")
+    p_schedule.add_argument("--message", default=None, help="触发时发送的消息")
+    p_schedule.add_argument("--id", default=None, dest="schedule_id", help="任务 ID（remove/toggle 时需要）")
+
+    # ─── 前台模式参数 ─────────────────────────────────────────
+    parser.add_argument("--http", action="store_true", help="前台启动 HTTP 模式")
+    parser.add_argument("--host", default="0.0.0.0", help="监听地址")
+    parser.add_argument("--port", type=int, default=8900, help="监听端口")
+
+    args = parser.parse_args()
+
+    # 分发
+    dispatch = {
+        "start": lambda: _cmd_start(args),
+        "stop": _cmd_stop,
+        "restart": lambda: _cmd_restart(args),
+        "status": _cmd_status,
+        "update": lambda: _cmd_update(args),
+        "config": lambda: _cmd_config(args),
+        "skills": lambda: _cmd_skills(args),
+        "logs": lambda: _cmd_logs(args),
+        "doctor": _cmd_doctor,
+        "schedule": lambda: _cmd_schedule(args),
+    }
+
+    fn = dispatch.get(args.command)
+    if fn:
+        fn()
+    elif args.http:
+        _run_http(args.host, args.port)
+    else:
+        _run_cli()
+
+
+# ═══════════════════════════════════════════════════════════════
+# 子命令实现
+# ═══════════════════════════════════════════════════════════════
+
+def _cmd_start(args) -> None:
+    from src.daemon import start
+    ok = start(http=not args.cli, host=args.host, port=args.port)
+    sys.exit(0 if ok else 1)
+
+
+def _cmd_stop() -> None:
+    from src.daemon import stop
+    ok = stop()
+    sys.exit(0 if ok else 1)
+
+
+def _cmd_restart(args) -> None:
+    from src.daemon import restart
+    ok = restart(http=not args.cli, host=args.host, port=args.port)
+    sys.exit(0 if ok else 1)
+
+
+def _cmd_status() -> None:
+    from src.daemon import status
+    st = status()
+    if st["running"]:
+        print(f"🦝 Raccoon 运行中")
+        print(f"   PID:   {st['pid']}")
+        print(f"   模式:  {st['mode']}")
+        print(f"   时长:  {st['uptime']}")
+    else:
+        print("🦝 Raccoon 未运行")
+
+
+def _cmd_update(args) -> None:
+    """自更新"""
+    current = _get_version()
+
+    if args.check:
+        latest = _get_latest_version()
+        if latest is None:
+            print("❌ 无法检查新版本")
+            sys.exit(1)
+        if latest == current:
+            print(f"✅ 已是最新版本 ({current})")
+        else:
+            print(f"🔄 有新版本可用: {current} → {latest}")
+            print(f"   运行 `raccoon update` 更新")
+        return
+
+    # 执行更新
+    print(f"🦝 当前版本: {current}")
+    print("🔄 正在更新...")
+
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--upgrade", "raccoon"],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode == 0:
+            new_ver = _get_version()
+            print(f"✅ 更新完成: {current} → {new_ver}")
+        else:
+            print(f"❌ 更新失败:\n{result.stderr}")
+            sys.exit(1)
+    except subprocess.TimeoutExpired:
+        print("❌ 更新超时")
+        sys.exit(1)
+
+
+def _cmd_config(args) -> None:
+    """配置管理"""
+    from src.config import load_config, PROJECT_ROOT
+
+    config_path = PROJECT_ROOT / "config.json"
+
+    if args.action == "list":
+        config = load_config()
+        data = config.model_dump()
+        for k, v in sorted(data.items()):
+            # 隐藏敏感字段
+            if "api_key" in k or "secret" in k:
+                v = "***" + str(v)[-4:] if len(str(v)) > 4 else "***"
+            print(f"  {k} = {v}")
+
+    elif args.action == "get":
+        if not args.key:
+            print("❌ 请指定配置键: raccoon config get <key>")
+            sys.exit(1)
+        config = load_config()
+        val = getattr(config, args.key, None)
+        if val is None:
+            print(f"❌ 未知配置键: {args.key}")
+            sys.exit(1)
+        if "api_key" in args.key or "secret" in args.key:
+            val = "***" + str(val)[-4:] if len(str(val)) > 4 else "***"
+        print(f"{args.key} = {val}")
+
+    elif args.action == "set":
+        if not args.key or args.value is None:
+            print("❌ 用法: raccoon config set <key> <value>")
+            sys.exit(1)
+
+        # 读取现有配置
+        if config_path.exists():
+            with open(config_path) as f:
+                data = json.load(f)
+        else:
+            data = {}
+
+        # 类型转换
+        value = args.value
+        if value.lower() == "true":
+            value = True
+        elif value.lower() == "false":
+            value = False
+        elif value.isdigit():
+            value = int(value)
+        else:
+            try:
+                value = float(value)
+            except ValueError:
+                pass
+
+        data[args.key] = value
+        with open(config_path, "w") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+        print(f"✅ {args.key} = {value}")
+
+
+def _cmd_skills(args) -> None:
+    """Skill 管理"""
+    from src.config import RaccoonConfig
+    from src.skill_vault.vault_manager import VaultManager
+
+    config = RaccoonConfig()
+    vault = VaultManager(config)
+
+    if args.action == "list":
+        skills = vault.list_skills()
+        if not skills:
+            print("  (无已安装的 Skill)")
+            return
+        print(f"已安装 {len(skills)} 个 Skill:\n")
+        for s in sorted(skills, key=lambda x: x.name):
+            print(f"  📦 {s.name:<16} v{s.version:<8} {s.description}")
+
+    elif args.action == "install":
+        if not args.target:
+            print("❌ 用法: raccoon skills install <git-url|local-path>")
+            sys.exit(1)
+        print(f"🔄 正在安装: {args.target}")
+        try:
+            meta = asyncio.run(vault.install(args.target))
+            print(f"✅ 安装成功: {meta.name} v{meta.version}")
+        except Exception as e:
+            print(f"❌ 安装失败: {e}")
+            sys.exit(1)
+
+    elif args.action == "uninstall":
+        if not args.target:
+            print("❌ 用法: raccoon skills uninstall <skill-name>")
+            sys.exit(1)
+        try:
+            vault.uninstall(args.target)
+            print(f"✅ 已卸载: {args.target}")
+        except KeyError as e:
+            print(f"❌ {e}")
+            sys.exit(1)
+
+    elif args.action == "info":
+        if not args.target:
+            print("❌ 用法: raccoon skills info <skill-name>")
+            sys.exit(1)
+        meta = vault.get_skill(args.target)
+        if not meta:
+            print(f"❌ Skill 不存在: {args.target}")
+            sys.exit(1)
+        print(f"  名称:     {meta.name}")
+        print(f"  版本:     {meta.version}")
+        print(f"  描述:     {meta.description}")
+        print(f"  入口:     {meta.entry}")
+        triggers = ", ".join(meta.triggers) if meta.triggers else "(无)"
+        print(f"  触发词:   {triggers}")
+        print(f"  参数:     {json.dumps(meta.parameters, ensure_ascii=False, indent=4) if meta.parameters else '(无)'}")
+        if meta.permissions:
+            print(f"  权限:     {', '.join(meta.permissions)}")
+
+
+def _cmd_logs(args) -> None:
+    """查看日志"""
+    from src.daemon import _PID_DIR
+
+    if args.audit:
+        # 审计日志
+        log_dir = PROJECT_ROOT / "logs"
+        log_files = sorted(log_dir.glob("audit_*.jsonl"), reverse=True)
+        if not log_files:
+            print("  (无审计日志)")
+            return
+        target = log_files[0]
+        if args.follow:
+            subprocess.run(["tail", "-f", "-n", str(args.lines), str(target)])
+        else:
+            subprocess.run(["tail", "-n", str(args.lines), str(target)])
+    else:
+        # 运行日志
+        log_file = _PID_DIR / "raccoon.log"
+        if not log_file.exists():
+            print("  (无运行日志)")
+            return
+        if args.follow:
+            subprocess.run(["tail", "-f", "-n", str(args.lines), str(log_file)])
+        else:
+            subprocess.run(["tail", "-n", str(args.lines), str(log_file)])
+
+
+def _cmd_doctor() -> None:
+    """诊断检查"""
+    import importlib
+
+    print("🦝 Raccoon 诊断检查\n")
+    issues = []
+
+    # 1. Python 版本
+    py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    if sys.version_info >= (3, 11):
+        print(f"  ✅ Python {py_ver}")
+    else:
+        print(f"  ❌ Python {py_ver} (需要 >= 3.11)")
+        issues.append("Python 版本过低")
+
+    # 2. 依赖检查
+    deps = [
+        ("pydantic", "pydantic"),
+        ("fastapi", "fastapi"),
+        ("uvicorn", "uvicorn"),
+        ("structlog", "structlog"),
+        ("openai", "openai"),
+        ("httpx", "httpx"),
+        ("psutil", "psutil"),
+        ("click", "click"),
+        ("rich", "rich"),
+        ("aiosqlite", "aiosqlite"),
+    ]
+    for mod, pkg in deps:
+        try:
+            m = importlib.import_module(mod)
+            ver = getattr(m, "__version__", "?")
+            print(f"  ✅ {pkg:<16} {ver}")
+        except ImportError:
+            print(f"  ❌ {pkg:<16} 未安装")
+            issues.append(f"{pkg} 未安装")
+
+    # 3. 配置文件
+    config_path = PROJECT_ROOT / "config.json"
+    if config_path.exists():
+        print(f"  ✅ config.json 存在")
+        try:
+            from src.config import load_config
+            config = load_config()
+            if config.llm_api_key:
+                print(f"  ✅ LLM API Key 已配置")
+            else:
+                print(f"  ⚠️  LLM API Key 未配置")
+                issues.append("LLM API Key 未配置")
+        except Exception as e:
+            print(f"  ❌ 配置加载失败: {e}")
+            issues.append("配置加载失败")
+    else:
+        print(f"  ⚠️  config.json 不存在（将使用默认配置）")
+
+    # 4. Skills 目录
+    skills_dir = PROJECT_ROOT / "skills"
+    if skills_dir.exists():
+        skill_count = len([d for d in skills_dir.iterdir() if d.is_dir()])
+        print(f"  ✅ Skills 目录 ({skill_count} 个)")
+    else:
+        print(f"  ❌ Skills 目录不存在")
+        issues.append("Skills 目录不存在")
+
+    # 5. 数据目录
+    data_dir = PROJECT_ROOT / "data"
+    if data_dir.exists():
+        print(f"  ✅ 数据目录存在")
+    else:
+        print(f"  ⚠️  数据目录不存在（首次运行会自动创建）")
+
+    # 6. 端口检查
+    import socket
+    port = 8900
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    result = sock.connect_ex(("127.0.0.1", port))
+    sock.close()
+    if result == 0:
+        print(f"  ⚠️  端口 {port} 已被占用（Raccoon 可能在运行）")
+    else:
+        print(f"  ✅ 端口 {port} 可用")
+
+    # 7. 运行状态
+    from src.daemon import status
+    st = status()
+    if st["running"]:
+        print(f"  ✅ Raccoon 运行中 (PID: {st['pid']})")
+    else:
+        print(f"  ℹ️  Raccoon 未运行")
+
+    # 总结
+    print()
+    if issues:
+        print(f"⚠️  发现 {len(issues)} 个问题:")
+        for i, issue in enumerate(issues, 1):
+            print(f"   {i}. {issue}")
+    else:
+        print("✅ 一切正常！")
+
+
+def _cmd_schedule(args) -> None:
+    """定时任务管理"""
+    from src.config import RaccoonConfig
+    from src.scheduler.schedule_store import ScheduleStore
+    from src.scheduler.cron_parser import CronParser, CronParseError
+    from src.types import ScheduleEntry
+
+    config = RaccoonConfig()
+    store = ScheduleStore(config)
+    store.recover()
+
+    if args.action == "list":
+        schedules = list(store.all_schedules())
+        if not schedules:
+            print("  (无定时任务)")
+            return
+        print(f"已创建 {len(schedules)} 个定时任务:\n")
+        for s in sorted(schedules, key=lambda x: x.created_at):
+            status = "✅" if s.enabled else "⏸️"
+            next_str = s.next_run.strftime("%Y-%m-%d %H:%M") if s.next_run else "?"
+            last_str = s.last_run.strftime("%Y-%m-%d %H:%M") if s.last_run else "-"
+            print(f"  {status} [{s.schedule_id[:8]}] {s.name}")
+            print(f"     cron: {s.cron}  消息: {s.message}")
+            print(f"     下次: {next_str}  上次: {last_str}")
+
+    elif args.action == "add":
+        if not args.name or not args.cron or not args.message:
+            print("❌ 用法: raccoon schedule add --name <名称> --cron <表达式> --message <消息>")
+            sys.exit(1)
+        try:
+            CronParser(args.cron)
+        except CronParseError as e:
+            print(f"❌ 无效的 cron 表达式: {e}")
+            sys.exit(1)
+        entry = ScheduleEntry(
+            name=args.name,
+            cron=args.cron,
+            message=args.message,
+            conversation_id=f"schedule_{args.name}",
+        )
+        # 预计算 next_run
+        try:
+            from datetime import datetime, timezone
+            cron = CronParser(args.cron)
+            entry.next_run = cron.next_time(datetime.now(timezone.utc))
+        except Exception:
+            pass
+        store.add(entry)
+        next_str = entry.next_run.strftime("%Y-%m-%d %H:%M") if entry.next_run else "?"
+        print(f"✅ 定时任务已创建: {entry.name}")
+        print(f"   ID: {entry.schedule_id}")
+        print(f"   cron: {entry.cron}")
+        print(f"   下次触发: {next_str}")
+
+    elif args.action == "remove":
+        sid = args.schedule_id
+        if not sid:
+            print("❌ 用法: raccoon schedule remove --id <任务ID>")
+            sys.exit(1)
+        entry = store.remove(sid)
+        if entry:
+            print(f"✅ 已删除定时任务: {entry.name}")
+        else:
+            print(f"❌ 未找到任务: {sid}")
+
+    elif args.action == "toggle":
+        sid = args.schedule_id
+        if not sid:
+            print("❌ 用法: raccoon schedule toggle --id <任务ID>")
+            sys.exit(1)
+        entry = store.get(sid)
+        if not entry:
+            print(f"❌ 未找到任务: {sid}")
+            sys.exit(1)
+        entry.enabled = not entry.enabled
+        store.update(entry)
+        status = "启用" if entry.enabled else "禁用"
+        print(f"✅ 已{status}定时任务: {entry.name}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# 辅助函数
+# ═══════════════════════════════════════════════════════════════
+
+def _get_version() -> str:
+    """获取当前版本"""
+    try:
+        from importlib.metadata import version
+        return version("raccoon")
+    except Exception:
+        return "0.1.0"
+
+
+def _get_latest_version() -> str | None:
+    """查询最新版本"""
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "index", "versions", "raccoon"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode == 0:
+            # 解析输出
+            for line in result.stdout.splitlines():
+                if "Available versions:" in line or "LATEST:" in line:
+                    parts = line.split()
+                    for p in parts:
+                        p = p.strip(",()")
+                        if p and p[0].isdigit():
+                            return p
+    except Exception:
+        pass
+    return None
+
+
+def _run_cli() -> None:
+    """前台 CLI 模式"""
+    from src.adapters.cli_adapter import run_cli
+    run_cli()
+
+
+def _run_http(host: str, port: int) -> None:
+    """前台 HTTP 模式"""
+    import uvicorn
+    from src.adapters.http_adapter import create_app
+    from src.config import load_config
+
+    config = load_config()
+    app = create_app(config)
+    uvicorn.run(app, host=host, port=port)
+
+
+if __name__ == "__main__":
+    main()

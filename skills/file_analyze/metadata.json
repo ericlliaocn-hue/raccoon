@@ -1,0 +1,13 @@
+{
+  "name": "file_analyze",
+  "version": "1.0.0",
+  "description": "读取文本类文件内容并分析，支持代码/配置/文档/日志等文件",
+  "trigger_words": ["分析文件", "看看内容", "读一下", "查看文件", "打开文件", "分析一下", "文件内容", "看看文件", "读文件", "查看内容"],
+  "aliases": ["文件分析", "分析"],
+  "intent_tags": ["file", "analyze"],
+  "risk_level": "low",
+  "requires_approval": false,
+  "timeout_seconds": 30,
+  "entry": "main.py",
+  "permissions": []
+}

@@ -1,0 +1,13 @@
+{
+  "name": "change_detector",
+  "version": "1.0.0",
+  "description": "监控网页或文件变化，检测到变化时通知用户",
+  "trigger_words": ["监控", "变化", "检测", "monitor", "watch"],
+  "aliases": ["变化检测", "网页监控"],
+  "intent_tags": ["monitor", "notification"],
+  "risk_level": "medium",
+  "requires_approval": false,
+  "timeout_seconds": 60,
+  "entry": "main.py",
+  "permissions": ["network", "filesystem"]
+}

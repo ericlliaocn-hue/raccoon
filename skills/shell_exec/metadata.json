@@ -1,0 +1,13 @@
+{
+  "name": "shell_exec",
+  "version": "1.0.0",
+  "description": "执行 Shell 命令并返回输出，支持白名单安全控制",
+  "trigger_words": ["执行", "运行", "shell", "命令", "run", "exec"],
+  "aliases": ["执行命令", "终端"],
+  "intent_tags": ["system", "utility"],
+  "risk_level": "high",
+  "requires_approval": true,
+  "timeout_seconds": 30,
+  "entry": "main.py",
+  "permissions": ["subprocess", "filesystem"]
+}
