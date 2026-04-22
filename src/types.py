@@ -110,6 +110,7 @@ class RouteType(str, Enum):
     TASK_OPERATION = "task_operation"  # 任务操作（取消等）
     SYSTEM = "system"         # 系统指令
     LLM = "llm"               # LLM 兜底
+    LEARN = "learn"           # 学习请求（用户确认创建新 Skill）
     NONE = "none"             # 无匹配
 
 

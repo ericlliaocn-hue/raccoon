@@ -18,7 +18,10 @@ from src.config import load_config
 from src.eventbus.bus import EventBus
 from src.eventbus.events import EventType, make_event
 from src.executor.agent import Executor
+from src.llm import LLMFactory
 from src.router.router import Router
+from src.scheduler.schedule_store import ScheduleStore
+from src.scheduler.scheduler import Scheduler
 from src.skill_vault.vault_manager import VaultManager
 from src.types import Event, RouteResult, RouteType
 
@@ -115,6 +118,9 @@ class CLISession:
                 },
                 confidence=0.95,
             )
+        # 检查待确认的学习请求
+        elif self._executor.intercept_learn_request(self._conversation_id, text):
+            route = self._executor.intercept_learn_request(self._conversation_id, text)
         else:
             route = await self._router.route(text)
 
@@ -164,6 +170,24 @@ def run_cli() -> None:
     vault_manager = VaultManager(config)
     router = Router()
     executor = Executor(event_bus, vault_manager, config)
+
+    # 定时调度
+    schedule_store = ScheduleStore(config)
+    schedule_store.recover()
+    scheduler = Scheduler(event_bus, schedule_store, config)
+
+    # L3 学习引擎
+    llm_client = LLMFactory.create(config)
+    from src.brain.learning_engine import LearningEngine
+    learning_engine = LearningEngine(
+        config=config,
+        vault_manager=vault_manager,
+        llm_client=llm_client,
+        scheduler=scheduler,
+        router=router,
+    )
+    executor.set_learning_engine(learning_engine)
+    executor.set_scheduler(scheduler)
 
     from src.supervisor.audit_logger import AuditLogger
     audit_logger = AuditLogger(config)

@@ -1,6 +1,6 @@
 [project]
 name = "raccoon"
-version = "0.1.0"
+version = "0.2.0"
 description = "Raccoon - 事件驱动的 AI 智能体框架"
 readme = "README.md"
 requires-python = ">=3.11"

@@ -1,0 +1,23 @@
+{
+  "name": "xiaohongshu_daily_report",
+  "version": "0.1.0",
+  "description": "每日定时抓取并推送前一天的小红书爆文前20榜单",
+  "trigger_words": [
+    "小红书爆文",
+    "小红书日报",
+    "每天九点",
+    "小红书榜单"
+  ],
+  "intent_tags": [
+    "learned"
+  ],
+  "risk_level": "medium",
+  "requires_approval": false,
+  "timeout_seconds": 60,
+  "entry": "main.py",
+  "permissions": [
+    "httpx",
+    "beautifulsoup4",
+    "schedule"
+  ]
+}

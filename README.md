@@ -1,17 +1,29 @@
-# 🦝 Raccoon — 事件驱动的 AI 智能体框架
+# 🦝 Raccoon — 会自己学技能的 AI Agent
 
-Raccoon 是一个本地优先、事件驱动的 AI Agent 框架，核心理念是**让 AI Agent 像浣熊一样灵巧、自主、可信赖**。
+Raccoon 是一个本地优先、事件驱动的 AI Agent 框架。核心理念：**不是你给它装工具它去用，而是它自己会长出能力来。**
+
+> 💬 你说一句话 → 没有对应 Skill → LLM 自动生成代码 → 执行失败 → 自动装包/修代码 → 重试直到成功 → 下次直接复用
+
+## 为什么选 Raccoon
+
+| | 传统 Agent | Raccoon |
+|---|---|---|
+| 新需求 | 等人开发插件 | 对话中自动学会 |
+| 执行报错 | 停下来等你修 | 自己装依赖、改代码、重试 |
+| 能力增长 | 装多少用多少 | 越用越强，经验自动积累 |
 
 ## 特性
 
-- **事件驱动架构**：EventBus 解耦所有模块，消息即指令
-- **三层能力体系**：L1 基础技能 → L2 市场扩展 → L3 对话自学
-- **Skill 沙箱隔离**：每个 Skill 以 subprocess 运行，崩溃不影响主进程
-- **内置 Flow 编排**：Skill 自带多步骤流程（用户选择 / LLM 推理 / 交互输入），无需外部 Workflow 引擎
-- **CDP 浏览器操控**：原生 Playwright 集成，可操控网页完成复杂任务
-- **定时调度**：Cron 表达式驱动的定时任务，支持自动重试
-- **多通道通知**：系统通知、Bark、Webhook 等多渠道推送
-- **记忆系统**：MemCore 持久化经验，对话自学能力持续积累
+- **🧠 L3 对话自学**：没有的 Skill？说一句话，Raccoon 自己生成、自己调试、自己学会。执行失败自动修复，最多重试 3 次
+- **🔄 自修复闭环**：`ModuleNotFoundError` → 自动 `pip install` → 装不了自动换库 → 还不行 LLM 重写代码 → 直到跑通
+- **📡 事件驱动架构**：EventBus 解耦所有模块，消息即指令
+- **🏗 三层能力体系**：L1 基础技能 → L2 市场扩展 → L3 对话自学
+- **🔒 Skill 沙箱隔离**：每个 Skill 以 subprocess 运行，崩溃不影响主进程
+- **🔀 内置 Flow 编排**：Skill 自带多步骤流程（用户选择 / LLM 推理 / 交互输入），无需外部 Workflow 引擎
+- **🌐 CDP 浏览器操控**：原生 Playwright 集成，可操控网页完成复杂任务
+- **⏰ 定时调度**：Cron 表达式驱动的定时任务，支持自动重试
+- **🔔 多通道通知**：系统通知、Bark、Webhook 等多渠道推送
+- **💾 记忆系统**：MemCore 持久化经验，对话自学能力持续积累
 
 ## 架构
 
@@ -173,8 +185,10 @@ raccoon skills uninstall <skill-name>
 | Skill | 说明 | 权限 |
 |-------|------|------|
 | `web_automate` | CDP 浏览器自动化，操控网页完成任务 | `browser_automation`, `network` |
+| `ai_daily_report` | 每日 AI 日报，聚合 HackerNews/TechCrunch/机器之心/36氪 资讯 | `httpx`, `feedparser`, `beautifulsoup4` |
+| `xiaohongshu_daily_report` | 小红书每日爆文榜单（开发中） | `httpx`, `beautifulsoup4` |
 
-更多 Skill 可通过 `raccoon skills install <git-url>` 安装。
+更多 Skill 可通过 `raccoon skills install <git-url>` 安装，或**直接对话让 Raccoon 自己学会**。
 
 ## 开发自定义 Skill
 

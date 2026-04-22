@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -44,6 +45,8 @@ from src.types import (
 
 if TYPE_CHECKING:
     from src.skill_vault.vault_manager import VaultManager
+    from src.brain.learning_engine import LearningEngine
+    from src.scheduler.scheduler import Scheduler
 
 logger = structlog.get_logger(__name__)
 
@@ -56,6 +59,20 @@ class PendingContext:
     login_step: str = ""  # "input_phone" / "input_code" 等
     pending_prompt: str = ""
     pending_params: dict[str, Any] = field(default_factory=dict)
+
+
+class LlmClassification(str, Enum):
+    """LLM 消息分类结果（供 adapter 层决定响应方式）"""
+    CHITCHAT = "chitchat"           # 闲聊 → 流式
+    SKILL_MATCHED = "skill_matched" # 匹配到 Skill → 一次性
+    NEEDS_LEARN = "needs_learn"     # 需要学习确认 → 一次性
+
+
+@dataclass
+class LlmClassifyResult:
+    """LLM 消息分类结果"""
+    classification: LlmClassification
+    skill_name: str | None = None   # SKILL_MATCHED 时的 skill_name
 
 
 class Executor:
@@ -88,6 +105,12 @@ class Executor:
             event_bus, self._session_manager, vault_manager, self._config
         )
 
+        # L3 学习链路：LearningEngine + Scheduler（延迟注入）
+        self._learning_engine: LearningEngine | None = None
+        self._scheduler: Scheduler | None = None
+        # 待确认的学习请求：conversation_id → 用户原始消息
+        self._pending_learn_requests: dict[str, str] = {}
+
         # 恢复持久化任务
         self._task_queue.recover()
 
@@ -105,6 +128,48 @@ class Executor:
         """获取对话的挂起任务上下文"""
         return self._pending_tasks.get(conversation_id)
 
+    def set_learning_engine(self, engine: "LearningEngine") -> None:
+        """注入 LearningEngine 实例"""
+        self._learning_engine = engine
+
+    def set_scheduler(self, scheduler: "Scheduler") -> None:
+        """注入 Scheduler 实例"""
+        self._scheduler = scheduler
+
+    def intercept_learn_request(self, conversation_id: str, text: str) -> RouteResult | None:
+        """检查是否有待确认的学习请求，有则返回 LEARN RouteResult
+
+        在 adapter 层路由前调用，优先级仅次于 SkillSession 拦截。
+        """
+        if conversation_id in self._pending_learn_requests:
+            return RouteResult(
+                route_type=RouteType.LEARN,
+                params={"original_text": text},
+                confidence=0.95,
+            )
+        return None
+
+    async def classify_llm_message(self, text: str) -> LlmClassifyResult:
+        """对 LLM 路由消息做三段式前两步分类（启发式 → Skill 匹配）
+
+        供 adapter 层决定响应方式：闲聊走流式，Skill匹配/学习确认走一次性返回。
+        """
+        # 第一段：启发式判断
+        if not self._might_need_action(text):
+            return LlmClassifyResult(classification=LlmClassification.CHITCHAT)
+
+        # 第二段：Skill 模糊匹配
+        matched_skill = await self._match_skill(text)
+        if matched_skill:
+            logger.info("classify_matched_skill", skill=matched_skill)
+            return LlmClassifyResult(
+                classification=LlmClassification.SKILL_MATCHED,
+                skill_name=matched_skill,
+            )
+
+        # 命中动作信号但无 Skill 可匹配 → 需要学习确认
+        return LlmClassifyResult(classification=LlmClassification.NEEDS_LEARN)
+
     async def handle_route_result(
         self, route: RouteResult, event: Event
     ) -> str | None:
@@ -121,6 +186,8 @@ class Executor:
             return await self._handle_system(route, event)
         elif route.route_type == RouteType.LLM:
             return await self._handle_llm(route, event)
+        elif route.route_type == RouteType.LEARN:
+            return await self._handle_learn_confirm(route, event)
         return None
 
     # ─── Skill 执行 ────────────────────────────────────────────
@@ -431,7 +498,20 @@ class Executor:
             user_text=user_text,
         )
 
-    # ─── LLM 兜底（原有） ────────────────────────────────────
+    # ─── LLM 兜底（三段式改造） ────────────────────────────────
+
+    # 启发式信号词：判断用户消息是否可能需要执行动作
+    _ACTION_SIGNALS = (
+        "帮我", "帮我做", "帮我查", "帮我写", "帮我生成", "帮我创建",
+        "帮我发", "帮我搜", "帮我找", "帮我下载", "帮我安装",
+        "帮我转换", "帮我分析", "帮我监控", "帮我提醒", "帮我定时",
+        "每天", "每周", "每月", "定时", "自动", "监控",
+        "抓取", "爬取", "下载", "截图", "截屏",
+        "生成", "转换", "压缩", "批量", "整理",
+        "浏览器", "打开网页", "网页操作", "填表",
+        "发送消息", "推送", "通知",
+        "写一个", "做一个", "搞一个", "来一个",
+    )
 
     def _get_llm(self) -> LLMClient:
         """延迟初始化 LLM 客户端"""
@@ -439,9 +519,154 @@ class Executor:
             self._llm = LLMFactory.create(self._config)
         return self._llm
 
+    def _might_need_action(self, text: str) -> bool:
+        """极简启发式：判断消息是否可能需要执行动作（而非闲聊）
+
+        误判可接受——最坏情况多问一句"要不要创建"。
+        """
+        t = text.lower().strip()
+        if len(t) < 4:
+            return False
+        for signal in self._ACTION_SIGNALS:
+            if signal in t:
+                return True
+        return False
+
+    async def _match_skill(self, text: str) -> str | None:
+        """用 LLM 模糊匹配本地 Skill 清单
+
+        Returns:
+            匹配到的 skill_name，或 None
+        """
+        skills = self._vault_manager.list_skills()
+        if not skills:
+            return None
+
+        # 构建 Skill 清单摘要
+        skill_lines = []
+        for s in skills:
+            tags = ", ".join(s.intent_tags) if s.intent_tags else ""
+            triggers = ", ".join(s.trigger_words[:3]) if s.trigger_words else ""
+            skill_lines.append(
+                f"- {s.name}: {s.description} | 触发词: {triggers} | 标签: {tags}"
+            )
+        skill_catalog = "\n".join(skill_lines)
+
+        prompt = f"""判断用户消息是否可以用以下已有 Skill 来完成。
+
+已有 Skill 清单：
+{skill_catalog}
+
+用户消息：{text}
+
+如果某个 Skill 能满足需求，只返回该 Skill 的 name（如 image_gen）。
+如果没有合适的 Skill，只返回 NONE。
+只返回一个词，不要解释。"""
+
+        try:
+            llm = self._get_llm()
+            response = await llm.chat(
+                [{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=20,
+            )
+            result = response.strip().upper()
+            if result == "NONE" or not result:
+                return None
+            # 验证返回的 skill_name 是否真实存在
+            matched = response.strip().lower()
+            for s in skills:
+                if s.name == matched:
+                    return s.name
+            # 模糊匹配：返回的可能是别名或触发词
+            for s in skills:
+                if matched in s.name or matched in [a.lower() for a in s.aliases]:
+                    return s.name
+            return None
+        except Exception as e:
+            logger.warning("skill_match_failed", error=str(e))
+            return None
+
     async def _handle_llm(self, route: RouteResult, event: Event) -> str:
-        """LLM 兜底响应"""
+        """LLM 兜底响应（三段式：启发式 → Skill 匹配 → 用户确认/闲聊）"""
         text = route.params.get("original_text", "")
+        conv_id = event.conversation_id
+
+        # ── 第一段：启发式判断 ──
+        if not self._might_need_action(text):
+            # 明显闲聊，零额外开销
+            return await self._chat_fallback(text)
+
+        # ── 第二段：Skill 模糊匹配 ──
+        matched_skill = await self._match_skill(text)
+        if matched_skill:
+            logger.info("llm_fallback_matched_skill", skill=matched_skill)
+            # 构造 RouteResult 走 Skill 执行
+            skill_route = RouteResult(
+                route_type=RouteType.SKILL,
+                skill_name=matched_skill,
+                params={"rest": text},
+                confidence=0.6,
+            )
+            return await self._handle_skill(skill_route, event)
+
+        # ── 第三段：问用户要不要创建 ──
+        self._pending_learn_requests[conv_id] = text
+        return (
+            f"🤔 我目前没有能处理「{text[:30]}」的技能。\n\n"
+            "需要我帮你创建一个新技能吗？回复「要」我就开始学习，回复「不要」就正常聊天。"
+        )
+
+    async def _handle_learn_confirm(self, route: RouteResult, event: Event) -> str:
+        """处理用户对学习请求的确认/拒绝"""
+        conv_id = event.conversation_id
+        user_text = event.payload.get("text", "").strip().lower()
+        original_request = self._pending_learn_requests.pop(conv_id, None)
+
+        if not original_request:
+            # 没有待确认的请求，当作普通消息处理
+            return await self._chat_fallback(event.payload.get("text", ""))
+
+        # 判断用户是否确认
+        confirm_words = {"要", "好", "可以", "行", "是的", "是的", "创建", "学习", "帮我创建", "yes", "y", "ok", "确定", "确认"}
+        reject_words = {"不要", "不用", "算了", "取消", "no", "n", "否", "不了", "别"}
+
+        if user_text in reject_words:
+            return await self._chat_fallback(event.payload.get("text", ""))
+
+        if user_text not in confirm_words:
+            # 模糊回复，当作拒绝，走闲聊
+            return await self._chat_fallback(event.payload.get("text", ""))
+
+        # ── 用户确认：走 LearningEngine ──
+        if not self._learning_engine:
+            return "⚠️ 学习引擎未初始化，无法创建新技能。请联系管理员配置。"
+
+        try:
+            task = Task(
+                conversation_id=conv_id,
+                user_id=event.user_id,
+                origin_message=original_request,
+                skill_name="learning",
+            )
+
+            result = await self._learning_engine.learn_and_schedule(
+                task=task,
+                user_message=original_request,
+                conversation_id=conv_id,
+            )
+
+            reply = result.get("reply", "✅ 学习完成")
+            if result.get("schedule_created"):
+                reply += f"\n⏰ 已创建定时任务：{result['schedule_created']}"
+            return reply
+
+        except Exception as e:
+            logger.error("learn_confirm_failed", error=str(e))
+            return f"❌ 学习过程出错：{e}"
+
+    async def _chat_fallback(self, text: str) -> str:
+        """纯闲聊兜底"""
         try:
             llm = self._get_llm()
             messages = [{"role": "user", "content": text}]

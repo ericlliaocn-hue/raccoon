@@ -12,6 +12,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import re
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -72,6 +74,26 @@ class LLMClient(ABC):
         """发送流式聊天请求，返回异步迭代器"""
         ...
 
+    async def chat_with_tools(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        temperature: float = 0.7,
+        max_tokens: int = 2048,
+    ) -> dict[str, Any]:
+        """发送带工具定义的聊天请求（预留，当前用 prompt 模拟）
+
+        Args:
+            tools: OpenAI function calling 格式的工具列表
+
+        Returns:
+            {"content": "回复文本", "tool_calls": [...]} 或 {"content": "回复文本"}
+        """
+        # 默认实现：忽略 tools，走普通 chat
+        reply = await self.chat(messages, temperature=temperature, max_tokens=max_tokens)
+        return {"content": reply}
+
 
 class MockLLMClient(LLMClient):
     """Mock LLM 客户端（无需 API Key）"""
@@ -106,6 +128,18 @@ class MockLLMClient(LLMClient):
             yield text
 
         return _gen()
+
+    async def chat_with_tools(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        temperature: float = 0.7,
+        max_tokens: int = 2048,
+    ) -> dict[str, Any]:
+        """Mock chat_with_tools"""
+        reply = await self.chat(messages, temperature=temperature, max_tokens=max_tokens)
+        return {"content": reply}
 
 
 class SparkLLMClient(LLMClient):
@@ -198,6 +232,50 @@ class SparkLLMClient(LLMClient):
                 raise
 
         return _gen()
+
+    async def chat_with_tools(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        temperature: float = 0.7,
+        max_tokens: int = 2048,
+    ) -> dict[str, Any]:
+        """讯飞星火 chat_with_tools（预留，当前用 prompt 模拟）
+
+        讯飞星火 API 的 function calling 支持有限，
+        当前用 prompt 模拟工具调用，后续按需接入原生 function calling。
+        """
+        if not tools:
+            reply = await self.chat(messages, temperature=temperature, max_tokens=max_tokens)
+            return {"content": reply}
+
+        # 将工具定义注入 system prompt 模拟
+        tool_desc = json.dumps(tools, ensure_ascii=False, indent=2)
+        tool_prompt = (
+            "你可以使用以下工具：\n"
+            f"{tool_desc}\n\n"
+            "如果需要调用工具，请在回复中用 JSON 格式包裹："
+            "```tool_call\n{\"name\": \"工具名\", \"arguments\": {...}}\n```\n"
+            "如果不需要调用工具，直接回复即可。"
+        )
+        enhanced_messages = [{"role": "system", "content": tool_prompt}] + messages
+        reply = await self.chat(enhanced_messages, temperature=temperature, max_tokens=max_tokens)
+
+        # 尝试解析工具调用
+        tool_call_match = re.search(r"```tool_call\s*\n([\s\S]*?)```", reply)
+        if tool_call_match:
+            try:
+                tool_call_data = json.loads(tool_call_match.group(1).strip())
+                content = reply[:tool_call_match.start()].strip()
+                return {
+                    "content": content or None,
+                    "tool_calls": [tool_call_data],
+                }
+            except json.JSONDecodeError:
+                pass
+
+        return {"content": reply}
 
 
 class LLMFactory:

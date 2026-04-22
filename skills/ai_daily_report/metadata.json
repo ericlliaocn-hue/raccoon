@@ -1,0 +1,24 @@
+{
+  "name": "ai_daily_report",
+  "version": "0.1.0",
+  "description": "每日定时生成并推送前一天的AI领域日报，自动抓取、总结最新资讯",
+  "trigger_words": [
+    "AI日报",
+    "每日日报",
+    "每天八点",
+    "定时日报"
+  ],
+  "intent_tags": [
+    "learned"
+  ],
+  "risk_level": "medium",
+  "requires_approval": false,
+  "timeout_seconds": 60,
+  "entry": "main.py",
+  "permissions": [
+    "schedule",
+    "httpx",
+    "feedparser",
+    "beautifulsoup4"
+  ]
+}

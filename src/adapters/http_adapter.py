@@ -26,8 +26,9 @@ from pydantic import BaseModel as APIModel
 from src.config import load_config, RaccoonConfig
 from src.eventbus.bus import EventBus
 from src.eventbus.events import EventType, make_event
-from src.executor.agent import Executor
+from src.executor.agent import Executor, LlmClassification
 from src.executor.file_manager import FileManager
+from src.llm import LLMFactory
 from src.router.router import Router
 from src.scheduler.scheduler import Scheduler
 from src.scheduler.schedule_store import ScheduleStore
@@ -123,6 +124,19 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
     # 通知网关
     notifier = Notifier(event_bus, config)
     notifier.initialize()
+
+    # L3 学习引擎
+    llm_client = LLMFactory.create(config)
+    from src.brain.learning_engine import LearningEngine
+    learning_engine = LearningEngine(
+        config=config,
+        vault_manager=vault_manager,
+        llm_client=llm_client,
+        scheduler=scheduler,
+        router=router,
+    )
+    executor.set_learning_engine(learning_engine)
+    executor.set_scheduler(scheduler)
 
     # 工作流编排
     workflow_store = WorkflowStore(config)
@@ -222,6 +236,9 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
                 },
                 confidence=0.95,
             )
+        # 检查待确认的学习请求
+        elif executor.intercept_learn_request(conv_id, req.text):
+            route = executor.intercept_learn_request(conv_id, req.text)
         else:
             route = await router.route(req.text)
 
@@ -271,6 +288,9 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
                 },
                 confidence=0.95,
             )
+        # 检查待确认的学习请求
+        elif executor.intercept_learn_request(conv_id, req.text):
+            route = executor.intercept_learn_request(conv_id, req.text)
         else:
             route = await router.route(req.text)
 
@@ -289,7 +309,15 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
                 yield f"data: {json.dumps({'type': 'done', 'conversation_id': conv_id}, ensure_ascii=False)}\n\n"
             return StreamingResponse(_single(), media_type="text/event-stream")
 
-        # 非 LLM 路由：直接返回完整结果
+        # LEARN 路由：直接返回完整结果（非流式）
+        if route.route_type == RouteType.LEARN:
+            reply = await executor.handle_route_result(route, event)
+            async def _single():
+                yield f"data: {json.dumps({'type': 'text', 'content': reply or '(无响应)', 'conversation_id': conv_id, 'source': 'learn_confirm'}, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps({'type': 'done', 'conversation_id': conv_id}, ensure_ascii=False)}\n\n"
+            return StreamingResponse(_single(), media_type="text/event-stream")
+
+        # 非流式路由（SKILL、LEARN、SKILL_SESSION 等）：直接返回完整结果
         if route.route_type != RouteType.LLM:
             reply = await executor.handle_route_result(route, event)
             async def _single():
@@ -297,26 +325,50 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
                 yield f"data: {json.dumps({'type': 'done', 'conversation_id': conv_id}, ensure_ascii=False)}\n\n"
             return StreamingResponse(_single(), media_type="text/event-stream")
 
-        # LLM 路由：流式推送
+        # LLM 路由：先分类再分流
         text = route.params.get("original_text", "")
+        classify = await executor.classify_llm_message(text)
 
-        async def _stream() -> AsyncGenerator[str, None]:
-            try:
-                llm = executor._get_llm()
-                messages = [{"role": "user", "content": text}]
-                gen = await llm.chat_stream(
-                    messages,
-                    temperature=config.llm_temperature,
-                    max_tokens=config.llm_max_tokens,
-                )
-                async for chunk in gen:
-                    yield f"data: {json.dumps({'type': 'text', 'content': chunk, 'conversation_id': conv_id}, ensure_ascii=False)}\n\n"
+        if classify.classification == LlmClassification.CHITCHAT:
+            # 闲聊 → 流式推送，保留打字机效果
+            async def _stream() -> AsyncGenerator[str, None]:
+                try:
+                    llm = executor._get_llm()
+                    messages = [{"role": "user", "content": text}]
+                    gen = await llm.chat_stream(
+                        messages,
+                        temperature=config.llm_temperature,
+                        max_tokens=config.llm_max_tokens,
+                    )
+                    async for chunk in gen:
+                        yield f"data: {json.dumps({'type': 'text', 'content': chunk, 'conversation_id': conv_id, 'source': 'llm'}, ensure_ascii=False)}\n\n"
+                    yield f"data: {json.dumps({'type': 'done', 'conversation_id': conv_id}, ensure_ascii=False)}\n\n"
+                except Exception as e:
+                    logger.error("stream_chat_failed", error=str(e))
+                    yield f"data: {json.dumps({'type': 'error', 'content': str(e)}, ensure_ascii=False)}\n\n"
+            return StreamingResponse(_stream(), media_type="text/event-stream")
+
+        elif classify.classification == LlmClassification.SKILL_MATCHED:
+            # 匹配到 Skill → 构造 RouteResult 走 Skill 执行，一次性返回
+            skill_route = RouteResult(
+                route_type=RouteType.SKILL,
+                skill_name=classify.skill_name,
+                params={"rest": text},
+                confidence=0.6,
+            )
+            reply = await executor.handle_route_result(skill_route, event)
+            async def _single():
+                yield f"data: {json.dumps({'type': 'text', 'content': reply or '(无响应)', 'conversation_id': conv_id, 'source': 'skill_matched'}, ensure_ascii=False)}\n\n"
                 yield f"data: {json.dumps({'type': 'done', 'conversation_id': conv_id}, ensure_ascii=False)}\n\n"
-            except Exception as e:
-                logger.error("stream_chat_failed", error=str(e))
-                yield f"data: {json.dumps({'type': 'error', 'content': str(e)}, ensure_ascii=False)}\n\n"
+            return StreamingResponse(_single(), media_type="text/event-stream")
 
-        return StreamingResponse(_stream(), media_type="text/event-stream")
+        else:
+            # NEEDS_LEARN → 走 _handle_llm 第三段（学习确认），一次性返回
+            reply = await executor.handle_route_result(route, event)
+            async def _single():
+                yield f"data: {json.dumps({'type': 'text', 'content': reply or '(无响应)', 'conversation_id': conv_id, 'source': 'learn_confirm'}, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps({'type': 'done', 'conversation_id': conv_id}, ensure_ascii=False)}\n\n"
+            return StreamingResponse(_single(), media_type="text/event-stream")
 
     @app.get("/events")
     async def event_stream() -> StreamingResponse:
@@ -791,6 +843,9 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
                     },
                     confidence=0.95,
                 )
+            # 检查待确认的学习请求
+            elif executor.intercept_learn_request(event.conversation_id, req.text):
+                route = executor.intercept_learn_request(event.conversation_id, req.text)
             else:
                 route = await router.route(req.text)
             reply = await executor.handle_route_result(route, event)
