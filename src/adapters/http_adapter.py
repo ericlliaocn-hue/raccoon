@@ -23,7 +23,8 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel as APIModel
 
-from src.config import load_config, RaccoonConfig
+from src.config import load_config, RaccoonConfig, LLM_PRESETS
+from src.conversation_store import ConversationStore
 from src.eventbus.bus import EventBus
 from src.eventbus.events import EventType, make_event
 from src.executor.agent import Executor, LlmClassification
@@ -146,19 +147,26 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
     # 入站网关
     gateway = GatewayInbound(event_bus, config)
 
-    # SSE 事件队列
-    sse_queues: list[asyncio.Queue] = []
+    # 会话持久化
+    conversation_store = ConversationStore(config)
+
+    # SSE 事件队列（每个连接带关注的 conversation_id）
+    # 格式: list of (queue, set_of_conversation_ids_or_None)
+    # None 表示关注所有事件（兼容旧行为）
+    sse_subscribers: list[tuple[asyncio.Queue, set[str] | None]] = []
 
     # 文件管理器（共享给 Executor 和 HTTP 端点）
     file_manager = FileManager()
 
-    # EventBus handler: 将事件推送到 SSE 队列
+    # EventBus handler: 将事件推送到 SSE 队列（按 conversation_id 过滤）
     async def on_any_event(event: Event) -> None:
-        for q in sse_queues:
-            try:
-                q.put_nowait(event)
-            except asyncio.QueueFull:
-                pass
+        for q, conv_ids in sse_subscribers:
+            # conv_ids 为 None 表示关注所有事件
+            if conv_ids is None or event.conversation_id in conv_ids:
+                try:
+                    q.put_nowait(event)
+                except asyncio.QueueFull:
+                    pass
 
     event_bus.on_any(on_any_event)
 
@@ -171,13 +179,14 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
     app.state.executor = executor
     app.state.vault_manager = vault_manager
     app.state.audit_logger = audit_logger
-    app.state.sse_queues = sse_queues
+    app.state.sse_subscribers = sse_subscribers
     app.state.file_manager = file_manager
     app.state.scheduler = scheduler
     app.state.notifier = notifier
     app.state.workflow_store = workflow_store
     app.state.workflow_engine = workflow_engine
     app.state.gateway = gateway
+    app.state.conversation_store = conversation_store
 
     # ─── Web UI ────────────────────────────────────────────────
 
@@ -373,10 +382,13 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
             return StreamingResponse(_single(), media_type="text/event-stream")
 
     @app.get("/events")
-    async def event_stream() -> StreamingResponse:
-        """SSE 事件流"""
+    async def event_stream(conversation_id: str | None = None) -> StreamingResponse:
+        """SSE 事件流，可选按 conversation_id 过滤"""
         queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=100)
-        sse_queues.append(queue)
+        # 如果指定了 conversation_id，只关注该会话的事件
+        conv_ids = {conversation_id} if conversation_id else None
+        subscriber = (queue, conv_ids)
+        sse_subscribers.append(subscriber)
 
         async def generate() -> AsyncGenerator[str, None]:
             try:
@@ -388,7 +400,7 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
                     except asyncio.TimeoutError:
                         yield f": keepalive\n\n"
             finally:
-                sse_queues.remove(queue)
+                sse_subscribers.remove(subscriber)
 
         return StreamingResponse(generate(), media_type="text/event-stream")
 
@@ -497,42 +509,219 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
         """列出任务的所有可下载文件"""
         return file_manager.list_task_files(task_id)
 
-    # ─── Conversation Persistence ────────────────────────────────
+    # ─── LLM Settings API ──────────────────────────────────────
 
-    # 内存中的会话存储（MVP，重启后丢失）
-    _conversations: dict[str, list[dict]] = {}
+    class LLMSettingsRequest(APIModel):
+        provider: str | None = None
+        api_key: str | None = None
+        model: str | None = None
+        base_url: str | None = None
+        temperature: float | None = None
+        max_tokens: int | None = None
+
+    class LLMTestRequest(APIModel):
+        provider: str | None = None
+        api_key: str | None = None
+        model: str | None = None
+        base_url: str | None = None
+
+    @app.get("/settings/llm")
+    async def get_llm_settings() -> dict:
+        """获取当前 LLM 配置（API Key 脱敏）"""
+        return {
+            "provider": config.llm_provider,
+            "api_key": config.mask_api_key(),
+            "api_key_set": bool(config.llm_api_key),
+            "model": config.llm_model,
+            "base_url": config.llm_base_url,
+            "temperature": config.llm_temperature,
+            "max_tokens": config.llm_max_tokens,
+        }
+
+    @app.put("/settings/llm")
+    async def update_llm_settings(req: LLMSettingsRequest) -> dict:
+        """更新 LLM 配置并热重载"""
+        # 如果 api_key 是脱敏格式（包含 ***），不更新
+        api_key = req.api_key
+        if api_key and "***" in api_key:
+            api_key = None  # 跳过脱敏值
+
+        config.update_llm(
+            provider=req.provider,
+            api_key=api_key,
+            model=req.model,
+            base_url=req.base_url,
+            temperature=req.temperature,
+            max_tokens=req.max_tokens,
+        )
+
+        # 热重载：重建 LLM 客户端
+        try:
+            new_llm = LLMFactory.create(config)
+            executor._llm_client = new_llm
+            learning_engine._llm_client = new_llm
+            logger.info("llm_hot_reloaded", provider=config.llm_provider, model=config.llm_model)
+        except Exception as e:
+            logger.warning("llm_hot_reload_failed", error=str(e))
+
+        return {
+            "status": "updated",
+            "provider": config.llm_provider,
+            "model": config.llm_model,
+            "api_key": config.mask_api_key(),
+        }
+
+    @app.get("/settings/llm/presets")
+    async def get_llm_presets() -> list[dict]:
+        """获取 LLM 预设模板列表"""
+        return LLM_PRESETS
+
+    @app.post("/settings/llm/test")
+    async def test_llm_connection(req: LLMTestRequest) -> dict:
+        """测试 LLM 连接"""
+        # 临时构建配置测试
+        test_config = RaccoonConfig(
+            llm_provider=req.provider or config.llm_provider,
+            llm_api_key=req.api_key or config.llm_api_key,
+            llm_model=req.model or config.llm_model,
+            llm_base_url=req.base_url or config.llm_base_url,
+        )
+
+        try:
+            client = LLMFactory.create(test_config)
+            reply = await client.chat(
+                [{"role": "user", "content": "你好，请回复'连接成功'"}],
+                temperature=0.1,
+                max_tokens=50,
+            )
+            return {
+                "status": "ok",
+                "reply": reply[:200],
+                "provider": test_config.llm_provider,
+                "model": test_config.llm_model,
+            }
+        except Exception as e:
+            return {
+                "status": "error",
+                "error": str(e),
+                "provider": test_config.llm_provider,
+                "model": test_config.llm_model,
+            }
+
+    # ─── Multi-Model Management API ────────────────────────────────
+
+    class ModelAddRequest(APIModel):
+        id: str = ""
+        name: str
+        vendor: str = "Custom"
+        url: str = ""
+        apiKey: str = ""
+        maxInputTokens: int = 0
+        maxOutputTokens: int = 0
+        supportsToolCall: bool = False
+        supportsImages: bool = False
+        supportsReasoning: bool = False
+
+    class ModelUpdateRequest(APIModel):
+        name: str | None = None
+        vendor: str | None = None
+        url: str | None = None
+        apiKey: str | None = None
+        maxInputTokens: int | None = None
+        maxOutputTokens: int | None = None
+        supportsToolCall: bool | None = None
+        supportsImages: bool | None = None
+        supportsReasoning: bool | None = None
+
+    @app.get("/settings/models")
+    async def list_models() -> list[dict]:
+        """列出所有已配置的模型"""
+        return config.list_models()
+
+    @app.get("/settings/models/{model_id}")
+    async def get_model(model_id: str) -> dict:
+        """获取模型详情（apiKey 脱敏）"""
+        models = config.list_models()
+        for m in models:
+            if m.get("id") == model_id:
+                return m
+        raise HTTPException(status_code=404, detail="模型不存在")
+
+    @app.post("/settings/models")
+    async def add_model(req: ModelAddRequest) -> dict:
+        """新增模型"""
+        model_data = req.model_dump()
+        result = config.add_model(model_data)
+        return result
+
+    @app.put("/settings/models/{model_id}")
+    async def update_model(model_id: str, req: ModelUpdateRequest) -> dict:
+        """更新模型配置"""
+        updates = {k: v for k, v in req.model_dump().items() if v is not None}
+        result = config.update_model(model_id, updates)
+        if result["status"] == "not_found":
+            raise HTTPException(status_code=404, detail="模型不存在")
+
+        # 如果更新的是当前激活模型，热重载 LLM 客户端
+        if model_id == config.llm_active_model_id:
+            try:
+                new_llm = LLMFactory.create(config)
+                executor._llm_client = new_llm
+                learning_engine._llm_client = new_llm
+            except Exception as e:
+                logger.warning("llm_hot_reload_failed", error=str(e))
+
+        return result
+
+    @app.delete("/settings/models/{model_id}")
+    async def delete_model(model_id: str) -> dict:
+        """删除模型"""
+        result = config.delete_model(model_id)
+        if result["status"] == "not_found":
+            raise HTTPException(status_code=404, detail="模型不存在")
+        return result
+
+    @app.post("/settings/models/{model_id}/activate")
+    async def activate_model(model_id: str) -> dict:
+        """切换当前激活的模型"""
+        result = config.activate_model(model_id)
+        if result["status"] == "not_found":
+            raise HTTPException(status_code=404, detail="模型不存在")
+
+        # 热重载 LLM 客户端
+        try:
+            new_llm = LLMFactory.create(config)
+            executor._llm_client = new_llm
+            learning_engine._llm_client = new_llm
+            logger.info("llm_model_switched", provider=config.llm_provider, model=config.llm_model)
+        except Exception as e:
+            logger.warning("llm_hot_reload_failed", error=str(e))
+
+        return result
+
+    # ─── Conversation Persistence ────────────────────────────────
 
     @app.post("/conversations/save")
     async def save_conversation(req: ConversationSave) -> dict:
         """保存会话消息"""
-        conv_id = req.conversation_id
-        _conversations[conv_id] = [m.model_dump() for m in req.messages]
-        return {"status": "saved", "conversation_id": conv_id, "count": len(req.messages)}
+        conversation_store.save(req.conversation_id, [m.model_dump() for m in req.messages])
+        return {"status": "saved", "conversation_id": req.conversation_id, "count": len(req.messages)}
 
     @app.get("/conversations")
     async def list_conversations() -> list[dict]:
         """列出所有保存的会话"""
-        result = []
-        for conv_id, msgs in _conversations.items():
-            first_user = next((m for m in msgs if m["role"] == "user"), None)
-            result.append({
-                "conversation_id": conv_id,
-                "message_count": len(msgs),
-                "preview": first_user["content"][:50] if first_user else "(空)",
-                "last_time": msgs[-1].get("time", "") if msgs else "",
-            })
-        return sorted(result, key=lambda x: x.get("last_time", ""), reverse=True)
+        return conversation_store.list_all()
 
     @app.get("/conversations/{conversation_id}")
     async def get_conversation(conversation_id: str) -> dict:
         """获取会话详情"""
-        msgs = _conversations.get(conversation_id, [])
+        msgs = conversation_store.get(conversation_id)
         return {"conversation_id": conversation_id, "messages": msgs}
 
     @app.delete("/conversations/{conversation_id}")
     async def delete_conversation(conversation_id: str) -> dict:
         """删除会话"""
-        _conversations.pop(conversation_id, None)
+        conversation_store.delete(conversation_id)
         return {"status": "deleted", "conversation_id": conversation_id}
 
     # ─── File Upload ─────────────────────────────────────────────

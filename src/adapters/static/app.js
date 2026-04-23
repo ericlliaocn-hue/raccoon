@@ -10,6 +10,7 @@ marked.setOptions({
 
 // ─── State ─────────────────────────────────────────────
 let convId = null, sending = false, paused = false;
+let currentAbortController = null;  // 用于中断流式请求
 const history = [];
 let autoSaveTimer = null;
 
@@ -36,9 +37,26 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 // ─── SSE ───────────────────────────────────────────────
+let sseConnection = null;
+
 function setupSSE() {
-  const es = new EventSource('/events');
-  es.onmessage = e => { try { handleSSE(JSON.parse(e.data)); } catch {} };
+  connectSSE();
+}
+
+function connectSSE() {
+  if (sseConnection) { sseConnection.close(); sseConnection = null; }
+  const url = convId ? `/events?conversation_id=${encodeURIComponent(convId)}` : '/events';
+  sseConnection = new EventSource(url);
+  sseConnection.onmessage = e => { try { handleSSE(JSON.parse(e.data)); } catch {} };
+  sseConnection.onerror = () => {
+    // 断线重连
+    setTimeout(connectSSE, 3000);
+  };
+}
+
+function reconnectSSE() {
+  // 当 convId 变化时重连 SSE，带上新的 conversation_id
+  connectSSE();
 }
 
 function handleSSE(ev) {
@@ -159,10 +177,12 @@ async function sendMsg() {
   createStreamBubble(bid);
 
   try {
+    currentAbortController = new AbortController();
     const res = await fetch('/chat/stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text, conversation_id: convId }),
+      signal: currentAbortController.signal,
     });
     const reader = res.body.getReader(), dec = new TextDecoder();
     let buf = '';
@@ -180,9 +200,9 @@ async function sendMsg() {
             if (d.source) lastSource = d.source;
             if (d.skill_name) lastSkillName = d.skill_name;
             updateBubble(bid, full, lastSource, lastSkillName);
-            if (d.conversation_id) convId = d.conversation_id;
+            if (d.conversation_id && convId === null) { convId = d.conversation_id; reconnectSSE(); }
           } else if (d.type === 'done') {
-            if (d.conversation_id) convId = d.conversation_id;
+            if (d.conversation_id && convId === null) { convId = d.conversation_id; reconnectSSE(); }
             if (d.source) lastSource = d.source;
             if (d.skill_name) lastSkillName = d.skill_name;
             const srcHtml = renderSourceLabel(lastSource, lastSkillName);
@@ -204,18 +224,21 @@ async function sendMsg() {
     }
     finalizeBubble(bid, full, lastSource, lastSkillName);
   } catch (err) {
-    try {
+    if (err.name === 'AbortError') {
+      finalizeBubble(bid, full || '(已暂停)', lastSource, lastSkillName);
+      addMsg('system', '⏸️ 对话已暂停');
+    } else try {
       const r = await fetch('/message', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text, conversation_id: convId }),
       });
-      const d = await r.json(); convId = d.conversation_id; full = d.reply || '(无响应)';
+      const d = await r.json(); if (convId === null) { convId = d.conversation_id; reconnectSSE(); } full = d.reply || '(无响应)';
       finalizeBubble(bid, full);
     } catch (e2) {
       finalizeBubble(bid, '⚠️ 请求失败: ' + err.message);
     }
-  } finally { sending = false; sendBtn.disabled = false; inputEl.focus(); }
+  } finally { sending = false; sendBtn.disabled = false; currentAbortController = null; inputEl.focus(); }
 }
 
 function sendQuick(t) { inputEl.value = t; sendMsg(); }
@@ -309,7 +332,8 @@ function copyCode(btn) {
 }
 
 function clearChat() {
-  msgsEl.innerHTML = ''; history.length = 0; convId = null; paused = false;
+  if (currentAbortController) currentAbortController.abort();
+  msgsEl.innerHTML = ''; history.length = 0; convId = null; paused = false; sending = false;
   updatePauseBtn();
   if (welcomeEl) welcomeEl.style.display = '';
 }
@@ -318,7 +342,11 @@ function clearChat() {
 function togglePause() {
   paused = !paused;
   updatePauseBtn();
-  addMsg('system', paused ? '⏸️ 对话已暂停' : '▶️ 对话已恢复');
+  if (paused && currentAbortController) {
+    // 暂停时中断正在进行的流式请求
+    currentAbortController.abort();
+  }
+  if (!paused) addMsg('system', '▶️ 对话已恢复');
 }
 
 function updatePauseBtn() {
@@ -331,8 +359,10 @@ function updatePauseBtn() {
 
 function newConversation() {
   if (history.length) saveConversation();
-  msgsEl.innerHTML = ''; history.length = 0; convId = null; paused = false;
+  if (currentAbortController) currentAbortController.abort();
+  msgsEl.innerHTML = ''; history.length = 0; convId = null; paused = false; sending = false;
   updatePauseBtn();
+  reconnectSSE();
   if (welcomeEl) welcomeEl.style.display = '';
   highlightActiveConv();
   inputEl.focus();
@@ -379,6 +409,7 @@ async function loadConversation(id) {
     if (!data.messages || !data.messages.length) return;
     msgsEl.innerHTML = ''; history.length = 0; convId = id; paused = false;
     updatePauseBtn();
+    reconnectSSE();  // 切换会话时重连 SSE
     if (welcomeEl) welcomeEl.style.display = 'none';
     data.messages.forEach(m => {
       const div = document.createElement('div'); div.className = 'msg ' + m.role;
@@ -504,7 +535,19 @@ async function loadLLM() {
     };
     const s = map[llm.status] || map.mock;
     dot.className = 'llm-dot ' + s.cls;
-    prov.textContent = (llm.provider === 'spark' ? '讯飞 codeplan' : llm.provider) + ' · ' + s.text;
+
+    // 尝试从模型列表获取 vendor 信息
+    let vendorLabel = '';
+    try {
+      const modelsRes = await fetch('/settings/models');
+      const models = await modelsRes.json();
+      const active = models.find(m => m.active);
+      if (active) {
+        vendorLabel = active.vendor ? ` · ${active.vendor}` : '';
+      }
+    } catch {}
+
+    prov.textContent = (llm.provider === 'spark' ? '讯飞 codeplan' : llm.provider) + vendorLabel + ' · ' + s.text;
     model.textContent = llm.model || '-';
     const hdr = $('chatStatus');
     if (hdr && llm.status === 'ready') {
@@ -711,4 +754,251 @@ async function deleteWorkflow(id) {
     await fetch(`/workflows/${id}`, { method: 'DELETE' });
     loadWorkflows();
   } catch {}
+}
+
+// ═════════════════════════════════════════════════════════
+// ─── LLM Model Dropdown & Settings ────────────────────
+// ═════════════════════════════════════════════════════════
+
+let llmPresets = [];
+let editingModelId = null;  // null = 新增模式, string = 编辑模式
+
+// ─── Model Dropdown ──────────────────────────────────────
+
+async function toggleModelDropdown(e) {
+  e.stopPropagation();
+  const dd = $('modelDropdown');
+  if (!dd.hidden) { dd.hidden = true; return; }
+  // 加载模型列表
+  await refreshModelDropdown();
+  dd.hidden = false;
+  // 点击外部关闭
+  setTimeout(() => document.addEventListener('click', closeModelDropdown, { once: true }), 0);
+}
+
+function closeModelDropdown() {
+  $('modelDropdown').hidden = true;
+}
+
+async function refreshModelDropdown() {
+  const list = $('modelDropdownList');
+  try {
+    const res = await fetch('/settings/models');
+    const models = await res.json();
+    if (!models.length) {
+      list.innerHTML = '<div class="model-dropdown-empty">暂无配置的模型</div>';
+      return;
+    }
+    list.innerHTML = models.map(m => `
+      <div class="model-item${m.active ? ' active' : ''}" data-id="${escHtml(m.id)}">
+        <div class="model-item-info" onclick="event.stopPropagation();activateModel('${escHtml(m.id)}')">
+          <span class="model-item-name">${escHtml(m.name || m.id)}</span>
+          <span class="model-item-vendor">${escHtml(m.vendor || '')}</span>
+        </div>
+        <button class="model-item-edit" onclick="event.stopPropagation();openLLMSettings('${escHtml(m.id)}')" title="编辑">✏️</button>
+        ${m.active ? '<span class="model-item-active-badge">当前</span>' : ''}
+      </div>
+    `).join('');
+  } catch {
+    list.innerHTML = '<div class="model-dropdown-empty">加载失败</div>';
+  }
+}
+
+async function activateModel(modelId) {
+  try {
+    const res = await fetch(`/settings/models/${modelId}/activate`, { method: 'POST' });
+    const data = await res.json();
+    if (data.status === 'activated') {
+      addMsg('system', `✅ 已切换到模型: ${data.model}`);
+      closeModelDropdown();
+      loadLLM();
+    }
+  } catch (e) {
+    addMsg('system', '⚠️ 切换模型失败: ' + e.message);
+  }
+}
+
+// ─── LLM Settings Modal (新增/编辑模型) ──────────────────
+
+async function openLLMSettings(modelId) {
+  closeModelDropdown();
+  editingModelId = modelId;
+  const modal = $('llmModal');
+  modal.removeAttribute('hidden');
+
+  // 更新标题
+  const hdrTitle = modal.querySelector('.modal-hdr span');
+  hdrTitle.textContent = modelId ? '✏️ 编辑模型' : '➕ 新增模型';
+
+  // 加载预设
+  try {
+    const res = await fetch('/settings/llm/presets');
+    llmPresets = await res.json();
+    const sel = $('llm-preset');
+    sel.innerHTML = '<option value="">-- 选择预设 --</option>' +
+      llmPresets.map(p => `<option value="${p.id}">${p.name} — ${p.description}</option>`).join('');
+  } catch {}
+
+  if (modelId) {
+    // 编辑模式：加载模型数据
+    try {
+      const res = await fetch(`/settings/models/${modelId}`);
+      const m = await res.json();
+      $('llm-apikey').value = m.apiKey || '';
+      $('llm-apikey').placeholder = m.apiKey ? '已设置 (输入新值覆盖)' : '输入 API Key';
+      $('llm-model').value = m.name || '';
+      $('llm-baseurl').value = m.url || '';
+      $('llm-maxtok').value = m.maxOutputTokens || 8192;
+      // 额外字段
+      $('llm-model-id').value = m.id || '';
+      $('llm-vendor').value = m.vendor || 'Custom';
+      $('llm-max-input').value = m.maxInputTokens || '';
+      $('llm-supports-toolcall').checked = m.supportsToolCall || false;
+      $('llm-supports-images').checked = m.supportsImages || false;
+      $('llm-supports-reasoning').checked = m.supportsReasoning || false;
+    } catch {}
+    // 显示删除按钮
+    $('llm-delete-btn').style.display = '';
+  } else {
+    // 新增模式：清空表单
+    $('llm-apikey').value = '';
+    $('llm-apikey').placeholder = '输入 API Key';
+    $('llm-model').value = '';
+    $('llm-baseurl').value = '';
+    $('llm-temp').value = 0.7;
+    $('llm-maxtok').value = 8192;
+    $('llm-model-id').value = '';
+    $('llm-vendor').value = 'Custom';
+    $('llm-max-input').value = '';
+    $('llm-supports-toolcall').checked = false;
+    $('llm-supports-images').checked = false;
+    $('llm-supports-reasoning').checked = false;
+    // 隐藏删除按钮
+    $('llm-delete-btn').style.display = 'none';
+  }
+  // 清空测试结果
+  const tr = $('llm-test-result');
+  tr.style.display = 'none'; tr.className = '';
+}
+
+function closeLLMSettings() {
+  $('llmModal').setAttribute('hidden', '');
+  editingModelId = null;
+}
+
+function applyPreset() {
+  const id = $('llm-preset').value;
+  const preset = llmPresets.find(p => p.id === id);
+  if (!preset) return;
+  $('llm-model').value = preset.model || '';
+  $('llm-baseurl').value = preset.base_url || '';
+  $('llm-vendor').value = preset.name || 'Custom';
+  // 根据 provider 设置 vendor
+  if (preset.provider === 'spark') $('llm-vendor').value = 'Spark';
+  else if (preset.provider === 'openai') $('llm-vendor').value = 'OpenAI';
+}
+
+function toggleKeyVis() {
+  const inp = $('llm-apikey');
+  inp.type = inp.type === 'password' ? 'text' : 'password';
+}
+
+// 从 vendor 推断 provider
+function vendorToProvider(vendor) {
+  const v = (vendor || '').toLowerCase();
+  if (v === 'spark' || v.includes('星火')) return 'spark';
+  if (v === 'mock') return 'mock';
+  return 'openai';
+}
+
+async function testLLM() {
+  const tr = $('llm-test-result');
+  tr.style.display = ''; tr.className = ''; tr.textContent = '⏳ 测试连接中...';
+  try {
+    const res = await fetch('/settings/llm/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        provider: vendorToProvider($('llm-vendor').value),
+        api_key: $('llm-apikey').value || undefined,
+        model: $('llm-model').value,
+        base_url: $('llm-baseurl').value,
+      }),
+    });
+    const data = await res.json();
+    if (data.status === 'ok') {
+      tr.className = 'ok';
+      tr.textContent = `✅ 连接成功！回复: ${data.reply} (Provider: ${data.provider}, Model: ${data.model})`;
+    } else {
+      tr.className = 'err';
+      tr.textContent = `❌ 连接失败: ${data.error}`;
+    }
+  } catch (e) {
+    tr.className = 'err';
+    tr.textContent = `❌ 请求失败: ${e.message}`;
+  }
+}
+
+async function saveLLMSettings() {
+  const modelData = {
+    name: $('llm-model').value.trim(),
+    vendor: $('llm-vendor').value.trim() || 'Custom',
+    url: $('llm-baseurl').value.trim(),
+    apiKey: $('llm-apikey').value || undefined,
+    maxInputTokens: parseInt($('llm-max-input').value) || 0,
+    maxOutputTokens: parseInt($('llm-maxtok').value) || 8192,
+    supportsToolCall: $('llm-supports-toolcall').checked,
+    supportsImages: $('llm-supports-images').checked,
+    supportsReasoning: $('llm-supports-reasoning').checked,
+  };
+  // apiKey 含 *** 则跳过
+  if (modelData.apiKey && modelData.apiKey.includes('***')) {
+    delete modelData.apiKey;
+  }
+
+  try {
+    if (editingModelId) {
+      // 编辑模式
+      const res = await fetch(`/settings/models/${editingModelId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(modelData),
+      });
+      const data = await res.json();
+      if (data.status === 'updated') {
+        addMsg('system', `✅ 模型「${modelData.name}」已更新`);
+        closeLLMSettings();
+        loadLLM();
+      }
+    } else {
+      // 新增模式
+      modelData.id = modelData.name;  // 用模型名作为默认 ID
+      const res = await fetch('/settings/models', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(modelData),
+      });
+      const data = await res.json();
+      if (data.status === 'added') {
+        addMsg('system', `✅ 模型「${modelData.name}」已添加`);
+        closeLLMSettings();
+        loadLLM();
+      }
+    }
+  } catch (e) {
+    addMsg('system', '⚠️ 保存失败: ' + e.message);
+  }
+}
+
+async function deleteModelFromSettings() {
+  if (!editingModelId) return;
+  if (!confirm('确定删除此模型配置？')) return;
+  try {
+    await fetch(`/settings/models/${editingModelId}`, { method: 'DELETE' });
+    addMsg('system', '✅ 模型已删除');
+    closeLLMSettings();
+    loadLLM();
+  } catch (e) {
+    addMsg('system', '⚠️ 删除失败: ' + e.message);
+  }
 }

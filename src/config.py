@@ -64,6 +64,10 @@ class RaccoonConfig(BaseSettings):
     llm_temperature: float = 0.7
     llm_max_tokens: int = 8192
 
+    # ─── 多模型管理 ───
+    llm_models: list[dict] = Field(default_factory=list)  # [{"id","name","vendor","url","apiKey","maxInputTokens","maxOutputTokens","supportsToolCall","supportsImages","supportsReasoning"}, ...]
+    llm_active_model_id: str = ""  # 当前激活的模型 ID（对应 llm_models 中的 id）
+
     model_config = {
         "env_prefix": "RACCOON_",
         "env_file": ".env",
@@ -78,6 +82,239 @@ class RaccoonConfig(BaseSettings):
                 data = json.load(f)
             return cls(**data)
         return cls()
+
+    def update_llm(
+        self,
+        provider: str | None = None,
+        api_key: str | None = None,
+        model: str | None = None,
+        base_url: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> None:
+        """更新 LLM 配置并持久化到 config.json"""
+        if provider is not None:
+            self.llm_provider = provider
+        if api_key is not None:
+            self.llm_api_key = api_key
+        if model is not None:
+            self.llm_model = model
+        if base_url is not None:
+            self.llm_base_url = base_url
+        if temperature is not None:
+            self.llm_temperature = temperature
+        if max_tokens is not None:
+            self.llm_max_tokens = max_tokens
+
+        # 持久化到 config.json
+        config_path = PROJECT_ROOT / "config.json"
+        existing = {}
+        if config_path.exists():
+            with open(config_path) as f:
+                existing = json.load(f)
+
+        llm_fields = {
+            "llm_provider", "llm_api_key", "llm_model",
+            "llm_base_url", "llm_temperature", "llm_max_tokens",
+        }
+        for field in llm_fields:
+            val = getattr(self, field)
+            if field == "llm_temperature":
+                existing[field] = float(val)
+            elif field == "llm_max_tokens":
+                existing[field] = int(val)
+            else:
+                existing[field] = str(val)
+
+        with open(config_path, "w") as f:
+            json.dump(existing, f, indent=2, ensure_ascii=False)
+
+    def mask_api_key(self) -> str:
+        """返回脱敏的 API Key"""
+        key = self.llm_api_key
+        if not key or len(key) <= 8:
+            return "***" if key else ""
+        return key[:4] + "*" * (len(key) - 8) + key[-4:]
+
+    # ─── 多模型管理 ──────────────────────────────────────────
+
+    def list_models(self) -> list[dict]:
+        """列出所有已配置的模型（apiKey 脱敏）"""
+        result = []
+        for m in self.llm_models:
+            entry = dict(m)
+            if entry.get("apiKey"):
+                ak = entry["apiKey"]
+                entry["apiKey"] = ak[:4] + "*" * (len(ak) - 8) + ak[-4:] if len(ak) > 8 else "***"
+            entry["active"] = (m.get("id") == self.llm_active_model_id)
+            result.append(entry)
+        return result
+
+    def get_model(self, model_id: str) -> dict | None:
+        """获取指定模型配置（apiKey 不脱敏，仅内部使用）"""
+        for m in self.llm_models:
+            if m.get("id") == model_id:
+                return dict(m)
+        return None
+
+    def add_model(self, model: dict) -> dict:
+        """新增模型配置"""
+        # 确保 id 唯一
+        model_id = model.get("id", "")
+        if not model_id:
+            import uuid
+            model_id = model.get("name", str(uuid.uuid4())[:8])
+            model["id"] = model_id
+        # 检查 id 冲突
+        existing_ids = {m.get("id") for m in self.llm_models}
+        if model_id in existing_ids:
+            # 追加后缀
+            base = model_id
+            i = 1
+            while model_id in existing_ids:
+                model_id = f"{base}_{i}"
+                i += 1
+            model["id"] = model_id
+        self.llm_models.append(model)
+        self._persist_models()
+        return {"status": "added", "id": model_id}
+
+    def update_model(self, model_id: str, updates: dict) -> dict:
+        """更新模型配置"""
+        for i, m in enumerate(self.llm_models):
+            if m.get("id") == model_id:
+                # 不允许修改 id
+                updates.pop("id", None)
+                # apiKey 含 *** 则跳过
+                if updates.get("apiKey") and "***" in updates.get("apiKey", ""):
+                    updates.pop("apiKey")
+                self.llm_models[i].update(updates)
+                self._persist_models()
+                # 如果更新的是当前激活模型，同步到顶层 LLM 配置
+                if model_id == self.llm_active_model_id:
+                    self._sync_active_model_to_llm()
+                return {"status": "updated", "id": model_id}
+        return {"status": "not_found"}
+
+    def delete_model(self, model_id: str) -> dict:
+        """删除模型配置"""
+        before = len(self.llm_models)
+        self.llm_models = [m for m in self.llm_models if m.get("id") != model_id]
+        if len(self.llm_models) < before:
+            # 如果删除的是当前激活模型，清除激活状态
+            if model_id == self.llm_active_model_id:
+                self.llm_active_model_id = ""
+            self._persist_models()
+            return {"status": "deleted", "id": model_id}
+        return {"status": "not_found"}
+
+    def activate_model(self, model_id: str) -> dict:
+        """切换当前激活的模型"""
+        model = self.get_model(model_id)
+        if not model:
+            return {"status": "not_found"}
+        self.llm_active_model_id = model_id
+        self._sync_active_model_to_llm()
+        self._persist_models()
+        return {"status": "activated", "id": model_id, "provider": self.llm_provider, "model": self.llm_model}
+
+    def _sync_active_model_to_llm(self) -> None:
+        """将激活的模型配置同步到顶层 LLM 字段"""
+        model = self.get_model(self.llm_active_model_id)
+        if not model:
+            return
+        # 根据 vendor 推断 provider
+        vendor = model.get("vendor", "").lower()
+        if vendor == "spark" or "星火" in model.get("vendor", ""):
+            self.llm_provider = "spark"
+        elif vendor == "mock":
+            self.llm_provider = "mock"
+        else:
+            self.llm_provider = "openai"
+        self.llm_api_key = model.get("apiKey", self.llm_api_key)
+        self.llm_model = model.get("name", self.llm_model)
+        self.llm_base_url = model.get("url", self.llm_base_url)
+        if model.get("maxOutputTokens"):
+            self.llm_max_tokens = model["maxOutputTokens"]
+
+    def _persist_models(self) -> None:
+        """持久化模型列表到 config.json"""
+        config_path = PROJECT_ROOT / "config.json"
+        existing = {}
+        if config_path.exists():
+            with open(config_path) as f:
+                existing = json.load(f)
+        existing["llm_models"] = self.llm_models
+        existing["llm_active_model_id"] = self.llm_active_model_id
+        # 同步顶层 LLM 字段
+        llm_fields = {
+            "llm_provider", "llm_api_key", "llm_model",
+            "llm_base_url", "llm_temperature", "llm_max_tokens",
+        }
+        for field in llm_fields:
+            val = getattr(self, field)
+            if field == "llm_temperature":
+                existing[field] = float(val)
+            elif field == "llm_max_tokens":
+                existing[field] = int(val)
+            else:
+                existing[field] = str(val)
+        with open(config_path, "w") as f:
+            json.dump(existing, f, indent=2, ensure_ascii=False)
+
+
+# ─── LLM 预设模板 ─────────────────────────────────────────────
+
+LLM_PRESETS: list[dict] = [
+    {
+        "id": "spark_codeplan",
+        "name": "讯飞 codeplan",
+        "provider": "spark",
+        "base_url": "https://maas-coding-api.cn-huabei-1.xf-yun.com/v2",
+        "model": "astron-code-latest",
+        "description": "讯飞星火 codeplan 编程助手",
+    },
+    {
+        "id": "spark_ultra",
+        "name": "讯飞星火 4.0 Ultra",
+        "provider": "spark",
+        "base_url": "https://spark-api-open.xf-yun.com/v1",
+        "model": "generalv3.5",
+        "description": "讯飞星火大模型 4.0 Ultra",
+    },
+    {
+        "id": "openai_gpt4",
+        "name": "OpenAI GPT-4o",
+        "provider": "openai",
+        "base_url": "https://api.openai.com/v1",
+        "model": "gpt-4o",
+        "description": "OpenAI GPT-4o",
+    },
+    {
+        "id": "deepseek",
+        "name": "DeepSeek Chat",
+        "provider": "openai",
+        "base_url": "https://api.deepseek.com/v1",
+        "model": "deepseek-chat",
+        "description": "DeepSeek Chat（OpenAI 兼容）",
+    },
+    {
+        "id": "qwen",
+        "name": "通义千问",
+        "provider": "openai",
+        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "model": "qwen-plus",
+        "description": "通义千问（OpenAI 兼容）",
+    },
+    {
+        "id": "custom",
+        "name": "自定义",
+        "provider": "openai",
+        "base_url": "",
+        "model": "",
+        "description": "自定义 OpenAI 兼容接口",
+    },
+]
 
 
 def load_config() -> RaccoonConfig:

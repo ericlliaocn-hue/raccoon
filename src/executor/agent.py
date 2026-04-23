@@ -158,6 +158,10 @@ class Executor:
         if not self._might_need_action(text):
             return LlmClassifyResult(classification=LlmClassification.CHITCHAT)
 
+        # 1.5 段：快速排除纯创作/纯聊天类任务（不需要外部数据）
+        if self._is_pure_creative_task(text):
+            return LlmClassifyResult(classification=LlmClassification.CHITCHAT)
+
         # 第二段：Skill 模糊匹配
         matched_skill = await self._match_skill(text)
         if matched_skill:
@@ -532,6 +536,30 @@ class Executor:
                 return True
         return False
 
+    # 纯创作/纯聊天类任务信号词：命中这些说明不需要外部数据
+    _PURE_CREATIVE_SIGNALS = (
+        "写一首", "写首诗", "写首歌", "写个故事", "写个笑话",
+        "写一封", "写一篇", "写段", "写几句",
+        "创作", "即兴", "灵感", "诗意", "押韵",
+        "关于春天", "关于爱情", "关于梦想", "关于友谊",
+    )
+
+    def _is_pure_creative_task(self, text: str) -> bool:
+        """判断是否为纯创作类任务（只需要 LLM 生成，不需要外部数据）
+
+        例如：写诗、写故事、写笑话、创意写作等
+        """
+        t = text.lower().strip()
+        # 直接匹配纯创作信号词
+        for signal in self._PURE_CREATIVE_SIGNALS:
+            if signal in t:
+                return True
+        # 模式匹配："写(一)(首/篇/封/段/个/句)...
+        import re
+        if re.search(r'写[一]?[首篇封段个句].*[诗歌词故事笑话信文]', t):
+            return True
+        return False
+
     async def _match_skill(self, text: str) -> str | None:
         """用 LLM 模糊匹配本地 Skill 清单
 
@@ -562,7 +590,8 @@ class Executor:
 规则：
 1. 只有当某个 Skill 的功能能**完全满足**用户需求时，才返回该 Skill 的 name
 2. "打开网页"/"浏览器自动化"类 Skill 只能打开页面和操作浏览器，**不能**获取、抓取、分析页面内容。如果用户需要获取某网站的特定信息（如排行榜、热搜、价格、新闻等），这些 Skill **无法满足**，必须返回 NONE
-3. 宁可返回 NONE 也不要勉强匹配不合适的 Skill。不确定时一律返回 NONE
+3. **纯创作类任务**（如写诗、写故事、写笑话、创意写作、文案创作等）**不需要任何 Skill**，只需要 LLM 直接生成。这类任务必须返回 NONE
+4. 宁可返回 NONE 也不要勉强匹配不合适的 Skill。不确定时一律返回 NONE
 
 只返回一个词：Skill 的 name 或 NONE。不要解释。"""
 

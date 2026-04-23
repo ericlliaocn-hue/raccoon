@@ -22,12 +22,19 @@
         <div class="logo-icon">🦝</div>
         <div><div class="logo-text">浣熊</div><div class="logo-sub">Project Raccoon v0.2</div></div>
       </div>
-      <div class="llm-bar">
+      <div class="llm-bar" onclick="toggleModelDropdown(event)" style="cursor:pointer" title="点击切换大模型">
         <div class="llm-row">
           <span class="llm-lbl">大模型</span>
           <span class="llm-val"><span class="llm-dot mock" id="llmDot"></span><span id="llmProv">加载中...</span></span>
         </div>
         <div class="llm-model" id="llmModel">-</div>
+        <!-- Model Dropdown -->
+        <div class="model-dropdown" id="modelDropdown" hidden onclick="event.stopPropagation()">
+          <div class="model-dropdown-inner" id="modelDropdownList"></div>
+          <div class="model-dropdown-footer">
+            <button class="model-dropdown-add" onclick="event.stopPropagation();openLLMSettings(null)">➕ 新增模型</button>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -152,6 +159,73 @@
     </div>
   </main>
 </div>
+<!-- LLM Settings Modal -->
+<div class="modal-overlay" id="llmModal" hidden onclick="if(event.target===this)closeLLMSettings()">
+  <div class="modal">
+    <div class="modal-hdr">
+      <span>➕ 新增模型</span>
+      <button class="modal-close" onclick="closeLLMSettings()">✕</button>
+    </div>
+    <div class="modal-body">
+      <label>预设模板</label>
+      <select id="llm-preset" onchange="applyPreset()">
+        <option value="">-- 选择预设 --</option>
+      </select>
+
+      <!-- 额外字段（多模型管理） -->
+      <input type="hidden" id="llm-model-id">
+
+      <label>模型名称 (ID)</label>
+      <input type="text" id="llm-model" placeholder="例: MiniMax-M2.7, gpt-4o">
+
+      <label>Vendor / 供应商</label>
+      <select id="llm-vendor">
+        <option value="Custom">Custom</option>
+        <option value="Spark">讯飞星火 (Spark)</option>
+        <option value="OpenAI">OpenAI</option>
+        <option value="DeepSeek">DeepSeek</option>
+        <option value="Qwen">通义千问 (Qwen)</option>
+        <option value="MiniMax">MiniMax</option>
+        <option value="Mock">Mock (测试)</option>
+      </select>
+
+      <label>API Key</label>
+      <div class="input-with-btn">
+        <input type="password" id="llm-apikey" placeholder="输入 API Key">
+        <button class="inline-btn" onclick="toggleKeyVis()">👁</button>
+      </div>
+
+      <label>Base URL</label>
+      <input type="text" id="llm-baseurl" placeholder="例: https://api.minimaxi.com/v1/chat/completions">
+
+      <div class="modal-row">
+        <div class="modal-col">
+          <label>Max Input Tokens</label>
+          <input type="number" id="llm-max-input" step="1024" min="0" max="1000000" placeholder="例: 262144">
+        </div>
+        <div class="modal-col">
+          <label>Max Output Tokens</label>
+          <input type="number" id="llm-maxtok" step="256" min="256" max="32768" value="8192">
+        </div>
+      </div>
+
+      <label>模型能力</label>
+      <div class="modal-checkboxes">
+        <label class="checkbox-label"><input type="checkbox" id="llm-supports-toolcall"> Tool Call</label>
+        <label class="checkbox-label"><input type="checkbox" id="llm-supports-images"> 图片理解</label>
+        <label class="checkbox-label"><input type="checkbox" id="llm-supports-reasoning"> 推理</label>
+      </div>
+
+      <div class="modal-acts">
+        <button class="modal-btn danger" id="llm-delete-btn" style="display:none" onclick="deleteModelFromSettings()">🗑️ 删除模型</button>
+        <button class="modal-btn" onclick="testLLM()">🧪 测试连接</button>
+        <button class="modal-btn primary" onclick="saveLLMSettings()">💾 保存</button>
+      </div>
+      <div id="llm-test-result" style="display:none"></div>
+    </div>
+  </div>
+</div>
+
 <script src="/static/app.js"></script>
 </body>
 </html>
