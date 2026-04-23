@@ -559,14 +559,22 @@ class Executor:
 
 用户消息：{text}
 
-如果某个 Skill 能满足需求，只返回该 Skill 的 name（如 image_gen）。
-如果没有合适的 Skill，只返回 NONE。
-只返回一个词，不要解释。"""
+规则：
+1. 只有当某个 Skill 的功能能**完全满足**用户需求时，才返回该 Skill 的 name
+2. "打开网页"/"浏览器自动化"类 Skill 只能打开页面和操作浏览器，**不能**获取、抓取、分析页面内容。如果用户需要获取某网站的特定信息（如排行榜、热搜、价格、新闻等），这些 Skill **无法满足**，必须返回 NONE
+3. 宁可返回 NONE 也不要勉强匹配不合适的 Skill。不确定时一律返回 NONE
+
+只返回一个词：Skill 的 name 或 NONE。不要解释。"""
 
         try:
             llm = self._get_llm()
+            # 显式传入 system role 以覆盖 llm.chat 自动注入的 SYSTEM_PROMPT
+            # 避免 LLM 按助手角色回复建议性文字而非精确匹配结果
             response = await llm.chat(
-                [{"role": "user", "content": prompt}],
+                [
+                    {"role": "system", "content": "你是一个 Skill 匹配分类器。严格按照指令只返回一个词：Skill 的 name 或 NONE。不要解释，不要建议，不要回复其他内容。"},
+                    {"role": "user", "content": prompt},
+                ],
                 temperature=0.1,
                 max_tokens=20,
             )

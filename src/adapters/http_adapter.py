@@ -35,7 +35,7 @@ from src.scheduler.schedule_store import ScheduleStore
 from src.notifier.notifier import Notifier
 from src.skill_vault.vault_manager import VaultManager
 from src.supervisor.audit_logger import AuditLogger
-from src.types import Event, RouteType, ScheduleEntry, WorkflowEntry, WorkflowStep
+from src.types import Event, RouteResult, RouteType, ScheduleEntry, WorkflowEntry, WorkflowStep
 from src.workflow.workflow_engine import WorkflowEngine
 from src.workflow.workflow_store import WorkflowStore
 from src.gateway.inbound import GatewayInbound, GatewayAuthError, GatewayRateLimitError
@@ -320,9 +320,10 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
         # 非流式路由（SKILL、LEARN、SKILL_SESSION 等）：直接返回完整结果
         if route.route_type != RouteType.LLM:
             reply = await executor.handle_route_result(route, event)
+            skill_name = route.skill_name or ""
             async def _single():
-                yield f"data: {json.dumps({'type': 'text', 'content': reply or '(无响应)', 'conversation_id': conv_id}, ensure_ascii=False)}\n\n"
-                yield f"data: {json.dumps({'type': 'done', 'conversation_id': conv_id}, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps({'type': 'text', 'content': reply or '(无响应)', 'conversation_id': conv_id, 'source': 'skill', 'skill_name': skill_name}, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps({'type': 'done', 'conversation_id': conv_id, 'source': 'skill', 'skill_name': skill_name}, ensure_ascii=False)}\n\n"
             return StreamingResponse(_single(), media_type="text/event-stream")
 
         # LLM 路由：先分类再分流
@@ -357,9 +358,10 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
                 confidence=0.6,
             )
             reply = await executor.handle_route_result(skill_route, event)
+            skill_name = classify.skill_name or ""
             async def _single():
-                yield f"data: {json.dumps({'type': 'text', 'content': reply or '(无响应)', 'conversation_id': conv_id, 'source': 'skill_matched'}, ensure_ascii=False)}\n\n"
-                yield f"data: {json.dumps({'type': 'done', 'conversation_id': conv_id}, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps({'type': 'text', 'content': reply or '(无响应)', 'conversation_id': conv_id, 'source': 'skill_matched', 'skill_name': skill_name}, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps({'type': 'done', 'conversation_id': conv_id, 'source': 'skill_matched', 'skill_name': skill_name}, ensure_ascii=False)}\n\n"
             return StreamingResponse(_single(), media_type="text/event-stream")
 
         else:

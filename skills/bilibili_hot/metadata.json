@@ -1,0 +1,21 @@
+{
+  "name": "bilibili_hot",
+  "version": "0.1.0",
+  "description": "获取B站热门视频排行榜，抓取并整理当前热门视频的标题、播放量、UP主等信息",
+  "trigger_words": [
+    "B站热门",
+    "B站排行榜",
+    "哔哩哔哩热门",
+    "B站视频排行"
+  ],
+  "intent_tags": [
+    "learned"
+  ],
+  "risk_level": "medium",
+  "requires_approval": false,
+  "timeout_seconds": 60,
+  "entry": "main.py",
+  "permissions": [
+    "requests"
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "name": "weibo_hot",
+  "version": "0.2.0",
+  "description": "获取微博热门排行榜，抓取并整理当前微博热搜词条、热度及相关信息",
+  "trigger_words": [
+    "微博热门",
+    "微博热搜",
+    "微博排行榜"
+  ],
+  "intent_tags": [
+    "learned",
+    "hot_search"
+  ],
+  "risk_level": "low",
+  "requires_approval": false,
+  "timeout_seconds": 30,
+  "entry": "main.py",
+  "permissions": []
+}

@@ -217,8 +217,40 @@ Skill 通过 stdout 输出 JSON 结果：
 | `image_url` | 否 | 图片 URL（如有） |
 | `need_login` | 否 | 是否需要登录（交互式 Skill） |
 | `login_step` | 否 | 当前登录阶段 |
+| `_debug` | 否 | 诊断信息（不展示给用户，仅供引擎自动修复使用） |
 
-## 五、main.py 标准模板
+### 4.3 `_debug` 诊断字段
+
+当 Skill 执行结果不理想时（API 返回异常、数据为空、解析失败等），应在输出 JSON 中写入 `_debug` 字段，帮助 LearningEngine 诊断根因并自动修复。
+
+```json
+{
+  "task_id": "uuid-string",
+  "reply": "当前未能获取到微博热搜数据，请稍后再试。",
+  "files": [],
+  "_debug": {
+    "api_url": "https://m.weibo.cn/api/container/getIndex",
+    "api_status": 200,
+    "api_response": "{\"ok\": -100, \"msg\": \"interface deprecated\"}",
+    "error_detail": "API 返回 ok=-100，接口可能已废弃"
+  }
+}
+```
+
+**`_debug` 字段规范**：
+
+| 子字段 | 说明 |
+|--------|------|
+| `api_url` | 请求的 URL |
+| `api_status` | HTTP 状态码 |
+| `api_response` | API 原始返回（截取前 500 字符即可） |
+| `error_detail` | 具体错误描述（中文） |
+
+**关键规则**：
+- `_debug` **不展示给用户**，仅供引擎诊断和自动修复使用
+- 成功时 `_debug` 可为空字典或省略
+- 失败时**必须**写入 `_debug`，尤其是 API 原始返回——这是 LearningEngine 判断"接口废弃 vs 代码 bug"的关键线索
+- 没有 `_debug` 时，引擎只能靠 reply 文本做语义验证，容易漏判或误判
 
 ### 5.1 最简 Skill（无 Flow）
 

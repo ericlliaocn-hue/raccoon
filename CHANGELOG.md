@@ -5,6 +5,55 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2025-04-23
+
+### 🧠 Data Acquisition Strategy — "API First, Crawl Later"
+
+This release adds a **data acquisition strategy layer** to LearningEngine, making Raccoon's self-learning smarter about *how* to get data — not just *what* code to generate.
+
+> **Before**: LLM guesses an approach (might pick HTML scraping when a JSON API exists).
+> **Now**: LLM lists candidate data sources → engine probes each one → picks the best (API > HTML > CDP).
+
+#### What Changed
+
+- **Data source candidate list in `_analyze_need`**: Instead of asking LLM for a single `approach`, the prompt now asks for a `data_sources` array with priority-ordered candidates (API, HTML, CDP). Backward compatible — if LLM still returns `approach`, it's auto-converted.
+
+- **New `_decide_data_strategy` method**: Probes each candidate data source in priority order:
+  1. Sends a lightweight HTTP request to each candidate URL
+  2. Checks if response is structured JSON (API), HTML page, or unreachable
+  3. For API candidates: verifies JSON structure, detects error codes, checks auth requirements
+  4. For HTML candidates: checks content length (too short = error page)
+  5. Picks the highest-priority usable source; falls back gracefully if all fail
+
+- **New `_probe_source` method**: Single-source probe with smart type detection:
+  - API type: expects JSON, rejects HTML responses (marks as "API not available, let HTML candidate handle it")
+  - HTML type: expects HTML content, validates meaningful content length
+  - CDP type: always marked usable (browser rendering can't be validated via HTTP)
+
+- **Experience records data strategy**: When a Skill is successfully learned, the experience written to MemCore now includes `data_strategy` and `chosen_source`, so future similar requests can skip the probe phase.
+
+- **Updated `learn()` flow**: New step 3 (data strategy decision) inserted between analysis and dependency installation. Step numbering: 1→experience, 2→analyze, 3→**strategy**, 4→install, 5→probe, 6→generate, 7→register, 8→execute+repair, 9→result.
+
+### 🔧 Improvements
+
+- **Approach replan with strategy awareness**: When code repair fails and `_replan_approach` kicks in, the new plan also benefits from the data strategy layer — it will try a different data source type (e.g., switch from API to HTML, or HTML to CDP).
+
+### 🛠 New Skills
+
+- **`bilibili_hot`**: Bilibili (B站) hot video ranking. Uses B站 API with WBI signature.
+- **`weibo_hot`**: Weibo (微博) hot search ranking. Uses Weibo mobile API.
+- **`csdn_hot`**: CSDN blog hot ranking. Uses CSDN phoenix API (structured JSON).
+- **`juejin_hot`**: 掘金 hot article ranking. Uses 掘金 recommend API.
+- **`cnblogs_hot`**: 博客园 top views ranking. HTML scraping (no public API available — a perfect example of the API-first strategy in action).
+- **`36kr_hot`**: 36氪 hot article ranking. Uses 36氪 API.
+
+### 🎨 Web UI
+
+- **Major UI overhaul**: Redesigned chat interface with modern card-based layout, improved message bubbles, and better mobile responsiveness.
+- **Skill execution feedback**: Real-time status indicators for Skill execution and learning flow.
+
+---
+
 ## [0.2.0] - 2025-04-22
 
 ### 🧠 L3 Self-Learning — The Core Update

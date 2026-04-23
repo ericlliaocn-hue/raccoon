@@ -1,0 +1,23 @@
+{
+  "name": "36kr_hot",
+  "version": "0.1.0",
+  "description": "获取36氪热门排行榜，抓取并整理当前热门文章的标题、热度、分类等信息",
+  "trigger_words": [
+    "36氪热门",
+    "36kr热门",
+    "36氪排行榜",
+    "36kr排行榜",
+    "36氪热搜"
+  ],
+  "intent_tags": [
+    "learned"
+  ],
+  "risk_level": "medium",
+  "requires_approval": false,
+  "timeout_seconds": 60,
+  "entry": "main.py",
+  "permissions": [
+    "requests",
+    "beautifulsoup4"
+  ]
+}

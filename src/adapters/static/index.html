@@ -20,7 +20,7 @@
     <div class="sidebar-hdr">
       <div class="logo">
         <div class="logo-icon">🦝</div>
-        <div><div class="logo-text">浣熊</div><div class="logo-sub">Project Raccoon v0.1</div></div>
+        <div><div class="logo-text">浣熊</div><div class="logo-sub">Project Raccoon v0.2</div></div>
       </div>
       <div class="llm-bar">
         <div class="llm-row">
@@ -30,31 +30,69 @@
         <div class="llm-model" id="llmModel">-</div>
       </div>
     </div>
-    <div class="stabs">
-      <button class="stab active" data-panel="skills">🧩 技能</button>
-      <button class="stab" data-panel="tasks">📋 任务</button>
-      <button class="stab" data-panel="history">💬 历史</button>
-    </div>
-    <div class="scontent">
-      <div class="panel active" id="panel-skills">
-        <div class="empty" id="skills-empty"><div class="empty-icon">📦</div><div>加载中...</div></div>
-        <div id="skills-list"></div>
+
+    <!-- 会话主区域 -->
+    <div class="conv-section">
+      <div class="conv-hdr">
+        <span>💬 会话</span>
+        <button class="conv-act" onclick="newConversation()">➕ 新会话</button>
       </div>
-      <div class="panel" id="panel-tasks">
-        <div class="empty" id="tasks-empty"><div class="empty-icon">📋</div><div>暂无任务</div></div>
-        <div id="tasks-list"></div>
-      </div>
-      <div class="panel" id="panel-history">
-        <div class="panel-hdr">
-          <span>💬 会话历史</span>
-          <button class="panel-act" onclick="newConversation()">➕ 新会话</button>
-        </div>
+      <div class="conv-list" id="conv-list">
         <div class="empty" id="conv-empty"><div class="empty-icon">💬</div><div>暂无保存的会话</div></div>
-        <div id="conv-list"></div>
-        <div class="hist-section">
-          <div class="hist-section-hdr">当前会话</div>
-          <div class="empty" id="history-empty"><div class="empty-icon">📝</div><div>暂无消息</div></div>
-          <div id="history-list"></div>
+      </div>
+    </div>
+
+    <!-- 下方折叠分区 -->
+    <div class="sidebar-sections">
+      <!-- 技能 -->
+      <div class="sec">
+        <div class="sec-hdr" onclick="toggleSec('skills')">
+          <span>🧩 技能</span>
+          <span class="sec-arrow" id="arrow-skills">▾</span>
+        </div>
+        <div class="sec-body" id="sec-skills">
+          <div class="empty" id="skills-empty"><div class="empty-icon">📦</div><div>加载中...</div></div>
+          <div id="skills-list"></div>
+        </div>
+      </div>
+
+      <!-- 任务 -->
+      <div class="sec">
+        <div class="sec-hdr" onclick="toggleSec('tasks')">
+          <span>📋 任务</span>
+          <span class="sec-arrow" id="arrow-tasks">▾</span>
+        </div>
+        <div class="sec-body" id="sec-tasks">
+          <div class="empty" id="tasks-empty"><div class="empty-icon">📋</div><div>暂无任务</div></div>
+          <div id="tasks-list"></div>
+        </div>
+      </div>
+
+      <!-- 定时 -->
+      <div class="sec">
+        <div class="sec-hdr" onclick="toggleSec('schedules')">
+          <span>⏰ 定时</span>
+          <span class="sec-arrow" id="arrow-schedules">▸</span>
+        </div>
+        <div class="sec-body collapsed" id="sec-schedules">
+          <div class="sec-act-row"><button class="sec-act" onclick="event.stopPropagation();toggleSchedForm()">➕ 新建</button></div>
+          <div id="sched-form" style="display:none"></div>
+          <div class="empty" id="schedules-empty"><div class="empty-icon">⏰</div><div>暂无定时任务</div></div>
+          <div id="schedules-list"></div>
+        </div>
+      </div>
+
+      <!-- 流程 -->
+      <div class="sec">
+        <div class="sec-hdr" onclick="toggleSec('workflows')">
+          <span>🔗 流程</span>
+          <span class="sec-arrow" id="arrow-workflows">▸</span>
+        </div>
+        <div class="sec-body collapsed" id="sec-workflows">
+          <div class="sec-act-row"><button class="sec-act" onclick="event.stopPropagation();toggleWfForm()">➕ 新建</button></div>
+          <div id="wf-form" style="display:none"></div>
+          <div class="empty" id="workflows-empty"><div class="empty-icon">🔗</div><div>暂无工作流</div></div>
+          <div id="workflows-list"></div>
         </div>
       </div>
     </div>
@@ -78,7 +116,7 @@
       <div class="welcome" id="welcome">
         <div class="welcome-icon">🦝</div>
         <div class="welcome-title">你好，我是浣熊</div>
-        <div class="welcome-sub">事件驱动的 AI 智能体框架，支持多轮对话、Skill 调用和任务管理。<br>输入消息开始对话，或试试下面的功能卡片。</div>
+        <div class="welcome-sub">事件驱动的 AI 智能体框架，支持多轮对话、Skill 调用、定时任务和工作流编排。<br>输入消息开始对话，或试试下面的功能卡片。</div>
         <div class="feat-grid">
           <div class="feat-card" onclick="sendQuick('帮我写一首关于春天的诗')">
             <div class="feat-icon">✍️</div><div class="feat-title">创意写作</div><div class="feat-desc">诗歌、故事、文案</div>
