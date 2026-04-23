@@ -80,8 +80,42 @@ class RaccoonConfig(BaseSettings):
         if path.exists():
             with open(path) as f:
                 data = json.load(f)
-            return cls(**data)
+            config = cls(**data)
+            # 迁移：如果 llm_models 为空但有旧版 LLM 配置，自动创建默认模型
+            config._migrate_legacy_llm_config()
+            return config
         return cls()
+
+    def _migrate_legacy_llm_config(self) -> None:
+        """将旧版单模型配置迁移到 llm_models 列表"""
+        if self.llm_models:
+            return  # 已有模型列表，无需迁移
+        if not self.llm_api_key:
+            return  # 没有配置 API Key，无法创建模型
+
+        # 根据 provider 推断 vendor
+        vendor_map = {
+            "spark": "讯飞",
+            "openai": "OpenAI",
+            "mock": "Mock",
+        }
+        vendor = vendor_map.get(self.llm_provider, self.llm_provider)
+
+        # 创建默认模型
+        default_model = {
+            "id": self.llm_model or "default",
+            "name": self.llm_model or "Default Model",
+            "vendor": vendor,
+            "url": self.llm_base_url,
+            "apiKey": self.llm_api_key,
+            "maxOutputTokens": self.llm_max_tokens,
+        }
+        self.llm_models = [default_model]
+        self.llm_active_model_id = default_model["id"]
+
+        # 持久化迁移后的配置
+        self._persist_models()
+        print(f"[Config] 已自动迁移旧版 LLM 配置到模型列表: {default_model['name']}")
 
     def update_llm(
         self,

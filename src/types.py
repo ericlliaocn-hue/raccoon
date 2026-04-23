@@ -142,6 +142,8 @@ class SkillMetadata(BaseModel):
     permissions: list[str] = Field(default_factory=list)  # network / filesystem / subprocess
     interactive: bool = False  # 是否需要多轮交互
     flow: FlowDefinition | None = None  # 流程定义（interactive=True 时必填）
+    enabled: bool = True  # 是否启用（默认启用，用户可手动关闭）
+    starred: bool = False  # 是否收藏
 
 
 # ─── Memory ────────────────────────────────────────────────────

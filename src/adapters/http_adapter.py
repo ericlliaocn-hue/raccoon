@@ -80,6 +80,11 @@ class SkillInfo(APIModel):
     version: str
     description: str
     trigger_words: list[str]
+    enabled: bool = False
+    risk_level: str = "low"
+    interactive: bool = False
+    intent_tags: list[str] = []
+    starred: bool = False
 
 
 class ScheduleCreateRequest(APIModel):
@@ -113,8 +118,8 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
     executor = Executor(event_bus, vault_manager, config)
     audit_logger = AuditLogger(config)
 
-    # 注册 Skill
-    for skill in vault_manager.list_skills():
+    # 只注册已启用的 Skill
+    for skill in vault_manager.list_enabled_skills():
         router.register_skill(skill)
 
     # 定时调度
@@ -196,7 +201,6 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
         html_path = Path(__file__).parent / "static" / "index.html"
         return HTMLResponse(content=html_path.read_text("utf-8"))
 
-    from fastapi.staticfiles import StaticFiles
     static_dir = Path(__file__).parent / "static"
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
@@ -444,7 +448,7 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
 
     @app.get("/skills", response_model=list[SkillInfo])
     async def list_skills() -> list[SkillInfo]:
-        """列出已安装 Skill"""
+        """列出所有已安装 Skill（含启用/禁用状态）"""
         skills = vault_manager.list_skills()
         return [
             SkillInfo(
@@ -452,9 +456,39 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
                 version=s.version,
                 description=s.description,
                 trigger_words=s.trigger_words,
+                enabled=s.enabled,
+                risk_level=s.risk_level,
+                interactive=s.interactive,
+                intent_tags=getattr(s, 'intent_tags', []) or [],
+                starred=getattr(s, 'starred', False) or False,
             )
             for s in skills
         ]
+
+    @app.post("/skills/{name}/toggle")
+    async def toggle_skill(name: str) -> dict:
+        """切换 Skill 启用/禁用"""
+        try:
+            meta = vault_manager.toggle_skill(name)
+            # 重新注册路由
+            if meta.enabled:
+                router.register_skill(meta)
+            else:
+                router.unregister_skill(meta)
+            return {"name": name, "enabled": meta.enabled}
+        except KeyError:
+            from fastapi.responses import JSONResponse
+            return JSONResponse(status_code=404, content={"error": f"Skill '{name}' not found"})
+
+    @app.post("/skills/{name}/star")
+    async def toggle_star(name: str) -> dict:
+        """切换 Skill 收藏/取消收藏"""
+        try:
+            meta = vault_manager.toggle_star(name)
+            return {"name": name, "starred": meta.starred}
+        except KeyError:
+            from fastapi.responses import JSONResponse
+            return JSONResponse(status_code=404, content={"error": f"Skill '{name}' not found"})
 
     @app.get("/status")
     async def system_status() -> dict:

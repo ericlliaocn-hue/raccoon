@@ -2,12 +2,19 @@
   "name": "echo",
   "version": "0.1.0",
   "description": "回显用户消息的示例 Skill",
-  "trigger_words": ["echo", "回显"],
+  "trigger_words": [
+    "echo",
+    "回显"
+  ],
   "aliases": [],
-  "intent_tags": ["utility"],
+  "intent_tags": [
+    "utility"
+  ],
   "risk_level": "low",
   "requires_approval": false,
   "timeout_seconds": 30,
   "entry": "main.py",
-  "permissions": []
+  "permissions": [],
+  "enabled": true,
+  "starred": false
 }

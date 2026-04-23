@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] - 2025-04-24
+
+### 🎨 UI: 技能商城重构 + 收藏功能
+
+- **商城弹窗重构为左右布局**：左侧 180px 分类 Tab 竖排（全部/系统自带/装机必装/效率/资讯/创作/开发/浏览器/自学习），右侧技能列表内容区，固定尺寸 960×680px
+- **搜索框移至左侧 sidebar 顶部**：搜索仅匹配技能名称，Tab 过滤（未启用/已启用）始终生效
+- **新增技能收藏功能**：每个技能卡片增加 ★ star 按钮，点击收藏/取消收藏，状态持久化到 metadata.json
+- **新增 API**：`POST /skills/{name}/star` 切换收藏状态
+- **SkillMetadata 新增 `starred` 字段**：`starred: bool = False`
+- **静态资源缓存控制**：CSS/JS 引用加版本号参数，避免浏览器缓存旧文件
+- **Config 迁移**：旧版单模型 LLM 配置自动迁移到 `llm_models` 列表
+
 ## [0.3.1] - 2025-04-23
 
 ### 📦 Release v0.3.1 — LLM Classifier Integration Test + Dev Conventions

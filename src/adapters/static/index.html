@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>浣熊 · Project Raccoon</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github-dark.min.css">
-<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/style.css?v=0.3.1c">
 <script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/core.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/languages/python.min.js"></script>
@@ -55,9 +55,12 @@
       <div class="sec">
         <div class="sec-hdr" onclick="toggleSec('skills')">
           <span>🧩 技能</span>
-          <span class="sec-arrow" id="arrow-skills">▾</span>
+          <div class="sec-hdr-actions">
+            <span class="market-btn" onclick="event.stopPropagation();openMarket()" title="技能商城">🏪</span>
+            <span class="sec-arrow" id="arrow-skills">▸</span>
+          </div>
         </div>
-        <div class="sec-body" id="sec-skills">
+        <div class="sec-body collapsed" id="sec-skills">
           <div class="empty" id="skills-empty"><div class="empty-icon">📦</div><div>加载中...</div></div>
           <div id="skills-list"></div>
         </div>
@@ -67,9 +70,9 @@
       <div class="sec">
         <div class="sec-hdr" onclick="toggleSec('tasks')">
           <span>📋 任务</span>
-          <span class="sec-arrow" id="arrow-tasks">▾</span>
+          <span class="sec-arrow" id="arrow-tasks">▸</span>
         </div>
-        <div class="sec-body" id="sec-tasks">
+        <div class="sec-body collapsed" id="sec-tasks">
           <div class="empty" id="tasks-empty"><div class="empty-icon">📋</div><div>暂无任务</div></div>
           <div id="tasks-list"></div>
         </div>
@@ -159,6 +162,47 @@
     </div>
   </main>
 </div>
+<!-- Skill Market Modal -->
+<div class="modal-overlay" id="marketModal" hidden onclick="if(event.target===this)closeMarket()">
+  <div class="market-modal">
+    <div class="market-modal-hdr">
+      <span>🏪 技能商城</span>
+      <button class="modal-close" onclick="closeMarket()">✕</button>
+    </div>
+    <div class="market-modal-body">
+      <!-- 左侧分类 Tab -->
+      <div class="market-sidebar">
+        <div class="market-search">
+          <input type="text" id="market-search-input" placeholder="🔍 搜索技能..." oninput="filterMarketSkills()">
+        </div>
+        <div class="market-cats" id="market-cats">
+          <button class="market-cat active" data-cat="all" onclick="switchMarketCat('all')">📋 全部</button>
+          <button class="market-cat" data-cat="builtin" onclick="switchMarketCat('builtin')">🔧 系统自带</button>
+          <button class="market-cat" data-cat="essential" onclick="switchMarketCat('essential')">⭐ 装机必装</button>
+          <button class="market-cat" data-cat="efficiency" onclick="switchMarketCat('efficiency')">⚡ 效率</button>
+          <button class="market-cat" data-cat="info" onclick="switchMarketCat('info')">📰 资讯</button>
+          <button class="market-cat" data-cat="creative" onclick="switchMarketCat('creative')">🎨 创作</button>
+          <button class="market-cat" data-cat="dev" onclick="switchMarketCat('dev')">💻 开发</button>
+          <button class="market-cat" data-cat="browser" onclick="switchMarketCat('browser')">🌐 浏览器</button>
+          <button class="market-cat" data-cat="learned" onclick="switchMarketCat('learned')">📚 自学习</button>
+        </div>
+      </div>
+      <!-- 右侧内容区 -->
+      <div class="market-main">
+        <div class="market-tabs">
+          <button class="market-tab active" data-tab="disabled" onclick="switchMarketTab('disabled')">未启用</button>
+          <button class="market-tab" data-tab="enabled" onclick="switchMarketTab('enabled')">已启用</button>
+          <button class="market-tab" data-tab="ranking" onclick="switchMarketTab('ranking')">🏆 排行榜</button>
+        </div>
+        <div class="market-content" id="market-content">
+          <div class="empty" id="market-modal-empty"><div class="empty-icon">✅</div><div>所有技能均已启用</div></div>
+          <div id="market-modal-list"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- LLM Settings Modal -->
 <div class="modal-overlay" id="llmModal" hidden onclick="if(event.target===this)closeLLMSettings()">
   <div class="modal">
@@ -226,6 +270,6 @@
   </div>
 </div>
 
-<script src="/static/app.js"></script>
+<script src="/static/app.js?v=0.3.1c"></script>
 </body>
 </html>

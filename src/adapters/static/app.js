@@ -21,8 +21,6 @@ const msgsEl = $('messages'), inputEl = $('input'),
 
 // ─── Init ──────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
-  loadSkills();
-  loadTasks();
   loadLLM();
   loadSavedConversations();
   loadSchedules();
@@ -490,16 +488,248 @@ function toggleSec(name) {
 async function loadSkills() {
   try {
     const res = await fetch('/skills'), skills = await res.json();
+    const enabled = skills.filter(s => s.enabled);
+
+    // 已启用列表
     const list = $('skills-list'), empty = $('skills-empty');
-    if (!skills.length) {
-      empty.innerHTML = '<div class="empty-icon">📦</div><div>暂无已安装技能</div>';
-      empty.style.display = ''; list.innerHTML = ''; return;
+    if (!enabled.length) {
+      empty.innerHTML = '<div class="empty-icon">📦</div><div>暂无已启用技能</div>';
+      empty.style.display = ''; list.innerHTML = '';
+    } else {
+      empty.style.display = 'none';
+      list.innerHTML = enabled.map(s => renderSkillCard(s, true)).join('');
     }
-    empty.style.display = 'none';
-    list.innerHTML = skills.map(s =>
-      `<div class="skill-card" onclick="sendQuick('${s.trigger_words[0] || s.name}')"><div class="sk-name">${s.name}<span class="sk-ver">v${s.version}</span></div><div class="sk-desc">${s.description || '无描述'}</div><div class="sk-triggers">${s.trigger_words.map(w => `<span class="ttag">${w}</span>`).join('')}</div></div>`
-    ).join('');
   } catch { $('skills-empty').innerHTML = '<div class="empty-icon">⚠️</div><div>加载失败</div>'; }
+}
+
+function renderSkillCard(s, isEnabled) {
+  const toggleClass = isEnabled ? 'sk-toggle on' : 'sk-toggle';
+  const toggleLabel = isEnabled ? '已启用' : '启用';
+  const riskBadge = s.risk_level && s.risk_level !== 'low'
+    ? `<span class="sk-risk ${s.risk_level}">${s.risk_level === 'medium' ? '⚠️' : '🔴'} ${s.risk_level}</span>` : '';
+  const interBadge = s.interactive ? '<span class="sk-badge interactive">交互式</span>' : '';
+  return `<div class="skill-card${isEnabled ? ' enabled' : ''}">
+    <div class="sk-top">
+      <div class="sk-name">${s.name}<span class="sk-ver">v${s.version}</span>${riskBadge}${interBadge}</div>
+      <button class="${toggleClass}" onclick="event.stopPropagation();toggleSkill('${s.name}',${isEnabled})" title="${toggleLabel}"><span class="sk-toggle-dot"></span></button>
+    </div>
+    <div class="sk-desc">${s.description || '无描述'}</div>
+    <div class="sk-triggers">${s.trigger_words.map(w => `<span class="ttag">${w}</span>`).join('')}</div>
+  </div>`;
+}
+
+async function toggleSkill(name, currentEnabled) {
+  try {
+    const res = await fetch(`/skills/${name}/toggle`, { method: 'POST' });
+    const data = await res.json();
+    if (res.ok) {
+      loadSkills(); // 刷新侧边栏列表
+      // 如果商城弹窗开着，也刷新
+      if (!$('marketModal').hasAttribute('hidden')) loadMarketSkills();
+    }
+  } catch {}
+}
+
+// ═════════════════════════════════════════════════════════
+// ─── Skill Market Modal ──────────────────────────────────
+// ═════════════════════════════════════════════════════════
+
+let marketTab = 'disabled';  // 'disabled' | 'enabled' | 'ranking'
+let marketCat = 'all';       // 'all' | 'builtin' | 'essential' | ...
+let marketSkillsCache = [];   // 缓存技能列表
+
+// ─── 技能分类映射（基于 intent_tags + 名称规则）───
+const SKILL_CATEGORIES = {
+  builtin:    { label: '🔧 系统自带', match: s => ['echo'].includes(s.name) },
+  essential:  { label: '⭐ 装机必装', match: s => ['file_read','file_search','shell_exec','web_browse'].includes(s.name) },
+  efficiency: { label: '⚡ 效率',     match: s => ['clipboard','screenshot','system_info','change_detector','file_batch','file_analyze'].includes(s.name) },
+  info:       { label: '📰 资讯',     match: s => s.intent_tags?.includes('learned') || ['36kr_hot','baidu_hot','bilibili_hot','weibo_hot','csdn_hot','juejin_hot','cnblogs_hot','ai_daily_report','xiaohongshu_daily_report'].includes(s.name) },
+  creative:   { label: '🎨 创作',     match: s => s.intent_tags?.includes('image') || s.intent_tags?.includes('generation') || ['image_gen'].includes(s.name) },
+  dev:        { label: '💻 开发',     match: s => ['git_helper','log_watcher'].includes(s.name) || s.intent_tags?.includes('system') },
+  browser:    { label: '🌐 浏览器',   match: s => s.intent_tags?.includes('browser') || s.intent_tags?.includes('web') || s.intent_tags?.includes('automate') || ['web_automate','app_control'].includes(s.name) },
+  learned:    { label: '📚 自学习',   match: s => s.intent_tags?.includes('learned') },
+};
+
+// 获取技能所属分类 key
+function getSkillCategory(s) {
+  for (const [key, cat] of Object.entries(SKILL_CATEGORIES)) {
+    if (cat.match(s)) return key;
+  }
+  return 'efficiency'; // 默认归入效率
+}
+
+// 排行榜权重（使用次数模拟 + 人工权重）
+const RANKING_WEIGHTS = {
+  echo: 100, file_read: 95, shell_exec: 90, web_browse: 85,
+  image_gen: 80, web_automate: 75, file_search: 70, clipboard: 65,
+  screenshot: 60, git_helper: 55, file_batch: 50, system_info: 45,
+  change_detector: 40, ai_daily_report: 38, '36kr_hot': 35,
+  bilibili_hot: 32, baidu_hot: 30, weibo_hot: 28, log_watcher: 25,
+  file_analyze: 22, app_control: 20, csdn_hot: 18, juejin_hot: 16,
+  cnblogs_hot: 14, xiaohongshu_daily_report: 12,
+};
+
+function openMarket() {
+  $('marketModal').removeAttribute('hidden');
+  loadMarketSkills();
+}
+
+function closeMarket() {
+  $('marketModal').setAttribute('hidden', '');
+}
+
+function switchMarketTab(tab) {
+  marketTab = tab;
+  document.querySelectorAll('.market-tab').forEach(el => {
+    el.classList.toggle('active', el.dataset.tab === tab);
+  });
+  loadMarketSkills();
+}
+
+function switchMarketCat(cat) {
+  marketCat = cat;
+  document.querySelectorAll('.market-cat').forEach(el => {
+    el.classList.toggle('active', el.dataset.cat === cat);
+  });
+  loadMarketSkills();
+}
+
+async function loadMarketSkills() {
+  try {
+    const res = await fetch('/skills');
+    const skills = await res.json();
+    marketSkillsCache = skills.map(s => ({
+      ...s,
+      category: getSkillCategory(s),
+      rankScore: RANKING_WEIGHTS[s.name] || 10,
+    }));
+
+    renderMarketContent();
+  } catch {
+    $('market-modal-empty').innerHTML = '<div class="empty-icon">⚠️</div><div>加载失败</div>';
+    $('market-modal-empty').style.display = '';
+    $('market-modal-list').innerHTML = '';
+  }
+}
+
+function renderMarketContent() {
+  let skills = [...marketSkillsCache];
+  const list = $('market-modal-list');
+  const empty = $('market-modal-empty');
+
+  // 搜索过滤（仅匹配技能名称）
+  const q = ($('market-search-input')?.value || '').toLowerCase();
+  if (q) {
+    skills = skills.filter(s => s.name.toLowerCase().includes(q));
+  }
+
+  // 分类过滤
+  if (marketCat !== 'all') {
+    skills = skills.filter(s => s.category === marketCat);
+  }
+
+  // Tab 过滤
+  if (marketTab === 'disabled') {
+    skills = skills.filter(s => !s.enabled);
+  } else if (marketTab === 'enabled') {
+    skills = skills.filter(s => s.enabled);
+  }
+  if (marketTab === 'ranking') {
+    skills.sort((a, b) => b.rankScore - a.rankScore);
+  }
+
+  if (!skills.length) {
+    empty.style.display = '';
+    const msgs = {
+      disabled: '<div class="empty-icon">✅</div><div>该分类下所有技能均已启用</div>',
+      enabled:  '<div class="empty-icon">📦</div><div>该分类下暂无已启用技能</div>',
+      ranking:  '<div class="empty-icon">🏆</div><div>暂无排行数据</div>',
+    };
+    empty.innerHTML = msgs[marketTab] || '<div class="empty-icon">📦</div><div>暂无技能</div>';
+    list.innerHTML = '';
+    return;
+  }
+
+  empty.style.display = 'none';
+
+  if (marketTab === 'ranking') {
+    list.innerHTML = skills.map((s, i) => renderMarketRankCard(s, i + 1)).join('');
+  } else {
+    list.innerHTML = skills.map(s => renderMarketSkillCard(s)).join('');
+  }
+}
+
+function renderMarketSkillCard(s) {
+  const cat = SKILL_CATEGORIES[s.category];
+  const catLabel = cat ? cat.label.split(' ').pop() : s.category;
+  const riskBadge = s.risk_level && s.risk_level !== 'low'
+    ? `<span class="sk-risk ${s.risk_level}">${s.risk_level === 'medium' ? '⚠️' : '🔴'} ${s.risk_level}</span>` : '';
+  const interBadge = s.interactive ? '<span class="sk-badge interactive">交互式</span>' : '';
+  const toggleClass = s.enabled ? 'sk-toggle on' : 'sk-toggle';
+  const starClass = s.starred ? 'sk-star on' : 'sk-star';
+
+  return `<div class="market-skill-card${s.enabled ? ' enabled' : ''}">
+    <div class="market-skill-top">
+      <div class="market-skill-name">${s.name}<span class="market-skill-ver">v${s.version}</span><span class="market-skill-cat">${catLabel}</span>${riskBadge}${interBadge}</div>
+      <div class="market-skill-actions">
+        <button class="${starClass}" onclick="event.stopPropagation();toggleStarInMarket('${s.name}',${!!s.starred})" title="${s.starred ? '取消收藏' : '收藏'}">★</button>
+        <button class="${toggleClass}" onclick="event.stopPropagation();toggleSkillInMarket('${s.name}',${s.enabled})" title="${s.enabled ? '禁用' : '启用'}"><span class="sk-toggle-dot"></span></button>
+      </div>
+    </div>
+    <div class="market-skill-desc">${s.description || '无描述'}</div>
+    <div class="market-skill-triggers">${(s.trigger_words || []).map(w => `<span class="ttag">${w}</span>`).join('')}</div>
+  </div>`;
+}
+
+function renderMarketRankCard(s, rank) {
+  const cat = SKILL_CATEGORIES[s.category];
+  const catLabel = cat ? cat.label.split(' ').pop() : s.category;
+  const rankCls = rank <= 3 ? `r${rank}` : 'rn';
+  const riskBadge = s.risk_level && s.risk_level !== 'low'
+    ? `<span class="sk-risk ${s.risk_level}">${s.risk_level === 'medium' ? '⚠️' : '🔴'} ${s.risk_level}</span>` : '';
+  const toggleClass = s.enabled ? 'sk-toggle on' : 'sk-toggle';
+  const starClass = s.starred ? 'sk-star on' : 'sk-star';
+
+  return `<div class="market-skill-card${s.enabled ? ' enabled' : ''}">
+    <div class="market-skill-top">
+      <div class="market-skill-name">
+        <span class="market-rank-badge ${rankCls}">${rank}</span>
+        ${s.name}<span class="market-skill-ver">v${s.version}</span><span class="market-skill-cat">${catLabel}</span>${riskBadge}
+      </div>
+      <div class="market-skill-actions">
+        <button class="${starClass}" onclick="event.stopPropagation();toggleStarInMarket('${s.name}',${!!s.starred})" title="${s.starred ? '取消收藏' : '收藏'}">★</button>
+        <button class="${toggleClass}" onclick="event.stopPropagation();toggleSkillInMarket('${s.name}',${s.enabled})" title="${s.enabled ? '禁用' : '启用'}"><span class="sk-toggle-dot"></span></button>
+      </div>
+    </div>
+    <div class="market-skill-desc">${s.description || '无描述'}</div>
+    <div class="market-skill-triggers">
+      ${(s.trigger_words || []).map(w => `<span class="ttag">${w}</span>`).join('')}
+      <span class="market-rank-stat">🔥 热度 ${s.rankScore}</span>
+    </div>
+  </div>`;
+}
+
+async function toggleSkillInMarket(name, currentEnabled) {
+  try {
+    const res = await fetch(`/skills/${name}/toggle`, { method: 'POST' });
+    if (res.ok) {
+      loadSkills();        // 刷新侧边栏
+      loadMarketSkills();  // 刷新商城弹窗
+    }
+  } catch {}
+}
+
+async function toggleStarInMarket(name, currentStarred) {
+  try {
+    const res = await fetch(`/skills/${name}/star`, { method: 'POST' });
+    if (res.ok) {
+      loadMarketSkills();  // 刷新商城弹窗
+    }
+  } catch {}
+}
+
+function filterMarketSkills() {
+  renderMarketContent();
 }
 
 // ─── Tasks ─────────────────────────────────────────────

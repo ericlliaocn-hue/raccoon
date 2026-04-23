@@ -92,8 +92,48 @@ class VaultManager:
         return SkillMetadata.model_validate(data)
 
     def list_skills(self) -> list[SkillMetadata]:
-        """列出已安装的 Skill"""
+        """列出所有已安装的 Skill"""
         return list(self._skills.values())
+
+    def list_enabled_skills(self) -> list[SkillMetadata]:
+        """列出已启用的 Skill"""
+        return [s for s in self._skills.values() if s.enabled]
+
+    def toggle_skill(self, name: str) -> SkillMetadata:
+        """切换 Skill 启用/禁用状态"""
+        meta = self._skills.get(name)
+        if not meta:
+            raise KeyError(f"Skill not found: {name}")
+        meta.enabled = not meta.enabled
+        # 持久化到 metadata.json
+        self._persist_skill_meta(name)
+        logger.info("skill_toggled", name=name, enabled=meta.enabled)
+        return meta
+
+    def toggle_star(self, name: str) -> SkillMetadata:
+        """切换 Skill 收藏/取消收藏状态"""
+        meta = self._skills.get(name)
+        if not meta:
+            raise KeyError(f"Skill not found: {name}")
+        meta.starred = not meta.starred
+        self._persist_skill_meta(name)
+        logger.info("skill_star_toggled", name=name, starred=meta.starred)
+        return meta
+
+    def _persist_skill_meta(self, name: str) -> None:
+        """将 Skill 元数据写回 metadata.json"""
+        meta = self._skills.get(name)
+        if not meta:
+            return
+        import json
+        meta_path = self._skills_dir / name / "metadata.json"
+        if not meta_path.exists():
+            return
+        # 读取原始数据，只更新 enabled/starred 字段，保留其他原始格式
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+        data["enabled"] = meta.enabled
+        data["starred"] = meta.starred
+        meta_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def get_skill(self, name: str) -> SkillMetadata | None:
         """获取 Skill 元数据"""
