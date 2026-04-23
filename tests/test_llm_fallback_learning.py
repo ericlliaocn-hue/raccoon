@@ -47,8 +47,13 @@ class TestClassifyLlmMessage:
         mock_vault.list_skills = MagicMock(return_value=[mock_skill])
 
         executor = _make_executor(_vault_manager=mock_vault)
-        # _match_skill 需要 LLM，mock 它直接返回
-        executor._match_skill = AsyncMock(return_value="change_detector")
+        # _llm_classify 需要 LLM，mock 它直接返回
+        executor._llm_classify = AsyncMock(
+            return_value=LlmClassifyResult(
+                classification=LlmClassification.SKILL_MATCHED,
+                skill_name="change_detector",
+            )
+        )
 
         result = await executor.classify_llm_message("帮我监控网站变化")
         assert result.classification == LlmClassification.SKILL_MATCHED
@@ -62,6 +67,170 @@ class TestClassifyLlmMessage:
 
 
 # ─── _might_need_action ────────────────────────────────────────────
+
+
+class TestLlmClassify:
+    """_llm_classify 核心测试"""
+
+    def _make_executor_with_skills(self, skills=None):
+        """创建带 Skill 的 Executor，并 mock LLM"""
+        mock_vault = MagicMock()
+        mock_vault.list_skills = MagicMock(return_value=skills or [])
+        executor = _make_executor(_vault_manager=mock_vault)
+        return executor
+
+    @pytest.mark.asyncio
+    async def test_no_skills_returns_needs_learn(self):
+        """无已安装 Skill → NEEDS_LEARN"""
+        executor = self._make_executor_with_skills(skills=[])
+        result = await executor._llm_classify("帮我查天气")
+        assert result.classification == LlmClassification.NEEDS_LEARN
+
+    @pytest.mark.asyncio
+    async def test_llm_returns_chitchat(self):
+        """LLM 返回 CHITCHAT → 纯创作/问答"""
+        mock_skill = MagicMock()
+        mock_skill.name = "weather_query"
+        mock_skill.trigger_words = ["天气"]
+        mock_skill.aliases = []
+        mock_skill.intent_tags = ["weather"]
+        executor = self._make_executor_with_skills(skills=[mock_skill])
+
+        mock_llm = AsyncMock()
+        mock_llm.chat = AsyncMock(return_value="CHITCHAT")
+        executor._get_llm = MagicMock(return_value=mock_llm)
+
+        result = await executor._llm_classify("帮我写一首关于春天的诗")
+        assert result.classification == LlmClassification.CHITCHAT
+
+    @pytest.mark.asyncio
+    async def test_llm_returns_skill_matched(self):
+        """LLM 返回 SKILL:xxx → 匹配到已有 Skill"""
+        mock_skill = MagicMock()
+        mock_skill.name = "weather_query"
+        mock_skill.trigger_words = ["天气"]
+        mock_skill.aliases = []
+        mock_skill.intent_tags = ["weather"]
+        executor = self._make_executor_with_skills(skills=[mock_skill])
+
+        mock_llm = AsyncMock()
+        mock_llm.chat = AsyncMock(return_value="SKILL:weather_query")
+        executor._get_llm = MagicMock(return_value=mock_llm)
+
+        result = await executor._llm_classify("帮我查天气")
+        assert result.classification == LlmClassification.SKILL_MATCHED
+        assert result.skill_name == "weather_query"
+
+    @pytest.mark.asyncio
+    async def test_llm_returns_needs_learn(self):
+        """LLM 返回 NEEDS_LEARN → 需要外部数据但无匹配 Skill"""
+        mock_skill = MagicMock()
+        mock_skill.name = "weather_query"
+        mock_skill.trigger_words = ["天气"]
+        mock_skill.aliases = []
+        mock_skill.intent_tags = ["weather"]
+        executor = self._make_executor_with_skills(skills=[mock_skill])
+
+        mock_llm = AsyncMock()
+        mock_llm.chat = AsyncMock(return_value="NEEDS_LEARN")
+        executor._get_llm = MagicMock(return_value=mock_llm)
+
+        result = await executor._llm_classify("帮我监控网站变化")
+        assert result.classification == LlmClassification.NEEDS_LEARN
+
+    @pytest.mark.asyncio
+    async def test_llm_returns_hallucinated_skill(self):
+        """LLM 返回不存在的 Skill → 降级为 NEEDS_LEARN"""
+        mock_skill = MagicMock()
+        mock_skill.name = "weather_query"
+        mock_skill.trigger_words = ["天气"]
+        mock_skill.aliases = []
+        mock_skill.intent_tags = ["weather"]
+        executor = self._make_executor_with_skills(skills=[mock_skill])
+
+        mock_llm = AsyncMock()
+        mock_llm.chat = AsyncMock(return_value="SKILL:nonexistent_skill")
+        executor._get_llm = MagicMock(return_value=mock_llm)
+
+        result = await executor._llm_classify("帮我做点什么")
+        assert result.classification == LlmClassification.NEEDS_LEARN
+
+    @pytest.mark.asyncio
+    async def test_llm_failure_fallback_chitchat(self):
+        """LLM 调用失败 → 安全降级为 CHITCHAT"""
+        mock_skill = MagicMock()
+        mock_skill.name = "weather_query"
+        mock_skill.trigger_words = ["天气"]
+        mock_skill.aliases = []
+        mock_skill.intent_tags = ["weather"]
+        executor = self._make_executor_with_skills(skills=[mock_skill])
+
+        mock_llm = AsyncMock()
+        mock_llm.chat = AsyncMock(side_effect=Exception("LLM timeout"))
+        executor._get_llm = MagicMock(return_value=mock_llm)
+
+        result = await executor._llm_classify("帮我查天气")
+        assert result.classification == LlmClassification.CHITCHAT
+
+    @pytest.mark.asyncio
+    async def test_llm_unparseable_response_fallback_chitchat(self):
+        """LLM 返回无法解析的内容 → 安全降级为 CHITCHAT"""
+        mock_skill = MagicMock()
+        mock_skill.name = "weather_query"
+        mock_skill.trigger_words = ["天气"]
+        mock_skill.aliases = []
+        mock_skill.intent_tags = ["weather"]
+        executor = self._make_executor_with_skills(skills=[mock_skill])
+
+        mock_llm = AsyncMock()
+        mock_llm.chat = AsyncMock(return_value="我觉得应该用天气查询功能")
+        executor._get_llm = MagicMock(return_value=mock_llm)
+
+        result = await executor._llm_classify("帮我查天气")
+        assert result.classification == LlmClassification.CHITCHAT
+
+    @pytest.mark.asyncio
+    async def test_skill_name_fuzzy_match(self):
+        """LLM 返回的 skill_name 模糊匹配"""
+        mock_skill = MagicMock()
+        mock_skill.name = "web_automate"
+        mock_skill.trigger_words = ["浏览器"]
+        mock_skill.aliases = ["browser"]
+        mock_skill.intent_tags = ["web"]
+        executor = self._make_executor_with_skills(skills=[mock_skill])
+
+        mock_llm = AsyncMock()
+        mock_llm.chat = AsyncMock(return_value="SKILL:web_auto")
+        executor._get_llm = MagicMock(return_value=mock_llm)
+
+        result = await executor._llm_classify("帮我打开浏览器")
+        assert result.classification == LlmClassification.SKILL_MATCHED
+        assert result.skill_name == "web_automate"
+
+    @pytest.mark.asyncio
+    async def test_match_skill_delegates_to_llm_classify(self):
+        """_match_skill 废弃方法委托给 _llm_classify"""
+        executor = _make_executor()
+        executor._llm_classify = AsyncMock(
+            return_value=LlmClassifyResult(
+                classification=LlmClassification.SKILL_MATCHED,
+                skill_name="weather_query",
+            )
+        )
+
+        result = await executor._match_skill("帮我查天气")
+        assert result == "weather_query"
+
+    @pytest.mark.asyncio
+    async def test_match_skill_returns_none_for_chitchat(self):
+        """_match_skill 废弃方法在 CHITCHAT 时返回 None"""
+        executor = _make_executor()
+        executor._llm_classify = AsyncMock(
+            return_value=LlmClassifyResult(classification=LlmClassification.CHITCHAT)
+        )
+
+        result = await executor._match_skill("帮我写一首诗")
+        assert result is None
 
 
 class TestMightNeedAction:

@@ -158,21 +158,8 @@ class Executor:
         if not self._might_need_action(text):
             return LlmClassifyResult(classification=LlmClassification.CHITCHAT)
 
-        # 1.5 段：快速排除纯创作/纯聊天类任务（不需要外部数据）
-        if self._is_pure_creative_task(text):
-            return LlmClassifyResult(classification=LlmClassification.CHITCHAT)
-
-        # 第二段：Skill 模糊匹配
-        matched_skill = await self._match_skill(text)
-        if matched_skill:
-            logger.info("classify_matched_skill", skill=matched_skill)
-            return LlmClassifyResult(
-                classification=LlmClassification.SKILL_MATCHED,
-                skill_name=matched_skill,
-            )
-
-        # 命中动作信号但无 Skill 可匹配 → 需要学习确认
-        return LlmClassifyResult(classification=LlmClassification.NEEDS_LEARN)
+        # 第二段：LLM 精确分类（一次调用完成"需不需要Skill + 匹配哪个"）
+        return await self._llm_classify(text)
 
     async def handle_route_result(
         self, route: RouteResult, event: Event
@@ -536,41 +523,89 @@ class Executor:
                 return True
         return False
 
-    # 纯创作/纯聊天类任务信号词：命中这些说明不需要外部数据
-    _PURE_CREATIVE_SIGNALS = (
-        "写一首", "写首诗", "写首歌", "写个故事", "写个笑话",
-        "写一封", "写一篇", "写段", "写几句",
-        "创作", "即兴", "灵感", "诗意", "押韵",
-        "关于春天", "关于爱情", "关于梦想", "关于友谊",
-    )
+    async def _llm_classify(self, text: str) -> LlmClassifyResult:
+        """用 LLM 一次性判断：闲聊 / Skill匹配 / 需要学习
 
-    def _is_pure_creative_task(self, text: str) -> bool:
-        """判断是否为纯创作类任务（只需要 LLM 生成，不需要外部数据）
-
-        例如：写诗、写故事、写笑话、创意写作等
-        """
-        t = text.lower().strip()
-        # 直接匹配纯创作信号词
-        for signal in self._PURE_CREATIVE_SIGNALS:
-            if signal in t:
-                return True
-        # 模式匹配："写(一)(首/篇/封/段/个/句)...
-        import re
-        if re.search(r'写[一]?[首篇封段个句].*[诗歌词故事笑话信文]', t):
-            return True
-        return False
-
-    async def _match_skill(self, text: str) -> str | None:
-        """用 LLM 模糊匹配本地 Skill 清单
+        替代原来的 _is_pure_creative_task + _match_skill 两段式判断，
+        让 LLM 同时理解"需不需要外部数据/动作"和"匹配哪个 Skill"。
 
         Returns:
-            匹配到的 skill_name，或 None
+            LlmClassifyResult: 三种分类之一
         """
         skills = self._vault_manager.list_skills()
-        if not skills:
-            return None
 
-        # 构建 Skill 清单摘要
+        # 无 Skill 可匹配 → 直接 NEEDS_LEARN
+        if not skills:
+            return LlmClassifyResult(classification=LlmClassification.NEEDS_LEARN)
+
+        # 构建 Skill 清单
+        skill_catalog = self._build_skill_catalog(skills)
+
+        prompt = f"""判断用户消息应该由什么方式处理。
+
+已有 Skill 清单：
+{skill_catalog}
+
+用户消息：{text}
+
+分类规则：
+1. 如果用户消息是闲聊、问答、创意写作（写诗/写故事/写文案/翻译/润色/总结等纯文本生成），不需要外部数据或工具操作 → 回复 CHITCHAT
+2. 如果某个已有 Skill 能完全满足用户需求 → 回复 SKILL:skill_name
+3. 如果用户需要执行动作/获取外部数据，但没有合适的 Skill → 回复 NEEDS_LEARN
+
+关键判断标准——"需不需要外部数据/动作"：
+- "写一首诗""讲个笑话""翻译一下""润色这段话""总结一下" → CHITCHAT（LLM 直接生成）
+- "查天气""抓取网页""生成图片""监控价格""每天推送" → 需要外部数据/动作
+- "打开网页"/"浏览器自动化"类 Skill 只能打开页面和操作浏览器，不能获取、抓取、分析页面内容
+- 不确定时优先选 CHITCHAT
+
+只回复分类结果（CHITCHAT / SKILL:skill_name / NEEDS_LEARN），不要解释。"""
+
+        try:
+            llm = self._get_llm()
+            response = await llm.chat(
+                [
+                    {"role": "system", "content": "你是消息分类器。只回复分类结果：CHITCHAT、SKILL:skill_name、或 NEEDS_LEARN。不要解释。"},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.1,
+                max_tokens=30,
+            )
+            result = response.strip()
+            logger.info("llm_classify_result", input=text[:50], output=result)
+
+            # 解析 CHITCHAT
+            if "CHITCHAT" in result.upper():
+                return LlmClassifyResult(classification=LlmClassification.CHITCHAT)
+
+            # 解析 SKILL:xxx
+            if result.upper().startswith("SKILL:"):
+                skill_name = result.split(":", 1)[1].strip().lower()
+                matched = self._verify_skill_name(skill_name, skills)
+                if matched:
+                    return LlmClassifyResult(
+                        classification=LlmClassification.SKILL_MATCHED,
+                        skill_name=matched,
+                    )
+                # LLM 返回了不存在的 Skill → 降级为 NEEDS_LEARN
+                logger.warning("llm_classify_skill_not_found", llm_returned=skill_name)
+                return LlmClassifyResult(classification=LlmClassification.NEEDS_LEARN)
+
+            # 解析 NEEDS_LEARN
+            if "LEARN" in result.upper():
+                return LlmClassifyResult(classification=LlmClassification.NEEDS_LEARN)
+
+            # 无法解析 → 安全降级为 CHITCHAT
+            logger.warning("llm_classify_unparseable", raw=result)
+            return LlmClassifyResult(classification=LlmClassification.CHITCHAT)
+
+        except Exception as e:
+            # LLM 调用失败 → 安全降级为 CHITCHAT
+            logger.warning("llm_classify_failed", error=str(e))
+            return LlmClassifyResult(classification=LlmClassification.CHITCHAT)
+
+    def _build_skill_catalog(self, skills: list) -> str:
+        """构建 Skill 清单摘要"""
         skill_lines = []
         for s in skills:
             tags = ", ".join(s.intent_tags) if s.intent_tags else ""
@@ -578,76 +613,56 @@ class Executor:
             skill_lines.append(
                 f"- {s.name}: {s.description} | 触发词: {triggers} | 标签: {tags}"
             )
-        skill_catalog = "\n".join(skill_lines)
+        return "\n".join(skill_lines)
 
-        prompt = f"""判断用户消息是否可以用以下已有 Skill 来完成。
+    def _verify_skill_name(self, name: str, skills: list) -> str | None:
+        """验证 LLM 返回的 skill_name 是否真实存在"""
+        for s in skills:
+            if s.name == name:
+                return s.name
+        # 模糊匹配：返回的可能是别名
+        for s in skills:
+            if name in s.name or name in [a.lower() for a in s.aliases]:
+                return s.name
+        return None
 
-已有 Skill 清单：
-{skill_catalog}
 
-用户消息：{text}
+    async def _match_skill(self, text: str) -> str | None:
+        """[废弃] 用 LLM 模糊匹配本地 Skill 清单，请使用 _llm_classify 代替
 
-规则：
-1. 只有当某个 Skill 的功能能**完全满足**用户需求时，才返回该 Skill 的 name
-2. "打开网页"/"浏览器自动化"类 Skill 只能打开页面和操作浏览器，**不能**获取、抓取、分析页面内容。如果用户需要获取某网站的特定信息（如排行榜、热搜、价格、新闻等），这些 Skill **无法满足**，必须返回 NONE
-3. **纯创作类任务**（如写诗、写故事、写笑话、创意写作、文案创作等）**不需要任何 Skill**，只需要 LLM 直接生成。这类任务必须返回 NONE
-4. 宁可返回 NONE 也不要勉强匹配不合适的 Skill。不确定时一律返回 NONE
-
-只返回一个词：Skill 的 name 或 NONE。不要解释。"""
-
-        try:
-            llm = self._get_llm()
-            # 显式传入 system role 以覆盖 llm.chat 自动注入的 SYSTEM_PROMPT
-            # 避免 LLM 按助手角色回复建议性文字而非精确匹配结果
-            response = await llm.chat(
-                [
-                    {"role": "system", "content": "你是一个 Skill 匹配分类器。严格按照指令只返回一个词：Skill 的 name 或 NONE。不要解释，不要建议，不要回复其他内容。"},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.1,
-                max_tokens=20,
-            )
-            result = response.strip().upper()
-            if result == "NONE" or not result:
-                return None
-            # 验证返回的 skill_name 是否真实存在
-            matched = response.strip().lower()
-            for s in skills:
-                if s.name == matched:
-                    return s.name
-            # 模糊匹配：返回的可能是别名或触发词
-            for s in skills:
-                if matched in s.name or matched in [a.lower() for a in s.aliases]:
-                    return s.name
-            return None
-        except Exception as e:
-            logger.warning("skill_match_failed", error=str(e))
-            return None
+        保留此方法以兼容可能的调用方，内部委托给 _llm_classify。
+        """
+        result = await self._llm_classify(text)
+        if result.classification == LlmClassification.SKILL_MATCHED:
+            return result.skill_name
+        return None
 
     async def _handle_llm(self, route: RouteResult, event: Event) -> str:
-        """LLM 兜底响应（三段式：启发式 → Skill 匹配 → 用户确认/闲聊）"""
+        """LLM 兜底响应（两段式：启发式 → LLM 分类）"""
         text = route.params.get("original_text", "")
         conv_id = event.conversation_id
 
-        # ── 第一段：启发式判断 ──
+        # ── 第一段：启发式快速短路 ──
         if not self._might_need_action(text):
-            # 明显闲聊，零额外开销
             return await self._chat_fallback(text)
 
-        # ── 第二段：Skill 模糊匹配 ──
-        matched_skill = await self._match_skill(text)
-        if matched_skill:
-            logger.info("llm_fallback_matched_skill", skill=matched_skill)
-            # 构造 RouteResult 走 Skill 执行
+        # ── 第二段：LLM 精确分类 ──
+        classify = await self._llm_classify(text)
+
+        if classify.classification == LlmClassification.CHITCHAT:
+            return await self._chat_fallback(text)
+
+        if classify.classification == LlmClassification.SKILL_MATCHED:
+            logger.info("llm_fallback_matched_skill", skill=classify.skill_name)
             skill_route = RouteResult(
                 route_type=RouteType.SKILL,
-                skill_name=matched_skill,
+                skill_name=classify.skill_name,
                 params={"rest": text},
                 confidence=0.6,
             )
             return await self._handle_skill(skill_route, event)
 
-        # ── 第三段：问用户要不要创建 ──
+        # NEEDS_LEARN → 问用户要不要创建
         self._pending_learn_requests[conv_id] = text
         return (
             f"🤔 我目前没有能处理「{text[:30]}」的技能。\n\n"

@@ -1,0 +1,22 @@
+{
+  "name": "baidu_hot",
+  "version": "0.1.0",
+  "description": "获取百度热搜排行榜，抓取并整理当前百度热搜词条、热度及相关信息。也可通过组合已有 Skill 实现：使用 @web_browse 访问百度热搜页面获取摘要，或使用 @web_automate (CDP模式) 打开并读取完整渲染后的热搜列表。",
+  "trigger_words": [
+    "百度热搜",
+    "百度热门",
+    "百度排行榜",
+    "百度热点"
+  ],
+  "intent_tags": [
+    "learned"
+  ],
+  "risk_level": "medium",
+  "requires_approval": false,
+  "timeout_seconds": 60,
+  "entry": "main.py",
+  "permissions": [
+    "requests",
+    "beautifulsoup4"
+  ]
+}

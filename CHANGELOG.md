@@ -5,7 +5,50 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2025-04-23
+
+### 📦 Release v0.3.1 — LLM Classifier Integration Test + Dev Conventions
+
+- **Integration test passed (43/43 — 100%)**: `_llm_classify` verified across CHITCHAT (9), ACTION (25), and BOUNDARY (9) scenarios.
+- **New Skill: `baidu_hot`**: 百度热搜排行榜.
+- **Dev conventions documented** (`docs/dev-conventions.md`): Testing standards for major changes — concurrent asyncio.gather, three scenario categories, 100% pass rate required.
+- **Test files**: Added `test_integration_llm_classify.py` and `quick_classify_test.py`.
+
 ## [0.3.0] - 2025-04-23
+
+### 🏷️ LLM Single-Pass Classifier — "方案C"
+
+This release replaces the two-stage hardcoded+LLM skill matching with a **single LLM classifier** (`_llm_classify`), making Raccoon's message routing simpler, more accurate, and more extensible.
+
+> **Before**: `_is_pure_creative_task` (hardcoded signals) → `_match_skill` (LLM) → fallback to NEEDS_LEARN
+> **Now**: `_llm_classify` (one LLM call) → CHITCHAT / SKILL:xxx / NEEDS_LEARN
+
+#### What Changed
+
+- **Deleted `_PURE_CREATIVE_SIGNALS` and `_is_pure_creative_task`**: Removed 27 lines of hardcoded creative task signals. No more safety net — LLM handles all classification.
+
+- **New `_llm_classify` method**: Single LLM call that simultaneously determines:
+  1. Whether the message needs external data/action (vs. pure text generation)
+  2. Which installed Skill matches (if any)
+  3. Whether a new Skill should be learned (NEEDS_LEARN)
+
+- **New `_build_skill_catalog` helper**: Constructs a concise Skill summary (name, description, trigger words, tags) for LLM context.
+
+- **New `_verify_skill_name` helper**: Validates LLM-returned skill names with fuzzy matching (supports aliases and partial matches).
+
+- **Deprecated `_match_skill`**: Now delegates to `_llm_classify` for backward compatibility.
+
+- **Simplified `classify_llm_message`**: Replaced three-step flow with `_might_need_action` → `_llm_classify`.
+
+- **LLM failure fallback**: Changed from NEEDS_LEARN to CHITCHAT (safer — don't trigger learning on LLM errors).
+
+#### Integration Test Results (43/43 passed — 100%)
+
+| Category | Count | Pass | Notes |
+|----------|-------|------|-------|
+| CHITCHAT | 9 | 9 | 写诗/翻译/润色/总结/闲聊等 |
+| ACTION | 25 | 25 | 24 SKILL_MATCHED + 1 NEEDS_LEARN (weather) |
+| BOUNDARY | 9 | 9 | "写小红书文案"→CHITCHAT, "订机票"→NEEDS_LEARN |
 
 ### 🧠 Data Acquisition Strategy — "API First, Crawl Later"
 
@@ -46,6 +89,7 @@ This release adds a **data acquisition strategy layer** to LearningEngine, makin
 - **`juejin_hot`**: 掘金 hot article ranking. Uses 掘金 recommend API.
 - **`cnblogs_hot`**: 博客园 top views ranking. HTML scraping (no public API available — a perfect example of the API-first strategy in action).
 - **`36kr_hot`**: 36氪 hot article ranking. Uses 36氪 API.
+- **`baidu_hot`**: 百度热搜排行榜. Uses 百度热搜 API.
 
 ### 🎨 Web UI
 
