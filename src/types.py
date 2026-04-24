@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 
 class TaskStatus(str, Enum):
     PENDING = "pending"
+    PENDING_APPROVAL = "pending_approval"
     RUNNING = "running"
     SUCCESS = "success"
     FAILED = "failed"
@@ -23,7 +24,13 @@ class TaskStatus(str, Enum):
 
 # 合法状态转换表
 VALID_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
-    TaskStatus.PENDING: {TaskStatus.RUNNING, TaskStatus.CANCELLED},
+    TaskStatus.PENDING: {
+        TaskStatus.PENDING_APPROVAL,
+        TaskStatus.RUNNING,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+    },
+    TaskStatus.PENDING_APPROVAL: {TaskStatus.RUNNING, TaskStatus.FAILED, TaskStatus.CANCELLED},
     TaskStatus.RUNNING: {TaskStatus.SUCCESS, TaskStatus.FAILED, TaskStatus.CANCELLING},
     TaskStatus.CANCELLING: {TaskStatus.CANCELLED},
     TaskStatus.SUCCESS: set(),
@@ -45,6 +52,7 @@ class EventType(str, Enum):
     SESSION_STARTED = "session_started"     # Skill 会话开始
     SESSION_STEP = "session_step"           # 会话步骤结果推送
     SESSION_ENDED = "session_ended"         # Skill 会话结束
+    APPROVAL_RESOLVED = "approval_resolved" # 审批完成（批准/拒绝/超时）
     SKILL_INSTALLING = "skill_installing"   # Skill 安装中
     SKILL_INSTALLED = "skill_installed"     # Skill 安装完成
     SKILL_INSTALL_FAILED = "skill_install_failed"  # Skill 安装失败
@@ -100,6 +108,7 @@ class Task(BaseModel):
     cancel_token: bool = False
     result: dict[str, Any] | None = None
     error: str | None = None
+    context: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 

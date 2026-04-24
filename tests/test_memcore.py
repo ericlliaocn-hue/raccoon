@@ -143,7 +143,7 @@ async def test_decay_reduces_confidence(config, writer, reader):
     await writer.write(entry)
 
     lifecycle = MemCoreLifecycle(config)
-    archived = await lifecycle.decay(days=30, threshold=0.1)
+    await lifecycle.decay(days=30, threshold=0.1)
     # 高置信度记忆衰减后 confidence 降低但不会低于阈值
     result = await reader.get("user1", "strong_memory")
     assert result is not None

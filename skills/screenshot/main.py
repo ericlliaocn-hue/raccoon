@@ -7,7 +7,6 @@
   输出: { "reply": "...", "files": [{"path": "...", "name": "..."}] }
 """
 import json
-import os
 import subprocess
 import sys
 import time

@@ -8,7 +8,6 @@ import json
 import re
 import sys
 import webbrowser
-from urllib.parse import urlparse
 
 
 def _extract_url(text: str) -> str | None:

@@ -7,7 +7,6 @@ from src.router.intent_classifier import (
     ModelIntentClassifier,
     OnlineLearningStore,
     IntentType,
-    INTENT_ROUTE_MAP,
 )
 from src.types import RouteType
 
@@ -58,7 +57,7 @@ class TestModelIntentClassifier:
     @pytest.mark.asyncio
     async def test_no_match_returns_none_or_keyword(self, classifier):
         """无法分类时返回 None 或关键词结果"""
-        result = await classifier.classify("随便聊聊")
+        await classifier.classify("随便聊聊")
         # Mock 模式下可能返回 None 或关键词结果
         # 关键是不抛异常
 

@@ -12,9 +12,13 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 from enum import Enum
+from typing import TYPE_CHECKING
 
 import structlog
-from src.types import Task, SkillMetadata
+from src.types import EventType, SkillMetadata, Task, make_event
+
+if TYPE_CHECKING:
+    from src.eventbus.bus import EventBus
 
 logger = structlog.get_logger(__name__)
 
@@ -48,8 +52,8 @@ class ApprovalResult:
 
 # 风险等级评估规则
 # permissions 中包含这些关键词时提升风险等级
-_HIGH_RISK_PERMISSIONS = {"subprocess", "network", "filesystem"}
-_MEDIUM_RISK_PERMISSIONS = {"network"}
+_HIGH_RISK_PERMISSIONS = {"subprocess"}
+_MEDIUM_RISK_PERMISSIONS = {"network", "filesystem"}
 
 
 class RiskAssessor:
@@ -66,7 +70,7 @@ class RiskAssessor:
            - filesystem → medium
            - network → medium
            - 无权限 → low
-        3. requires_approval=True → 至少 medium
+        3. requires_approval=True → high（显式要求人工确认）
 
         Returns:
             "low" / "medium" / "high"
@@ -84,9 +88,9 @@ class RiskAssessor:
         if perms & _MEDIUM_RISK_PERMISSIONS:
             return "medium"
 
-        # requires_approval 标记提升到 medium
+        # requires_approval 标记进入人工审批通道
         if metadata.requires_approval:
-            return "medium"
+            return "high"
 
         return "low"
 
@@ -136,10 +140,12 @@ class ApprovalEngine:
         auto_approve: bool = True,
         approval_timeout_seconds: int = 300,
         notifier=None,
+        event_bus: "EventBus | None" = None,
     ) -> None:
         self._auto_approve = auto_approve
         self._timeout = approval_timeout_seconds
         self._notifier = notifier  # Notifier 实例，用于审批通知
+        self._event_bus = event_bus
         self._queue: dict[str, ApprovalEntry] = {}  # approval_id → entry
         self._risk_assessor = RiskAssessor()
         self._cleanup_task: asyncio.Task | None = None
@@ -175,6 +181,7 @@ class ApprovalEngine:
                 entry.status = ApprovalStatus.EXPIRED
                 entry.resolved_at = datetime.now(timezone.utc)
                 entry.reason = "approval_timeout"
+                await self._emit_resolution(entry, approved=False, reason=entry.reason)
                 logger.warning(
                     "approval_expired",
                     approval_id=entry.approval_id,
@@ -218,21 +225,24 @@ class ApprovalEngine:
                 status=ApprovalStatus.AUTO_APPROVED,
             )
 
-        # 3. 低风险自动通过
-        if risk_level == "low":
+        # 3. 仅高风险或显式 requires_approval 进入人工审批，其余自动通过
+        requires_manual_approval = risk_level == "high" or (
+            metadata is not None and metadata.requires_approval
+        )
+        if not requires_manual_approval:
             logger.info(
-                "approval_low_risk_approved",
+                "approval_risk_auto_approved",
                 task_id=task.task_id,
                 skill=task.skill_name,
                 risk_level=risk_level,
             )
             return ApprovalResult(
                 approved=True,
-                reason="low_risk_auto_approved",
+                reason=f"{risk_level}_risk_auto_approved",
                 status=ApprovalStatus.APPROVED,
             )
 
-        # 4. 中/高风险需要人工审批
+        # 4. 高风险需要人工审批
         entry = ApprovalEntry(task=task, risk_level=risk_level, timeout_seconds=self._timeout)
         self._queue[entry.approval_id] = entry
 
@@ -274,6 +284,7 @@ class ApprovalEngine:
         entry.status = ApprovalStatus.APPROVED
         entry.resolved_at = datetime.now(timezone.utc)
         entry.resolved_by = approver
+        entry.reason = "manual_approved"
 
         logger.info(
             "approval_approved",
@@ -282,6 +293,7 @@ class ApprovalEngine:
             approver=approver,
         )
 
+        await self._emit_resolution(entry, approved=True, reason=entry.reason)
         return ApprovalResult(True, "manual_approved", ApprovalStatus.APPROVED, approval_id)
 
     async def reject(self, approval_id: str, reason: str = "", rejector: str = "manual") -> ApprovalResult:
@@ -314,6 +326,7 @@ class ApprovalEngine:
             rejector=rejector,
         )
 
+        await self._emit_resolution(entry, approved=False, reason=entry.reason)
         return ApprovalResult(False, reason or "manual_rejected", ApprovalStatus.REJECTED, approval_id)
 
     def get_pending(self) -> list[ApprovalEntry]:
@@ -323,6 +336,34 @@ class ApprovalEngine:
     def get_entry(self, approval_id: str) -> ApprovalEntry | None:
         """获取审批条目"""
         return self._queue.get(approval_id)
+
+    async def _emit_resolution(
+        self,
+        entry: ApprovalEntry,
+        *,
+        approved: bool,
+        reason: str,
+    ) -> None:
+        """向执行器广播审批结果，供挂起任务恢复或失败。"""
+        if not self._event_bus:
+            return
+        await self._event_bus.emit(
+            make_event(
+                EventType.APPROVAL_RESOLVED,
+                conversation_id=entry.task.conversation_id,
+                user_id=entry.task.user_id,
+                task_id=entry.task.task_id,
+                skill_name=entry.task.skill_name,
+                payload={
+                    "approval_id": entry.approval_id,
+                    "task_id": entry.task.task_id,
+                    "approved": approved,
+                    "status": entry.status.value,
+                    "reason": reason,
+                    "risk_level": entry.risk_level,
+                },
+            )
+        )
 
     async def _send_approval_notification(self, entry: ApprovalEntry) -> None:
         """发送审批通知"""

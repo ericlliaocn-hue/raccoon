@@ -14,7 +14,6 @@
 from __future__ import annotations
 
 import asyncio
-import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any
@@ -33,10 +32,8 @@ from src.llm import LLMFactory, LLMClient
 from src.types import (
     Event,
     EventType,
-    FlowDefinition,
     RouteResult,
     RouteType,
-    SessionStatus,
     SkillMetadata,
     Task,
     TaskStatus,
@@ -47,6 +44,7 @@ if TYPE_CHECKING:
     from src.skill_vault.vault_manager import VaultManager
     from src.brain.learning_engine import LearningEngine
     from src.scheduler.scheduler import Scheduler
+    from src.supervisor.approval_engine import ApprovalEngine
 
 logger = structlog.get_logger(__name__)
 
@@ -73,6 +71,20 @@ class LlmClassifyResult:
     """LLM 消息分类结果"""
     classification: LlmClassification
     skill_name: str | None = None   # SKILL_MATCHED 时的 skill_name
+    confidence: float = 1.0
+
+
+@dataclass
+class LlmStreamDecision:
+    """LLM 路由在流式接口里的展示决策。
+
+    分类和 Skill/学习分支都留在 Executor 内部；adapter 只负责把结果渲染成 SSE。
+    """
+
+    stream_chat: bool
+    reply: str | None = None
+    source: str = "llm"
+    skill_name: str = ""
 
 
 class Executor:
@@ -83,6 +95,7 @@ class Executor:
         event_bus: EventBus,
         vault_manager: "VaultManager",
         config: RaccoonConfig | None = None,
+        approval_engine: "ApprovalEngine | None" = None,
     ) -> None:
         self._event_bus = event_bus
         self._vault_manager = vault_manager
@@ -91,6 +104,7 @@ class Executor:
         self._media_pusher = MediaPusher()
         self._state_machine = TaskStateMachine()
         self._running_tasks: dict[str, asyncio.Task] = {}
+        self._pending_approvals: dict[str, tuple[Task, dict[str, Any], Event]] = {}
         self._semaphore = asyncio.Semaphore(self._config.max_concurrent_tasks)
         self._llm: LLMClient | None = None  # 延迟初始化
         self._file_manager = FileManager()
@@ -102,8 +116,10 @@ class Executor:
         self._session_manager = SkillSessionManager()
         self._session_manager.set_event_bus(event_bus)
         self._flow_engine = FlowEngine(
-            event_bus, self._session_manager, vault_manager, self._config
+            event_bus, self._session_manager, vault_manager, self._config, approval_engine
         )
+        self._approval_engine = approval_engine
+        self._event_bus.on(EventType.APPROVAL_RESOLVED, self._on_approval_resolved)
 
         # L3 学习链路：LearningEngine + Scheduler（延迟注入）
         self._learning_engine: LearningEngine | None = None
@@ -195,11 +211,13 @@ class Executor:
             return await self._handle_interactive_skill(skill_meta, route, event)
 
         # 创建 Task
+        params, task_context = self._split_params_and_context(route.params, event)
         task = Task(
             conversation_id=event.conversation_id,
             user_id=event.user_id,
             origin_message=event.payload.get("text", ""),
             skill_name=skill_name,
+            context=task_context,
         )
         self._task_queue.add(task)
 
@@ -212,16 +230,90 @@ class Executor:
                 task_id=task.task_id,
                 skill_name=skill_name,
                 status=TaskStatus.PENDING,
+                payload=task_context,
             )
         )
 
-        # 异步执行
-        asyncio_task = asyncio.create_task(
-            self._execute_task(task, route.params, event)
-        )
-        self._running_tasks[task.task_id] = asyncio_task
+        approval_reply = await self._review_or_schedule_task(task, params, event, skill_meta)
+        if approval_reply:
+            return approval_reply
 
         return f"收到！任务已创建 [{task.task_id[:8]}] Skill: {skill_name}"
+
+    def _split_params_and_context(
+        self,
+        params: dict[str, Any],
+        event: Event,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """拆分 Skill 参数和运行上下文，避免调度/审批元数据污染 Skill 入参。"""
+        run_params = dict(params or {})
+        context = dict(run_params.pop("_context", {}) or {})
+        for key in ("schedule_id", "run_id", "schedule_name", "cron", "is_retry"):
+            if key in event.payload and key not in context:
+                context[key] = event.payload[key]
+        return run_params, context
+
+    async def _review_or_schedule_task(
+        self,
+        task: Task,
+        params: dict[str, Any],
+        event: Event,
+        skill_meta: SkillMetadata | None,
+    ) -> str | None:
+        """审批通过则调度执行；等待审批/拒绝则返回用户可见提示。"""
+        if self._approval_engine is None:
+            self._schedule_task_execution(task, params, event)
+            return None
+
+        result = await self._approval_engine.review(task, metadata=skill_meta)
+        if result.approved:
+            self._schedule_task_execution(task, params, event)
+            return None
+
+        if result.status.value == "pending" and result.approval_id:
+            task.context["approval_id"] = result.approval_id
+            self._state_machine.transition(task, TaskStatus.PENDING_APPROVAL)
+            self._task_queue.update(task)
+            self._pending_approvals[result.approval_id] = (task, params, event)
+            return (
+                f"任务 [{task.task_id[:8]}] 等待审批，审批 ID: {result.approval_id[:8]}。"
+                "批准后会自动继续执行。"
+            )
+
+        task.error = result.reason or "approval_rejected"
+        self._state_machine.transition(task, TaskStatus.FAILED)
+        self._task_queue.update(task)
+        await self._emit_failure(task, task.error)
+        return f"任务 [{task.task_id[:8]}] 未执行：{task.error}"
+
+    def _schedule_task_execution(self, task: Task, params: dict[str, Any], event: Event) -> None:
+        """创建 asyncio task 并登记运行中任务。"""
+        asyncio_task = asyncio.create_task(self._execute_task(task, params, event))
+        self._running_tasks[task.task_id] = asyncio_task
+
+    async def _on_approval_resolved(self, event: Event) -> None:
+        """审批完成后恢复或失败挂起任务。"""
+        approval_id = event.payload.get("approval_id")
+        if not approval_id:
+            return
+        pending = self._pending_approvals.pop(approval_id, None)
+        if not pending:
+            return
+
+        task, params, original_event = pending
+        approved = bool(event.payload.get("approved"))
+        if approved:
+            self._schedule_task_execution(task, params, original_event)
+            return
+
+        reason = event.payload.get("reason") or event.payload.get("status") or "approval_rejected"
+        task.error = str(reason)
+        try:
+            self._state_machine.transition(task, TaskStatus.FAILED)
+        except TransitionError:
+            pass
+        self._task_queue.update(task)
+        await self._emit_failure(task, str(reason))
 
     async def _execute_task(
         self, task: Task, params: dict, event: Event
@@ -256,7 +348,7 @@ class Executor:
                             task_id=task.task_id,
                             skill_name=task.skill_name,
                             status=TaskStatus.CANCELLED,
-                            payload={"reason": "cancelled_by_user"},
+                            payload=self._payload_with_context(task, {"reason": "cancelled_by_user"}),
                         )
                     )
                     return
@@ -278,10 +370,11 @@ class Executor:
                 files_info = await self._media_pusher.push(task, task.conversation_id)
                 logger.debug("after_media_push", task_id=task.task_id, files_count=len(files_info))
 
-                # 发射 task_completed 事件（payload 含文件元信息）
+                # 发射 task_completed 事件（payload 含文件元信息和运行上下文）
                 payload = (result or {}).copy()
                 if files_info:
                     payload["_files"] = files_info
+                payload = self._payload_with_context(task, payload)
                 await self._event_bus.emit(
                     make_event(
                         EventType.TASK_COMPLETED,
@@ -333,9 +426,17 @@ class Executor:
                 task_id=task.task_id,
                 skill_name=task.skill_name,
                 status=task.status,
-                payload={"error": reason},
+                payload=self._payload_with_context(task, {"error": reason}),
             )
         )
+
+    def _payload_with_context(self, task: Task, payload: dict[str, Any]) -> dict[str, Any]:
+        """把 Task.context 展开到事件 payload，调度/通知依赖顶层字段。"""
+        merged = dict(payload)
+        if task.context:
+            merged.update({k: v for k, v in task.context.items() if k not in merged})
+            merged["_context"] = dict(task.context)
+        return merged
 
     def _transition_to_cancelled(self, task: Task) -> None:
         """安全地将任务转到 CANCELLED 状态，兼容 RUNNING 和 CANCELLING 两种当前状态"""
@@ -466,6 +567,9 @@ class Executor:
 
         initial_params = route.params.copy()
         initial_params["origin_message"] = event.payload.get("text", "")
+        _, task_context = self._split_params_and_context(route.params, event)
+        if task_context:
+            initial_params["_context"] = task_context
 
         return await self._flow_engine.start_flow(
             conversation_id=event.conversation_id,
@@ -558,13 +662,14 @@ class Executor:
 - "打开网页"/"浏览器自动化"类 Skill 只能打开页面和操作浏览器，不能获取、抓取、分析页面内容
 - 不确定时优先选 CHITCHAT
 
-只回复分类结果（CHITCHAT / SKILL:skill_name / NEEDS_LEARN），不要解释。"""
+只回复分类结果（CHITCHAT / SKILL:skill_name:confidence / NEEDS_LEARN），不要解释。
+confidence 是 0.0-1.0 的小数；只有非常确定时才高于 0.7。"""
 
         try:
             llm = self._get_llm()
             response = await llm.chat(
                 [
-                    {"role": "system", "content": "你是消息分类器。只回复分类结果：CHITCHAT、SKILL:skill_name、或 NEEDS_LEARN。不要解释。"},
+                    {"role": "system", "content": "你是消息分类器。只回复分类结果：CHITCHAT、SKILL:skill_name:confidence、或 NEEDS_LEARN。不要解释。"},
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.1,
@@ -579,12 +684,20 @@ class Executor:
 
             # 解析 SKILL:xxx
             if result.upper().startswith("SKILL:"):
-                skill_name = result.split(":", 1)[1].strip().lower()
+                parts = result.split(":")
+                skill_name = parts[1].strip().lower() if len(parts) > 1 else ""
+                confidence = 0.6
+                if len(parts) > 2:
+                    try:
+                        confidence = max(0.0, min(1.0, float(parts[2].strip())))
+                    except ValueError:
+                        confidence = 0.6
                 matched = self._verify_skill_name(skill_name, skills)
                 if matched:
                     return LlmClassifyResult(
                         classification=LlmClassification.SKILL_MATCHED,
                         skill_name=matched,
+                        confidence=confidence,
                     )
                 # LLM 返回了不存在的 Skill → 降级为 NEEDS_LEARN
                 logger.warning("llm_classify_skill_not_found", llm_returned=skill_name)
@@ -639,7 +752,6 @@ class Executor:
     async def _handle_llm(self, route: RouteResult, event: Event) -> str:
         """LLM 兜底响应（两段式：启发式 → LLM 分类）"""
         text = route.params.get("original_text", "")
-        conv_id = event.conversation_id
 
         # ── 第一段：启发式快速短路 ──
         if not self._might_need_action(text):
@@ -647,17 +759,41 @@ class Executor:
 
         # ── 第二段：LLM 精确分类 ──
         classify = await self._llm_classify(text)
+        return await self.handle_llm_classification(classify, text, event)
 
+    async def handle_llm_classification(
+        self,
+        classify: LlmClassifyResult,
+        text: str,
+        event: Event,
+    ) -> str:
+        """按统一的 LLM fallback 分类结果响应，供 /message 和 /chat/stream 共用。"""
+        conv_id = event.conversation_id
         if classify.classification == LlmClassification.CHITCHAT:
             return await self._chat_fallback(text)
 
         if classify.classification == LlmClassification.SKILL_MATCHED:
+            threshold = getattr(self._config, "llm_skill_match_threshold", 0.7)
+            if classify.confidence < threshold:
+                logger.info(
+                    "llm_fallback_low_confidence",
+                    skill=classify.skill_name,
+                    confidence=classify.confidence,
+                    threshold=threshold,
+                )
+                self._pending_learn_requests[conv_id] = text
+                return (
+                    f"我不太确定「{text[:30]}」该不该交给 "
+                    f"{classify.skill_name or '某个 Skill'} 处理。\n\n"
+                    "要我按新技能需求来学习/创建吗？回复「要」继续，回复「不要」我就正常聊天。"
+                )
+
             logger.info("llm_fallback_matched_skill", skill=classify.skill_name)
             skill_route = RouteResult(
                 route_type=RouteType.SKILL,
                 skill_name=classify.skill_name,
                 params={"rest": text},
-                confidence=0.6,
+                confidence=classify.confidence,
             )
             return await self._handle_skill(skill_route, event)
 
@@ -666,6 +802,26 @@ class Executor:
         return (
             f"🤔 我目前没有能处理「{text[:30]}」的技能。\n\n"
             "需要我帮你创建一个新技能吗？回复「要」我就开始学习，回复「不要」就正常聊天。"
+        )
+
+    async def decide_llm_stream(self, text: str, event: Event) -> LlmStreamDecision:
+        """给 /chat/stream 使用的统一 LLM fallback 决策。"""
+        classify = await self.classify_llm_message(text)
+        if classify.classification == LlmClassification.CHITCHAT:
+            return LlmStreamDecision(stream_chat=True)
+
+        reply = await self.handle_llm_classification(classify, text, event)
+        if classify.classification == LlmClassification.SKILL_MATCHED:
+            return LlmStreamDecision(
+                stream_chat=False,
+                reply=reply,
+                source="skill_matched",
+                skill_name=classify.skill_name or "",
+            )
+        return LlmStreamDecision(
+            stream_chat=False,
+            reply=reply,
+            source="learn_confirm",
         )
 
     async def _handle_learn_confirm(self, route: RouteResult, event: Event) -> str:

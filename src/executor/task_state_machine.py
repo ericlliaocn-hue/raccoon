@@ -1,7 +1,8 @@
-"""任务状态机（PENDING→RUNNING→CANCELLING→CANCELLED）
+"""任务状态机（PENDING→PENDING_APPROVAL/RUNNING→CANCELLING→CANCELLED）
 
 合法转换：
-PENDING → RUNNING, CANCELLED
+PENDING → PENDING_APPROVAL, RUNNING, CANCELLED
+PENDING_APPROVAL → RUNNING, FAILED, CANCELLED
 RUNNING → SUCCESS, FAILED, CANCELLING
 CANCELLING → CANCELLED
 
@@ -58,7 +59,7 @@ class TaskStateMachine:
     def request_cancel(task: Task) -> Task:
         """请求取消任务：RUNNING → CANCELLING，设置 cancel_token"""
         task.cancel_token = True
-        if task.status == TaskStatus.PENDING:
+        if task.status in (TaskStatus.PENDING, TaskStatus.PENDING_APPROVAL):
             return TaskStateMachine.transition(task, TaskStatus.CANCELLED)
         if task.status == TaskStatus.RUNNING:
             return TaskStateMachine.transition(task, TaskStatus.CANCELLING)

@@ -71,16 +71,6 @@ def main():
         input_data = {}
 
     task_id = input_data.get("task_id", "")
-    params = input_data.get("params", {})
-    origin_message = input_data.get("origin_message", "")
-
-    count = params.get("count") or 20
-    if not params.get("count"):
-        import re
-        count_match = re.search(r'(\d+)', origin_message)
-        if count_match:
-            count = int(count_match.group(1))
-
     reply, debug_info = get_cnblogs_hot()
 
     output = {

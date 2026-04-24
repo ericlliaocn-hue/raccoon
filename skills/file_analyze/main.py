@@ -98,7 +98,7 @@ def _analyze_content(content: str, path: Path) -> str:
     """对文件内容做简单分析摘要"""
     lines = content.splitlines()
     total_lines = len(lines)
-    non_empty = sum(1 for l in lines if l.strip())
+    non_empty = sum(1 for line in lines if line.strip())
     ext = path.suffix.lower()
 
     parts = [f"📄 文件：{path.name}"]

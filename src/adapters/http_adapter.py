@@ -13,32 +13,39 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+import sqlite3
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import AsyncGenerator
+from urllib.parse import quote
 
 import structlog
-from fastapi import FastAPI, HTTPException, UploadFile
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Request, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel as APIModel
 
+from src import __version__
+from src.adapters.auth import is_protected_http_endpoint, request_has_auth_token
 from src.config import load_config, RaccoonConfig, LLM_PRESETS
 from src.conversation_store import ConversationStore
 from src.eventbus.bus import EventBus
 from src.eventbus.events import EventType, make_event
-from src.executor.agent import Executor, LlmClassification
+from src.executor.agent import Executor
 from src.executor.file_manager import FileManager
 from src.llm import LLMFactory
+from src.router.intent_classifier import KeywordIntentClassifier, ModelIntentClassifier
 from src.router.router import Router
 from src.scheduler.scheduler import Scheduler
 from src.scheduler.schedule_store import ScheduleStore
 from src.notifier.notifier import Notifier
 from src.skill_vault.vault_manager import VaultManager
-from src.supervisor.approval_engine import ApprovalEngine, ApprovalStatus
+from src.supervisor.approval_engine import ApprovalEngine
 from src.supervisor.audit_logger import AuditLogger
-from src.types import Event, RouteResult, RouteType, ScheduleEntry, ScheduleStatus, RetryPolicy, WorkflowEntry, WorkflowStep
+from src.types import Event, RouteResult, RouteType, ScheduleEntry, WorkflowEntry, WorkflowStep
 from src.workflow.workflow_engine import WorkflowEngine
 from src.workflow.workflow_store import WorkflowStore
 from src.gateway.inbound import GatewayInbound, GatewayAuthError, GatewayRateLimitError
@@ -125,8 +132,11 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
 
     event_bus = EventBus(config)
     vault_manager = VaultManager(config)
-    router = Router()
-    executor = Executor(event_bus, vault_manager, config)
+    if config.intent_classifier_type == "model":
+        intent_classifier = ModelIntentClassifier(config)
+    else:
+        intent_classifier = KeywordIntentClassifier()
+    router = Router(intent_classifier=intent_classifier)
     audit_logger = AuditLogger(config)
 
     # 只注册已启用的 Skill
@@ -147,7 +157,10 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
         auto_approve=config.auto_approve,
         approval_timeout_seconds=config.approval_timeout_seconds,
         notifier=notifier,
+        event_bus=event_bus,
     )
+
+    executor = Executor(event_bus, vault_manager, config, approval_engine=approval_engine)
 
     # L3 学习引擎
     llm_client = LLMFactory.create(config)
@@ -193,7 +206,40 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
 
     event_bus.on_any(on_any_event)
 
-    app = FastAPI(title="Project Raccoon", version="0.1.0")
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        await event_bus.start()
+        await scheduler.start()
+        await approval_engine.start()
+        try:
+            from skills.web_automate.session_manager import get_session_manager
+            await get_session_manager().start_cleanup_loop()
+        except Exception as e:
+            logger.warning("browser_session_cleanup_loop_start_failed", error=str(e))
+        logger.info("http_server_started", port=config.http_port)
+
+        try:
+            yield
+        finally:
+            await approval_engine.stop()
+            await scheduler.stop()
+            try:
+                from skills.web_automate.session_manager import get_session_manager
+                session_mgr = get_session_manager()
+                await session_mgr.shutdown()
+                logger.info("browser_sessions_closed")
+            except Exception as e:
+                logger.warning("browser_session_cleanup_failed", error=str(e))
+            try:
+                active = executor.task_queue.get_active_by_conversation("")
+                if active:
+                    logger.info("cancelling_active_tasks", count=len(active))
+            except Exception:
+                pass
+            await event_bus.stop()
+            logger.info("http_server_stopped")
+
+    app = FastAPI(title="Project Raccoon", version=__version__, lifespan=lifespan)
 
     # 将依赖注入 app.state
     app.state.config = config
@@ -212,6 +258,17 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
     app.state.gateway = gateway
     app.state.conversation_store = conversation_store
 
+    @app.middleware("http")
+    async def auth_middleware(request: Request, call_next):
+        """Token 为空时兼容本地开发；配置后保护高风险 API。"""
+        if (
+            config.http_auth_token
+            and is_protected_http_endpoint(request.url.path, request.method)
+            and not request_has_auth_token(request, config.http_auth_token)
+        ):
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+        return await call_next(request)
+
     # ─── Web UI ────────────────────────────────────────────────
 
     @app.get("/", response_class=HTMLResponse)
@@ -224,35 +281,6 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
     # ─── Routes ────────────────────────────────────────────────
-
-    @app.on_event("startup")
-    async def startup() -> None:
-        await event_bus.start()
-        await scheduler.start()
-        await approval_engine.start()
-        logger.info("http_server_started", port=config.http_port)
-
-    @app.on_event("shutdown")
-    async def shutdown() -> None:
-        await approval_engine.stop()
-        await scheduler.stop()
-        # 优雅关闭：清理浏览器会话
-        try:
-            from skills.web_automate.session_manager import get_session_manager
-            session_mgr = get_session_manager()
-            await session_mgr.shutdown()
-            logger.info("browser_sessions_closed")
-        except Exception as e:
-            logger.warning("browser_session_cleanup_failed", error=str(e))
-        # 清理 Skill 子进程
-        try:
-            active = executor.task_queue.get_active_by_conversation("")
-            if active:
-                logger.info("cancelling_active_tasks", count=len(active))
-        except Exception:
-            pass
-        await event_bus.stop()
-        logger.info("http_server_stopped")
 
     @app.post("/message", response_model=MessageResponse)
     async def send_message(req: MessageRequest) -> MessageResponse:
@@ -375,11 +403,11 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
                 yield f"data: {json.dumps({'type': 'done', 'conversation_id': conv_id, 'source': 'skill', 'skill_name': skill_name}, ensure_ascii=False)}\n\n"
             return StreamingResponse(_single(), media_type="text/event-stream")
 
-        # LLM 路由：先分类再分流
+        # LLM 路由：Executor 负责 fallback 分类/Skill/学习决策，adapter 只渲染 SSE
         text = route.params.get("original_text", "")
-        classify = await executor.classify_llm_message(text)
+        decision = await executor.decide_llm_stream(text, event)
 
-        if classify.classification == LlmClassification.CHITCHAT:
+        if decision.stream_chat:
             # 闲聊 → 流式推送，保留打字机效果
             async def _stream() -> AsyncGenerator[str, None]:
                 try:
@@ -398,28 +426,10 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
                     yield f"data: {json.dumps({'type': 'error', 'content': str(e)}, ensure_ascii=False)}\n\n"
             return StreamingResponse(_stream(), media_type="text/event-stream")
 
-        elif classify.classification == LlmClassification.SKILL_MATCHED:
-            # 匹配到 Skill → 构造 RouteResult 走 Skill 执行，一次性返回
-            skill_route = RouteResult(
-                route_type=RouteType.SKILL,
-                skill_name=classify.skill_name,
-                params={"rest": text},
-                confidence=0.6,
-            )
-            reply = await executor.handle_route_result(skill_route, event)
-            skill_name = classify.skill_name or ""
-            async def _single():
-                yield f"data: {json.dumps({'type': 'text', 'content': reply or '(无响应)', 'conversation_id': conv_id, 'source': 'skill_matched', 'skill_name': skill_name}, ensure_ascii=False)}\n\n"
-                yield f"data: {json.dumps({'type': 'done', 'conversation_id': conv_id, 'source': 'skill_matched', 'skill_name': skill_name}, ensure_ascii=False)}\n\n"
-            return StreamingResponse(_single(), media_type="text/event-stream")
-
-        else:
-            # NEEDS_LEARN → 走 _handle_llm 第三段（学习确认），一次性返回
-            reply = await executor.handle_route_result(route, event)
-            async def _single():
-                yield f"data: {json.dumps({'type': 'text', 'content': reply or '(无响应)', 'conversation_id': conv_id, 'source': 'learn_confirm'}, ensure_ascii=False)}\n\n"
-                yield f"data: {json.dumps({'type': 'done', 'conversation_id': conv_id}, ensure_ascii=False)}\n\n"
-            return StreamingResponse(_single(), media_type="text/event-stream")
+        async def _single():
+            yield f"data: {json.dumps({'type': 'text', 'content': decision.reply or '(无响应)', 'conversation_id': conv_id, 'source': decision.source, 'skill_name': decision.skill_name}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'type': 'done', 'conversation_id': conv_id, 'source': decision.source, 'skill_name': decision.skill_name}, ensure_ascii=False)}\n\n"
+        return StreamingResponse(_single(), media_type="text/event-stream")
 
     @app.get("/events")
     async def event_stream(conversation_id: str | None = None) -> StreamingResponse:
@@ -438,7 +448,7 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
                         data = event.model_dump_json()
                         yield f"data: {data}\n\n"
                     except asyncio.TimeoutError:
-                        yield f": keepalive\n\n"
+                        yield ": keepalive\n\n"
             finally:
                 sse_subscribers.remove(subscriber)
 
@@ -713,7 +723,7 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
                 llm_status = "no_api_key"
 
         return {
-            "version": "0.3.5",
+            "version": __version__,
             "llm": {
                 "provider": config.llm_provider,
                 "model": llm_model,
@@ -745,9 +755,9 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
 
         # 数据库
         try:
-            from src.memcore.lifecycle import MemCoreLifecycle
-            lifecycle = MemCoreLifecycle(config)
-            await lifecycle._db.execute("SELECT 1")
+            config.db_path.parent.mkdir(parents=True, exist_ok=True)
+            with sqlite3.connect(str(config.db_path)) as conn:
+                conn.execute("SELECT 1").fetchone()
             checks["database"] = "ok"
         except Exception:
             checks["database"] = "error"
@@ -756,7 +766,7 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
 
         return {
             "status": overall,
-            "version": "0.3.5",
+            "version": __version__,
             "checks": checks,
         }
 
@@ -765,6 +775,9 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
     @app.get("/files/{task_id}/{path:path}")
     async def stream_file(task_id: str, path: str) -> StreamingResponse:
         """流式下载文件，path traversal 防护（路径在 FileManager 层校验）"""
+        if task_id == "uploads":
+            return await serve_upload(path)
+
         filename = Path(path).name
         try:
             gen, mime, size = await file_manager.stream_file(task_id, filename)
@@ -839,8 +852,8 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
         # 热重载：重建 LLM 客户端
         try:
             new_llm = LLMFactory.create(config)
-            executor._llm_client = new_llm
-            learning_engine._llm_client = new_llm
+            executor._llm = new_llm
+            learning_engine._llm = new_llm
             logger.info("llm_hot_reloaded", provider=config.llm_provider, model=config.llm_model)
         except Exception as e:
             logger.warning("llm_hot_reload_failed", error=str(e))
@@ -947,8 +960,8 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
         if model_id == config.llm_active_model_id:
             try:
                 new_llm = LLMFactory.create(config)
-                executor._llm_client = new_llm
-                learning_engine._llm_client = new_llm
+                executor._llm = new_llm
+                learning_engine._llm = new_llm
             except Exception as e:
                 logger.warning("llm_hot_reload_failed", error=str(e))
 
@@ -972,8 +985,8 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
         # 热重载 LLM 客户端
         try:
             new_llm = LLMFactory.create(config)
-            executor._llm_client = new_llm
-            learning_engine._llm_client = new_llm
+            executor._llm = new_llm
+            learning_engine._llm = new_llm
             logger.info("llm_model_switched", provider=config.llm_provider, model=config.llm_model)
         except Exception as e:
             logger.warning("llm_hot_reload_failed", error=str(e))
@@ -1010,12 +1023,32 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
     @app.post("/upload")
     async def upload_file() -> dict:
         """接收用户上传的文件（图片/附件），保存到 output/uploads/"""
-        from fastapi import UploadFile, File as FastAPIFile
-
-        # 使用 form data
-        form = await app.state._upload_form if hasattr(app.state, "_upload_form") else None
-        # FastAPI 自动解析 multipart
         return {"status": "ok"}
+
+    def _safe_upload_filename(filename: str | None) -> str:
+        """安全化上传文件名；路径穿越直接拒绝，其余特殊字符替换为下划线。"""
+        raw = (filename or "").strip()
+        if not raw:
+            raise HTTPException(status_code=400, detail="文件名不能为空")
+        if any(sep in raw for sep in ("/", "\\")) or ".." in raw:
+            raise HTTPException(status_code=400, detail="非法文件名")
+
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", raw)
+        safe = safe.strip("._")
+        if not safe:
+            raise HTTPException(status_code=400, detail="非法文件名")
+        return safe
+
+    def _resolve_upload_path(filename: str) -> tuple[Path, Path]:
+        """返回 (upload_dir, target)，并确保 target 没有逃出 upload_dir。"""
+        upload_dir = (Path("output") / "uploads").resolve()
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        target = (upload_dir / filename).resolve()
+        try:
+            target.relative_to(upload_dir)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="非法文件路径")
+        return upload_dir, target
 
     @app.post("/upload/file")
     async def upload_file_multipart(file: UploadFile = None) -> dict:
@@ -1023,28 +1056,26 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
         if not file:
             raise HTTPException(status_code=400, detail="No file provided")
 
-        import shutil
-        upload_dir = Path("output") / "uploads"
-        upload_dir.mkdir(parents=True, exist_ok=True)
-
-        dest = upload_dir / file.filename
+        safe_name = _safe_upload_filename(file.filename)
+        _, dest = _resolve_upload_path(safe_name)
         with open(dest, "wb") as f:
             content = await file.read()
             f.write(content)
 
         return {
             "status": "uploaded",
-            "name": file.filename,
+            "name": safe_name,
             "size": len(content),
             "path": str(dest),
-            "url": f"/files/uploads/{file.filename}",
+            "url": f"/files/uploads/{quote(safe_name)}",
         }
 
     @app.get("/files/uploads/{path:path}")
     async def serve_upload(path: str) -> StreamingResponse:
         """提供上传文件的访问"""
         from src.executor.file_manager import _mime_type
-        file_path = Path("output") / "uploads" / path
+        safe_name = _safe_upload_filename(path)
+        _, file_path = _resolve_upload_path(safe_name)
         if not file_path.exists():
             raise HTTPException(status_code=404, detail="文件不存在")
 
@@ -1059,7 +1090,10 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
         return StreamingResponse(
             _gen(),
             media_type=mime,
-            headers={"Content-Length": str(size), "Content-Disposition": f"inline; filename={file_path.name}"},
+            headers={
+                "Content-Length": str(size),
+                "Content-Disposition": f"inline; filename*=UTF-8''{quote(file_path.name)}",
+            },
         )
 
     # ─── Schedule Management ────────────────────────────────────
@@ -1105,6 +1139,30 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
         )
 
     event_bus.on(EventType.SCHEDULE_TRIGGERED, on_schedule_triggered)
+
+    async def on_scheduled_task_finished(event: Event) -> None:
+        """Executor 完成/失败后回写 schedule_runs，打通重试闭环。"""
+        schedule_id = event.payload.get("schedule_id")
+        run_id = event.payload.get("run_id")
+        if not schedule_id or run_id is None:
+            return
+        try:
+            run_id_int = int(run_id)
+        except (TypeError, ValueError):
+            logger.warning("schedule_run_id_invalid", schedule_id=schedule_id, run_id=run_id)
+            return
+
+        success = event.event == EventType.TASK_COMPLETED
+        error = None if success else str(event.payload.get("error") or event.payload.get("reason") or "")
+        await scheduler.record_run_result(
+            schedule_id=str(schedule_id),
+            run_id=run_id_int,
+            success=success,
+            error=error or None,
+        )
+
+    event_bus.on(EventType.TASK_COMPLETED, on_scheduled_task_finished)
+    event_bus.on(EventType.TASK_FAILED, on_scheduled_task_finished)
 
     @app.get("/schedules", response_model=list[ScheduleInfo])
     async def list_schedules() -> list[ScheduleInfo]:

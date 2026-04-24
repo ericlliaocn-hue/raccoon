@@ -21,7 +21,10 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-from browser_engine import BrowserEngine
+try:
+    from .browser_engine import BrowserEngine
+except ImportError:  # 兼容直接在 skills/web_automate 目录运行
+    from browser_engine import BrowserEngine
 
 logger = logging.getLogger("raccoon.session_manager")
 
@@ -78,19 +81,38 @@ class BrowserSessionManager:
     async def acquire(self, mode: str = "cdp", owner: str = "", reuse_url: str = "") -> BrowserSession:
         """获取浏览器会话
 
-        优先复用空闲的同模式会话，没有则创建新会话。
+        优先复用空闲的同模式会话；传入 reuse_url 时先找已打开相同站点的会话。
         """
         async with self._lock:
-            # 1. 尝试复用空闲会话
+            # 1. reuse_url 命中已有 tab 时，优先复用对应会话
+            if reuse_url:
+                for session in self._sessions.values():
+                    if not session.in_use and session.mode == mode:
+                        if session.engine.select_reuse_page(reuse_url):
+                            session.in_use = True
+                            session.owner = owner
+                            session.touch()
+                            logger.info(
+                                "session_reused_by_url: id=%s mode=%s owner=%s url=%s",
+                                session.id,
+                                mode,
+                                owner,
+                                reuse_url,
+                            )
+                            return session
+
+            # 2. 尝试复用空闲会话
             for session in self._sessions.values():
                 if not session.in_use and session.mode == mode:
+                    if reuse_url:
+                        session.engine.select_reuse_page(reuse_url)
                     session.in_use = True
                     session.owner = owner
                     session.touch()
                     logger.info("session_reused: id=%s mode=%s owner=%s", session.id, mode, owner)
                     return session
 
-            # 2. 检查同模式会话数量限制
+            # 3. 检查同模式会话数量限制
             mode_count = sum(1 for s in self._sessions.values() if s.mode == mode)
             if mode_count >= self._max_sessions_per_mode:
                 # 强制关闭最旧的空闲会话
@@ -104,7 +126,7 @@ class BrowserSessionManager:
                 else:
                     raise RuntimeError(f"浏览器会话池已满（模式：{mode}，上限：{self._max_sessions_per_mode}）")
 
-            # 3. 创建新会话
+            # 4. 创建新会话
             engine = BrowserEngine(mode)
             start_msg = await engine.start(reuse_url=reuse_url)
             if start_msg.startswith("❌"):

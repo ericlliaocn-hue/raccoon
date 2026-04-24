@@ -5,9 +5,7 @@
 """
 
 import asyncio
-import json
 import pytest
-from pathlib import Path
 
 from src.config import RaccoonConfig
 from src.eventbus.bus import EventBus

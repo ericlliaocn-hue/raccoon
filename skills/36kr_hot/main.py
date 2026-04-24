@@ -78,8 +78,6 @@ def fetch_36kr_hot():
 def main():
     input_data = json.loads(sys.stdin.read())
     task_id = input_data.get("task_id", "")
-    params = input_data.get("params", {})
-    origin_message = input_data.get("origin_message", "")
     
     try:
         hot_list = fetch_36kr_hot()

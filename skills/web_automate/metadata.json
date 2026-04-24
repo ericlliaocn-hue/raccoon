@@ -2,7 +2,7 @@
   "name": "web_automate",
   "version": "1.0.0",
   "description": "浏览器自动化：三种模式（headless后台 / headed前台可见 / CDP真实Chrome），支持打开/点击/输入/截图/读取",
-  "trigger_words": ["打开浏览器", "浏览器操作", "网页操作", "网页点击", "网页输入", "自动浏览", "帮我操作浏览器", "用我的Chrome", "网页截图", "网页自动化", "网页搜索", "web automate"],
+  "trigger_words": ["打开浏览器", "浏览器操作", "网页操作", "网页点击", "网页输入", "自动浏览", "帮我操作浏览器", "用我的Chrome", "网页截图", "浏览器截图", "用浏览器截图", "网页自动化", "网页搜索", "web automate"],
   "aliases": ["浏览器自动化", "网页自动化", "自动化"],
   "intent_tags": ["web", "automate", "browser"],
   "risk_level": "high",

@@ -36,9 +36,6 @@ from src.types import (
     FlowStep,
     FlowStepType,
     MessageSource,
-    RouteResult,
-    RouteType,
-    SessionStatus,
     SkillSession,
     Task,
     TaskStatus,
@@ -47,6 +44,7 @@ from src.types import (
 
 if TYPE_CHECKING:
     from src.skill_vault.vault_manager import VaultManager
+    from src.supervisor.approval_engine import ApprovalEngine
 
 logger = structlog.get_logger(__name__)
 
@@ -60,6 +58,7 @@ class FlowEngine:
         session_manager: SkillSessionManager,
         vault_manager: "VaultManager",
         config: RaccoonConfig | None = None,
+        approval_engine: "ApprovalEngine | None" = None,
     ) -> None:
         self._event_bus = event_bus
         self._session_manager = session_manager
@@ -71,7 +70,10 @@ class FlowEngine:
         self._task_queue = TaskQueue(self._config)
         self._state_machine = TaskStateMachine()
         self._running_tasks: dict[str, asyncio.Task] = {}
+        self._pending_approvals: dict[str, tuple[Task, dict[str, Any], str, FlowStep]] = {}
         self._semaphore = asyncio.Semaphore(self._config.max_concurrent_tasks)
+        self._approval_engine = approval_engine
+        self._event_bus.on(EventType.APPROVAL_RESOLVED, self._on_approval_resolved)
 
     def _get_llm(self) -> LLMClient:
         """延迟初始化 LLM 客户端"""
@@ -520,13 +522,23 @@ class FlowEngine:
                         break
 
         # 创建 Task
+        task_context = {"flow_step": step.name, "flow_step_id": step.step_id}
+        if isinstance(session.state.get("_context"), dict):
+            task_context.update(session.state["_context"])
+
         task = Task(
             conversation_id=conversation_id,
             user_id="flow_engine",
             origin_message=f"flow_step:{step.name}",
             skill_name=session.skill_name,
+            context=task_context,
         )
         self._task_queue.add(task)
+
+        approval_reply = await self._review_flow_task(task, skill_params, conversation_id, step)
+        if approval_reply:
+            self._session_manager.set_active(conversation_id)
+            return approval_reply
 
         # 如果是后台步骤，释放会话
         if step.background:
@@ -699,6 +711,7 @@ class FlowEngine:
                 payload["_step_name"] = step.name
                 if files_info:
                     payload["_files"] = files_info
+                payload = self._payload_with_context(task, payload)
                 await self._event_bus.emit(
                     make_event(
                         EventType.TASK_COMPLETED,
@@ -739,7 +752,10 @@ class FlowEngine:
                         task_id=task.task_id,
                         skill_name=task.skill_name,
                         status=TaskStatus.FAILED,
-                        payload={"error": str(e), "_source": MessageSource.BACKGROUND.value},
+                        payload=self._payload_with_context(
+                            task,
+                            {"error": str(e), "_source": MessageSource.BACKGROUND.value},
+                        ),
                     )
                 )
 
@@ -750,6 +766,86 @@ class FlowEngine:
 
             finally:
                 self._running_tasks.pop(task.task_id, None)
+
+    async def _review_flow_task(
+        self,
+        task: Task,
+        skill_params: dict[str, Any],
+        conversation_id: str,
+        step: FlowStep,
+    ) -> str | None:
+        """交互式 Skill 执行前同样走审批，避免 Flow 绕过刹车。"""
+        if self._approval_engine is None:
+            return None
+
+        skill_meta = self._vault_manager.get_skill(task.skill_name)
+        result = await self._approval_engine.review(task, metadata=skill_meta)
+        if result.approved:
+            return None
+
+        if result.status.value == "pending" and result.approval_id:
+            task.context["approval_id"] = result.approval_id
+            self._state_machine.transition(task, TaskStatus.PENDING_APPROVAL)
+            self._task_queue.update(task)
+            self._pending_approvals[result.approval_id] = (
+                task,
+                skill_params,
+                conversation_id,
+                step,
+            )
+            return (
+                f"**{step.name}** 等待审批\n\n"
+                f"任务 ID: `{task.task_id[:8]}`，审批 ID: `{result.approval_id[:8]}`。"
+                "批准后会自动继续执行。"
+            )
+
+        task.error = result.reason or "approval_rejected"
+        self._state_machine.transition(task, TaskStatus.FAILED)
+        self._task_queue.update(task)
+        return f"⚠️ 步骤「{step.name}」未执行：{task.error}"
+
+    async def _on_approval_resolved(self, event: Event) -> None:
+        """审批通过后恢复 Flow Skill 步骤。"""
+        approval_id = event.payload.get("approval_id")
+        if not approval_id:
+            return
+        pending = self._pending_approvals.pop(approval_id, None)
+        if not pending:
+            return
+
+        task, skill_params, conversation_id, step = pending
+        if event.payload.get("approved"):
+            self._session_manager.release_to_background(conversation_id, task.task_id)
+            asyncio_task = asyncio.create_task(
+                self._execute_background_task(task, skill_params, conversation_id, step)
+            )
+            self._running_tasks[task.task_id] = asyncio_task
+            return
+
+        reason = event.payload.get("reason") or event.payload.get("status") or "approval_rejected"
+        task.error = str(reason)
+        try:
+            self._state_machine.transition(task, TaskStatus.FAILED)
+        except Exception:
+            pass
+        self._task_queue.update(task)
+        await self._event_bus.emit(
+            make_event(
+                EventType.TASK_FAILED,
+                conversation_id=conversation_id,
+                task_id=task.task_id,
+                skill_name=task.skill_name,
+                status=TaskStatus.FAILED,
+                payload=self._payload_with_context(task, {"error": str(reason)}),
+            )
+        )
+
+    def _payload_with_context(self, task: Task, payload: dict[str, Any]) -> dict[str, Any]:
+        merged = dict(payload)
+        if task.context:
+            merged.update({k: v for k, v in task.context.items() if k not in merged})
+            merged["_context"] = dict(task.context)
+        return merged
 
     # ─── 取消流程 ─────────────────────────────────────────────
 

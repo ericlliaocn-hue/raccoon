@@ -2,8 +2,8 @@
   "name": "file_read",
   "version": "1.0.0",
   "description": "读取本地文件并通过 Web UI 发送给用户",
-  "trigger_words": ["发给我", "发过来", "下载", "send me", "send me the file"],
-  "aliases": ["文件读取", "读取文件", "发文件", "read file"],
+  "trigger_words": ["发给我", "发过来", "下载", "读取文件", "发送文件", "send me", "send me the file", "read file"],
+  "aliases": ["文件读取", "发文件", "传文件"],
   "author": "raccoon",
   "schema": {
     "type": "object",

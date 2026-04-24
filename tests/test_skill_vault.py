@@ -2,7 +2,6 @@
 
 import json
 import pytest
-from pathlib import Path
 
 from src.config import RaccoonConfig
 from src.skill_vault.vault_manager import VaultManager

@@ -35,7 +35,7 @@ class RaccoonConfig(BaseSettings):
     write_lock_retries: int = 3
 
     # ─── Supervisor ───
-    auto_approve: bool = True  # MVP: 自动通过
+    auto_approve: bool = False  # 默认仅高风险/显式审批进入人工确认，低中风险自动通过
     approval_timeout_seconds: int = 300  # 审批超时（秒），默认 5 分钟
 
     # ─── Scheduler ───
@@ -55,8 +55,9 @@ class RaccoonConfig(BaseSettings):
     workflows_dir: Path = Field(default=PROJECT_ROOT / "workflows")
 
     # ─── Adapters ───
-    http_host: str = "0.0.0.0"
+    http_host: str = "127.0.0.1"
     http_port: int = 8900
+    http_auth_token: str = ""  # 为空则不启用认证，生产环境建议配置
 
     # ─── Browser (CDP) ───
     chrome_path: str = ""  # Chrome 可执行文件路径，为空则自动检测
@@ -70,6 +71,8 @@ class RaccoonConfig(BaseSettings):
     llm_base_url: str = "https://maas-coding-api.cn-huabei-1.xf-yun.com/v2"  # codeplan 端点
     llm_temperature: float = 0.7
     llm_max_tokens: int = 8192
+    llm_skill_match_threshold: float = 0.7
+    intent_classifier_type: str = "keyword"  # keyword / model
 
     # ─── 多模型管理 ───
     llm_models: list[dict] = Field(default_factory=list)  # [{"id","name","vendor","url","apiKey","maxInputTokens","maxOutputTokens","supportsToolCall","supportsImages","supportsReasoning"}, ...]

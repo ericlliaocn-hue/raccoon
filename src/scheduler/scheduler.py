@@ -247,6 +247,9 @@ class Scheduler:
                 async def _retry():
                     await asyncio.sleep(policy.retry_interval_seconds)
                     if entry.enabled and entry.retry_count <= policy.max_retries:
+                        retry_run_id = self._store.record_run_start(entry.schedule_id)
+                        entry.last_run = datetime.now(timezone.utc)
+                        self._store.update(entry)
                         retry_event = make_event(
                             EventType.SCHEDULE_TRIGGERED,
                             conversation_id=entry.conversation_id,
@@ -256,7 +259,9 @@ class Scheduler:
                                 "schedule_id": entry.schedule_id,
                                 "schedule_name": f"{entry.name} (重试#{entry.retry_count})",
                                 "cron": entry.cron,
+                                "run_id": retry_run_id,
                                 "is_retry": True,
+                                "retry_count": entry.retry_count,
                             },
                         )
                         await self._event_bus.emit(retry_event)

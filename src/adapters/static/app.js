@@ -8,6 +8,27 @@ marked.setOptions({
   gfm: true,
 });
 
+// ─── HTTP Auth ─────────────────────────────────────────
+function authToken() {
+  return localStorage.getItem('raccoon_http_auth_token') || '';
+}
+
+function authUrl(url) {
+  const token = authToken();
+  if (!token) return url;
+  const sep = url.includes('?') ? '&' : '?';
+  return `${url}${sep}token=${encodeURIComponent(token)}`;
+}
+
+const rawFetch = window.fetch.bind(window);
+window.fetch = (input, init = {}) => {
+  const token = authToken();
+  if (!token) return rawFetch(input, init);
+  const headers = new Headers(init.headers || {});
+  if (!headers.has('Authorization')) headers.set('Authorization', `Bearer ${token}`);
+  return rawFetch(input, { ...init, headers });
+};
+
 // ─── State ─────────────────────────────────────────────
 let convId = null, sending = false, paused = false;
 let currentAbortController = null;  // 用于中断流式请求
@@ -44,7 +65,7 @@ function setupSSE() {
 function connectSSE() {
   if (sseConnection) { sseConnection.close(); sseConnection = null; }
   const url = convId ? `/events?conversation_id=${encodeURIComponent(convId)}` : '/events';
-  sseConnection = new EventSource(url);
+  sseConnection = new EventSource(authUrl(url));
   sseConnection.onmessage = e => { try { handleSSE(JSON.parse(e.data)); } catch {} };
   sseConnection.onerror = () => {
     // 断线重连
@@ -76,13 +97,13 @@ function handleSSE(ev) {
       const isImg = /^image\//.test(f.mime), isVid = /^video\//.test(f.mime), isAud = /^audio\//.test(f.mime);
       let body = '';
       if (isImg)
-        body = `<a href="/files/${ev.task_id}/${encodeURIComponent(f.name)}" target="_blank"><img src="/files/${ev.task_id}/${encodeURIComponent(f.name)}" alt="${escHtml(f.name)}" style="max-width:320px;max-height:240px;border-radius:8px;margin-top:8px;display:block;"/></a>`;
+        body = `<a href="${authUrl(`/files/${ev.task_id}/${encodeURIComponent(f.name)}`)}" target="_blank"><img src="${authUrl(`/files/${ev.task_id}/${encodeURIComponent(f.name)}`)}" alt="${escHtml(f.name)}" style="max-width:320px;max-height:240px;border-radius:8px;margin-top:8px;display:block;"/></a>`;
       else if (isVid)
-        body = `<video controls style="max-width:400px;border-radius:8px;margin-top:8px;display:block;"><source src="/files/${ev.task_id}/${encodeURIComponent(f.name)}" type="${f.mime}">你的浏览器不支持 video</video>`;
+        body = `<video controls style="max-width:400px;border-radius:8px;margin-top:8px;display:block;"><source src="${authUrl(`/files/${ev.task_id}/${encodeURIComponent(f.name)}`)}" type="${f.mime}">你的浏览器不支持 video</video>`;
       else if (isAud)
-        body = `<audio controls style="width:280px;margin-top:8px;display:block;"><source src="/files/${ev.task_id}/${encodeURIComponent(f.name)}" type="${f.mime}">你的浏览器不支持 audio</audio>`;
+        body = `<audio controls style="width:280px;margin-top:8px;display:block;"><source src="${authUrl(`/files/${ev.task_id}/${encodeURIComponent(f.name)}`)}" type="${f.mime}">你的浏览器不支持 audio</audio>`;
       else
-        body = `<div class="file-dl-wrap"><span class="file-dl-name">📎 ${escHtml(f.name)}</span><span class="file-dl-size">${fmtSize(f.size)}</span><a href="/files/${ev.task_id}/${encodeURIComponent(f.name)}" download="${escHtml(f.name)}" class="file-dl-btn">↓ 下载</a></div>`;
+        body = `<div class="file-dl-wrap"><span class="file-dl-name">📎 ${escHtml(f.name)}</span><span class="file-dl-size">${fmtSize(f.size)}</span><a href="${authUrl(`/files/${ev.task_id}/${encodeURIComponent(f.name)}`)}" download="${escHtml(f.name)}" class="file-dl-btn">↓ 下载</a></div>`;
       const srcHtml = renderSourceLabel(src, skillName);
       el.innerHTML = `<div class="msg-av">🦝</div><div class="msg-body">${srcHtml}<div class="msg-bbl">${body}</div></div>`;
       msgsEl.appendChild(el); msgsEl.scrollTop = msgsEl.scrollHeight;

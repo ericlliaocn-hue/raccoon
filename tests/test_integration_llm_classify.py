@@ -6,6 +6,7 @@
 
 注意：此测试会调用真实 LLM，需要配置 API Key
 """
+# ruff: noqa: E402
 import asyncio
 import sys
 import os
@@ -18,7 +19,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import pytest
 from unittest.mock import MagicMock
 
-from src.executor.agent import Executor, LlmClassification, LlmClassifyResult
+from src.executor.agent import Executor, LlmClassification
 from src.skill_vault.vault_manager import VaultManager
 from src.config import RaccoonConfig
 

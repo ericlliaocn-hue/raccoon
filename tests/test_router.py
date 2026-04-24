@@ -41,7 +41,7 @@ def test_match_chinese(trigger_map, echo_skill):
     assert result.skill_name == "echo"
 
 
-def test_no_match(trigger_map, echo_skill):
+def test_trigger_map_no_match(trigger_map, echo_skill):
     trigger_map.register(echo_skill)
     result = trigger_map.match("hello world")
     assert result is None
@@ -154,7 +154,7 @@ async def test_cancel_operation(classifier):
 
 
 @pytest.mark.asyncio
-async def test_no_match(classifier):
+async def test_intent_classifier_no_match(classifier):
     result = await classifier.classify("今天天气不错")
     assert result is None
 

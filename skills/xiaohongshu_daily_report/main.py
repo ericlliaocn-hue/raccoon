@@ -2,7 +2,6 @@ import sys
 import json
 import re
 import httpx
-from bs4 import BeautifulSoup
 
 
 def get_stdin_input():

@@ -9,7 +9,6 @@ import asyncio
 import uuid
 from typing import TYPE_CHECKING
 
-import click
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt

@@ -8,8 +8,7 @@
 
 import asyncio
 import os
-from datetime import datetime, timezone, timedelta
-from pathlib import Path
+from datetime import datetime, timezone
 
 import pytest
 
@@ -18,7 +17,7 @@ from src.eventbus.bus import EventBus
 from src.scheduler.cron_parser import CronParser, CronParseError
 from src.scheduler.schedule_store import ScheduleStore
 from src.scheduler.scheduler import Scheduler
-from src.types import Event, EventType, ScheduleEntry, ScheduleStatus, RetryPolicy, make_event
+from src.types import Event, EventType, ScheduleEntry, ScheduleStatus, RetryPolicy
 
 
 # ─── CronParser 测试 ─────────────────────────────────────────

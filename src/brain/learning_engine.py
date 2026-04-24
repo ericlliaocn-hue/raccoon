@@ -29,7 +29,6 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -39,7 +38,7 @@ import structlog
 
 from src.config import RaccoonConfig
 from src.skill_vault.vault_manager import VaultManager
-from src.types import ScheduleEntry, SkillMetadata, Task
+from src.types import ScheduleEntry, Task
 
 if TYPE_CHECKING:
     from src.scheduler.scheduler import Scheduler
@@ -1159,6 +1158,26 @@ if __name__ == "__main__":
             logger.info("skill_quick_fixed", skill=skill_name, error=error_msg)
             return quick_fix
 
+        actual_reply_section = ""
+        if actual_reply:
+            actual_reply_section = f"""\
+Skill 实际输出（reply）：
+{actual_reply[:500]}
+
+⚠️ 注意：Skill 代码没有抛异常，但输出内容表明执行结果不正确。
+请分析实际输出，找出根因（如 API 返回了错误状态、接口已废弃、数据解析逻辑有误等），然后修复代码。
+"""
+
+        debug_section = ""
+        if debug_info:
+            debug_section = f"""\
+🔍 Skill _debug 诊断信息（API 原始返回）：
+{json.dumps(debug_info, ensure_ascii=False, indent=2)[:800]}
+
+⚠️ 这是 Skill 代码记录的 API 原始响应，是诊断根因的关键线索！
+请根据此信息判断：API 是否已废弃/变更？是否需要换接口？数据解析逻辑是否正确？
+"""
+
         prompt = f"""以下 Skill 代码执行出错，请修复。
 
 Skill 名称：{skill_name}
@@ -1171,20 +1190,8 @@ Skill 名称：{skill_name}
 
 执行错误：
 {error_msg}
-{f"""
-Skill 实际输出（reply）：
-{actual_reply[:500]}
-
-⚠️ 注意：Skill 代码没有抛异常，但输出内容表明执行结果不正确。
-请分析实际输出，找出根因（如 API 返回了错误状态、接口已废弃、数据解析逻辑有误等），然后修复代码。
-""" if actual_reply else ""}
-{f"""
-🔍 Skill _debug 诊断信息（API 原始返回）：
-{json.dumps(debug_info, ensure_ascii=False, indent=2)[:800]}
-
-⚠️ 这是 Skill 代码记录的 API 原始响应，是诊断根因的关键线索！
-请根据此信息判断：API 是否已废弃/变更？是否需要换接口？数据解析逻辑是否正确？
-""" if debug_info else ""}
+{actual_reply_section}
+{debug_section}
 {_SKILL_STANDARD_CORE}
 
 修复要求：
@@ -1251,6 +1258,30 @@ Skill 实际输出（reply）：
             f"  第{i+1}次: {err}" for i, err in enumerate(error_history)
         )
 
+        last_reply_section = ""
+        if last_reply:
+            last_reply_section = f"""\
+- Skill 实际输出（reply）：
+{last_reply[:500]}
+
+⚠️ 请仔细分析实际输出，判断根因：
+  - 如果输出是"未能获取/暂无数据"等 → 大概率是 API 接口已失效/废弃，需要换一个不同的 API
+  - 如果输出包含鉴权/签名错误 → 该 API 需要认证，换不需要认证的公开接口
+  - 如果输出包含风控/验证码 → 该站点有反爬，考虑换数据源或用浏览器方式
+"""
+
+        debug_section = ""
+        if debug_info:
+            debug_section = f"""\
+- 🔍 Skill _debug 诊断信息（API 原始返回）：
+{json.dumps(debug_info, ensure_ascii=False, indent=2)[:800]}
+
+⚠️ 这是关键诊断线索！根据 API 原始返回判断：
+  - 如果 API 返回错误码/异常状态 → 该接口可能已废弃或变更，必须换不同的 API
+  - 如果 API 返回空数据 → 可能是接口参数变更或需要鉴权
+  - 如果 API 返回正常但解析失败 → 可以只修代码，不必换方案
+"""
+
         prompt = f"""之前的方案执行失败，需要重新选择实现方案。
 
 用户需求：{user_message}
@@ -1260,24 +1291,8 @@ Skill 实际输出（reply）：
 - 实现思路：{old_approach}
 - 失败记录：
 {errors_summary}
-{f"""
-- Skill 实际输出（reply）：
-{last_reply[:500]}
-
-⚠️ 请仔细分析实际输出，判断根因：
-  - 如果输出是"未能获取/暂无数据"等 → 大概率是 API 接口已失效/废弃，需要换一个不同的 API
-  - 如果输出包含鉴权/签名错误 → 该 API 需要认证，换不需要认证的公开接口
-  - 如果输出包含风控/验证码 → 该站点有反爬，考虑换数据源或用浏览器方式
-""" if last_reply else ""}
-{f"""
-- 🔍 Skill _debug 诊断信息（API 原始返回）：
-{json.dumps(debug_info, ensure_ascii=False, indent=2)[:800]}
-
-⚠️ 这是关键诊断线索！根据 API 原始返回判断：
-  - 如果 API 返回错误码/异常状态 → 该接口可能已废弃或变更，必须换不同的 API
-  - 如果 API 返回空数据 → 可能是接口参数变更或需要鉴权
-  - 如果 API 返回正常但解析失败 → 可以只修代码，不必换方案
-""" if debug_info else ""}
+{last_reply_section}
+{debug_section}
 已有 Skill 清单（可参考或组合）：
 {skill_catalog}
 
@@ -1539,7 +1554,7 @@ cron 示例：
             elif entry["phase"] == "dep_install_failed":
                 lines.append(f"   依赖安装失败（{', '.join(entry.get('deps', []))}）：{entry.get('error', '')[:80]}")
             elif entry["phase"] == "code_gen_failed":
-                lines.append(f"   代码生成失败")
+                lines.append("   代码生成失败")
             elif entry["phase"] == "register_failed":
                 lines.append(f"   Skill 注册失败（{entry.get('skill', '')}）")
 

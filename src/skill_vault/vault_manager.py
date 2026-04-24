@@ -303,7 +303,7 @@ class VaultManager:
                 gitpython.Repo.clone_from(source, tmp_dir, depth=1)
                 new_meta_path = Path(tmp_dir) / "metadata.json"
                 if not new_meta_path.exists():
-                    raise RuntimeError(f"metadata.json not found in remote source")
+                    raise RuntimeError("metadata.json not found in remote source")
                 new_data = json.loads(new_meta_path.read_text(encoding="utf-8"))
                 new_meta = SkillMetadata.model_validate(new_data)
                 new_version = new_meta.version
@@ -371,7 +371,7 @@ class VaultManager:
         """
         backup_base = self._skills_dir / ".backup"
         if not backup_base.exists():
-            raise RuntimeError(f"没有可用的备份")
+            raise RuntimeError("没有可用的备份")
 
         # 查找备份
         if version:

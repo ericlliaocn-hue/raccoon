@@ -18,7 +18,10 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from actions import Actions, ActionResult
+try:
+    from .actions import Actions, ActionResult
+except ImportError:  # 兼容 main.py 作为脚本直接运行
+    from actions import Actions, ActionResult
 
 logger = logging.getLogger("raccoon.browser_engine")
 
@@ -210,7 +213,7 @@ class BrowserEngine:
             cdp_profile = CDP_INCOGNITO_PROFILE_DIR
             incognito = True
             try:
-                await self._start_cdp(cdp_port, cdp_profile, incognito)
+                await self._start_cdp(cdp_port, cdp_profile, incognito, reuse_url=reuse_url)
             except RuntimeError as e:
                 return str(e)
 
@@ -253,14 +256,38 @@ class BrowserEngine:
         """
         if not self._browser:
             return None
+        patterns = self._reuse_patterns(pattern)
         try:
             for ctx in self._browser.contexts:
                 for page in ctx.pages:
-                    if pattern in page.url:
+                    if any(p and p in page.url for p in patterns):
                         return page
         except Exception:
             pass
         return None
+
+    def select_reuse_page(self, pattern: str) -> bool:
+        """把当前操作页切到已有匹配 tab，供 SessionManager 复用空闲会话。"""
+        page = self.find_page_by_url(pattern)
+        if not page:
+            return False
+        self._page = page
+        self._actions = Actions(self._page, OUTPUT_DIR)
+        return True
+
+    def _reuse_patterns(self, pattern: str) -> list[str]:
+        """生成复用匹配串：完整 URL + hostname，避免路径差异导致复用失败。"""
+        if not pattern:
+            return []
+        patterns = [pattern]
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(pattern)
+            if parsed.netloc:
+                patterns.append(parsed.netloc)
+        except Exception:
+            pass
+        return list(dict.fromkeys(patterns))
 
     def _is_chrome_cdp_running(self, port: int | None = None) -> bool:
         """检查 Chrome CDP 是否已在运行"""
@@ -495,13 +522,17 @@ class BrowserEngine:
 
 # ── 同步封装（给 main.py 调用）──────────────────────────
 
-def run_engine(mode: str, action_list: list[dict[str, Any]]) -> dict[str, Any]:
+def run_engine(
+    mode: str,
+    action_list: list[dict[str, Any]],
+    reuse_url: str = "",
+) -> dict[str, Any]:
     """同步运行引擎，返回结果（内部跑 async 事件循环）"""
     engine = BrowserEngine(mode)
 
     async def _run():
         # 1. 启动浏览器
-        start_msg = await engine.start()
+        start_msg = await engine.start(reuse_url=reuse_url if mode in ("cdp", "cdp_incognito") else "")
         if start_msg.startswith("❌"):
             return {"reply": start_msg, "files": [], "details": []}
 

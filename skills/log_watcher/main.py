@@ -84,7 +84,10 @@ def cmd_search(params: dict) -> dict:
             matches.append({
                 "line_number": i + 1,
                 "line": line[:200],
-                "context": [f"{j+1}: {l}" for j, l in enumerate(ctx_lines, start=start)],
+                "context": [
+                    f"{line_no + 1}: {ctx_line}"
+                    for line_no, ctx_line in enumerate(ctx_lines, start=start)
+                ],
             })
             if len(matches) >= max_results:
                 break

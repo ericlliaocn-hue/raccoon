@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+from typing import Any
 
 # ── 模式检测 ──────────────────────────────────────────────
 
@@ -163,39 +164,78 @@ def _parse_actions(text: str, url: str | None) -> list[dict]:
         actions.append({"action": "wait", "ms": 2000})
         actions.append({"action": "screenshot"})
 
-    # 6. 没有 URL 也没有操作 → 打开空白页截图
+    # 6. 没有 URL 也没有操作 → 对当前页截图，不主动把已复用页面导航到空白页
     if not actions:
-        actions.append({"action": "open", "url": "about:blank"})
         actions.append({"action": "screenshot"})
 
     return actions
+
+
+def _build_result(mode: str, details: list[dict[str, Any]]) -> dict[str, Any]:
+    """把动作结果整理成 Skill 协议输出。"""
+    files = []
+    for detail in details:
+        data = detail.get("data") or {}
+        if detail.get("success") and detail.get("action") == "screenshot" and data.get("path"):
+            files.append({"path": data["path"], "name": data.get("name", "screenshot.png")})
+
+    success_count = sum(1 for d in details if d.get("success"))
+    total = len(details)
+    summary_lines = [f"🌐 浏览器自动化完成（{success_count}/{total} 成功，模式：{mode}）"]
+    for detail in details:
+        marker = "✅" if detail.get("success") else "❌"
+        summary_lines.append(f"  {marker} {detail.get('message', '')}")
+
+    return {
+        "reply": "\n".join(summary_lines),
+        "files": files,
+        "details": details,
+    }
+
+
+async def run_browser_skill(data: dict[str, Any]) -> dict[str, Any]:
+    """默认运行路径：通过 BrowserSessionManager 获取/释放浏览器会话。"""
+    task_id = data.get("task_id", "")
+    origin = data.get("origin_message", "")
+
+    mode = _detect_mode(origin)
+    raw = origin.strip()
+    url = _extract_url(raw)
+    action_list = _parse_actions(raw, url)
+
+    try:
+        from .session_manager import get_session_manager
+    except ImportError:  # 兼容 subprocess 直接运行 main.py
+        from session_manager import get_session_manager
+
+    session = None
+    manager = get_session_manager()
+    try:
+        session = await manager.acquire(mode, owner=task_id or "web_automate", reuse_url=url or "")
+        details = await session.engine.execute(action_list)
+        result = _build_result(mode, details)
+    finally:
+        if session is not None:
+            await manager.release(session.id)
+
+    result["task_id"] = task_id
+    return result
 
 
 # ── 主入口 ────────────────────────────────────────────────
 
 def main() -> None:
     data = json.loads(sys.stdin.read())
-    task_id = data.get("task_id", "")
-    origin = data.get("origin_message", "")
-    params = data.get("params", {})
-
-    # 模式检测必须用完整原始消息（因为路由器会把触发词从 rest 中去掉）
-    mode = _detect_mode(origin)
-
-    # URL 和动作解析也用原始消息（路由器的 rest 会截断触发词之后的内容，丢失关键信息）
-    raw = origin.strip()
-
-    # 提取 URL
-    url = _extract_url(raw)
-
-    # 解析动作
-    action_list = _parse_actions(raw, url)
-
-    # 执行
-    from browser_engine import run_engine
-
-    result = run_engine(mode, action_list)
-    result["task_id"] = task_id
+    try:
+        import asyncio
+        result = asyncio.run(run_browser_skill(data))
+    except Exception as e:
+        result = {
+            "reply": f"❌ 浏览器自动化执行失败：{e}",
+            "files": [],
+            "details": [],
+            "task_id": data.get("task_id", ""),
+        }
 
     print(json.dumps(result, ensure_ascii=False))
 

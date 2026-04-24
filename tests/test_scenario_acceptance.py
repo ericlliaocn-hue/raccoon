@@ -15,12 +15,11 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import shutil
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -28,7 +27,7 @@ from src.config import RaccoonConfig
 from src.eventbus.bus import EventBus
 from src.eventbus.events import EventType, make_event
 from src.gateway.inbound import GatewayInbound, GatewayAuthError
-from src.notifier.channels.base import BaseChannel, Notification, Priority
+from src.notifier.channels.base import BaseChannel, Notification
 from src.notifier.notifier import Notifier
 from src.scheduler.cron_parser import CronParser
 from src.scheduler.schedule_store import ScheduleStore
@@ -58,6 +57,8 @@ def _make_config(**overrides) -> RaccoonConfig:
     """创建测试配置"""
     tmp = tempfile.mkdtemp()
     defaults = {
+        "db_path": Path(tmp) / "data" / "memcore.db",
+        "skills_dir": Path(tmp) / "skills",
         "schedules_dir": Path(tmp) / "schedules",
         "workflows_dir": Path(tmp) / "workflows",
         "notify_channels": [],
@@ -269,7 +270,7 @@ class TestScenario6PriceMonitor:
 
     def test_change_detector_detects_change(self):
         """change_detector 能检测到变化"""
-        from skills.change_detector.main import cmd_snapshot, cmd_check, SNAPSHOT_DIR
+        from skills.change_detector.main import cmd_snapshot, SNAPSHOT_DIR
 
         # 确保快照目录存在
         SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)

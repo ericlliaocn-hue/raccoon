@@ -9,14 +9,13 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import structlog
 
+from src.executor.file_manager import FileManager, _mime_type
 from src.types import Task
 
 logger = structlog.get_logger(__name__)
-from src.executor.file_manager import FileManager, _mime_type
 
 
 class MediaPusher:

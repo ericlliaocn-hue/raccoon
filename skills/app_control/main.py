@@ -8,7 +8,6 @@ macOS: open / osascript / ps
   输出: { "reply": "...", "files": [] }
 """
 import json
-import re
 import subprocess
 import sys
 

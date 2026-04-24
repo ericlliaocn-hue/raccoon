@@ -32,7 +32,6 @@ class FileManager:
     """文件管理器：存储、检索、流式发送文件"""
 
     def __init__(self, output_dir: Path | None = None) -> None:
-        import uuid
         self._output_dir = output_dir or (Path(__file__).parent.parent.parent / "output")
         self._output_dir.mkdir(parents=True, exist_ok=True)
 

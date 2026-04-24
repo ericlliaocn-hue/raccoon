@@ -86,7 +86,7 @@ def _get_disk_info() -> str:
         try:
             out = subprocess.check_output(["df", "-h"], timeout=3, text=True)
             lines = out.splitlines()[:6]  # 限制行数
-            return "\n".join(f"  {l}" for l in lines)
+            return "\n".join(f"  {line}" for line in lines)
         except Exception:
             return "  磁盘信息：psutil 未安装，无法获取"
 
@@ -117,7 +117,7 @@ def _get_process_info() -> str:
                 ["ps", "aux", "-r"], timeout=3, text=True,
             )
             lines = out.splitlines()[:11]
-            return "\n".join(f"  {l}" for l in lines)
+            return "\n".join(f"  {line}" for line in lines)
         except Exception:
             return "  进程信息：psutil 未安装，无法获取"
 
@@ -189,7 +189,7 @@ def main() -> None:
     arch = platform.machine()
 
     parts = []
-    parts.append(f"🖥️ 系统信息")
+    parts.append("🖥️ 系统信息")
     parts.append(f"  系统：{sys_name} {sys_release}（版本 {sys_version}）")
     parts.append(f"  主机：{hostname}")
     parts.append(f"  架构：{arch}")

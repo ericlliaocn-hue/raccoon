@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
-from datetime import datetime, timezone
 
 import pytest
 
@@ -14,7 +12,7 @@ from src.supervisor.approval_engine import (
     ApprovalStatus,
     RiskAssessor,
 )
-from src.types import SkillMetadata, Task, TaskStatus
+from src.types import SkillMetadata, Task
 
 
 # ─── Helpers ──────────────────────────────────────────────────
@@ -64,22 +62,22 @@ class TestRiskAssessor:
         meta = _make_metadata(permissions=["subprocess"])
         assert RiskAssessor.assess(meta) == "high"
 
-    def test_filesystem_permission_is_high(self):
+    def test_filesystem_permission_is_medium(self):
         meta = _make_metadata(permissions=["filesystem"])
-        assert RiskAssessor.assess(meta) == "high"
+        assert RiskAssessor.assess(meta) == "medium"
 
-    def test_network_permission_is_high(self):
-        """network 在 _HIGH_RISK_PERMISSIONS 中，优先匹配为 high"""
+    def test_network_permission_is_medium(self):
+        """network 属于中风险，默认不进入人工审批"""
         meta = _make_metadata(permissions=["network"])
-        assert RiskAssessor.assess(meta) == "high"
+        assert RiskAssessor.assess(meta) == "medium"
 
     def test_no_permissions_is_low(self):
         meta = _make_metadata(permissions=[])
         assert RiskAssessor.assess(meta) == "low"
 
-    def test_requires_approval_upgrades_to_medium(self):
+    def test_requires_approval_upgrades_to_high(self):
         meta = _make_metadata(requires_approval=True)
-        assert RiskAssessor.assess(meta) == "medium"
+        assert RiskAssessor.assess(meta) == "high"
 
     def test_high_risk_overrides_permissions(self):
         """显式 high 优先于 permissions 推断"""
@@ -155,13 +153,12 @@ class TestApprovalEngine:
         assert result.status == ApprovalStatus.APPROVED
 
     @pytest.mark.asyncio
-    async def test_manual_mode_medium_risk_needs_approval(self):
-        """手动模式下中风险需要审批"""
+    async def test_manual_mode_medium_risk_auto_approved(self):
+        """默认策略：手动模式下中风险自动通过，仅高风险进入人工审批"""
         engine = ApprovalEngine(auto_approve=False)
         result = await engine.review(_make_task(), risk_level="medium")
-        assert result.approved is False
-        assert result.status == ApprovalStatus.PENDING
-        assert result.approval_id is not None
+        assert result.approved is True
+        assert result.status == ApprovalStatus.APPROVED
 
     @pytest.mark.asyncio
     async def test_manual_mode_high_risk_needs_approval(self):
@@ -243,9 +240,9 @@ class TestApprovalEngine:
         await engine.review(_make_task("skill_c"), risk_level="low")
 
         pending = engine.get_pending()
-        assert len(pending) == 2
+        assert len(pending) == 1
         names = {e.task.skill_name for e in pending}
-        assert names == {"skill_a", "skill_b"}
+        assert names == {"skill_a"}
 
     @pytest.mark.asyncio
     async def test_get_entry(self):

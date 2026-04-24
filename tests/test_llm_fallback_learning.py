@@ -1,7 +1,6 @@
 """Tests for LLM fallback chain, message classification, and learning engine."""
-import asyncio
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 from src.types import Task, RouteResult, RouteType, Event, EventType
 from src.executor.agent import Executor, LlmClassification, LlmClassifyResult
@@ -279,7 +278,7 @@ class TestLearnConfirm:
             payload={"text": "不要"},
         )
 
-        result = await executor._handle_learn_confirm(route, event)
+        await executor._handle_learn_confirm(route, event)
         # 拒绝后走 chat_fallback
         assert "c1" not in executor._pending_learn_requests
 

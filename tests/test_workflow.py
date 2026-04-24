@@ -2,19 +2,15 @@
 
 from __future__ import annotations
 
-import asyncio
-import json
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from src.config import RaccoonConfig
 from src.eventbus.bus import EventBus
-from src.eventbus.events import EventType, make_event
 from src.types import WorkflowEntry, WorkflowStep
 from src.workflow.workflow_store import WorkflowStore
-from src.workflow.workflow_engine import WorkflowEngine, WorkflowExecution
+from src.workflow.workflow_engine import WorkflowEngine
 from src.workflow.workflow_templates import WorkflowTemplateMarket
 from src.brain.planner import Plan, Planner
 

@@ -1,11 +1,14 @@
 """快速集成测试：并发调用 LLM 测试 _llm_classify"""
-import asyncio, sys, os
+# ruff: noqa: E402
+import asyncio
+import sys
+import os
 from pathlib import Path
 
 PROJECT_ROOT = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.executor.agent import Executor, LlmClassification, LlmClassifyResult
+from src.executor.agent import Executor, LlmClassification
 from src.skill_vault.vault_manager import VaultManager
 from src.config import RaccoonConfig
 

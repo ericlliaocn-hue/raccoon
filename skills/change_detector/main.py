@@ -13,7 +13,6 @@
 
 import hashlib
 import json
-import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,7 +38,7 @@ def _fetch_url(url: str) -> str | None:
         req = urllib.request.Request(url, headers={"User-Agent": "Raccoon/1.0"})
         with urllib.request.urlopen(req, timeout=30) as resp:
             return resp.read().decode("utf-8", errors="replace")
-    except Exception as e:
+    except Exception:
         return None
 
 
@@ -163,8 +162,6 @@ def cmd_check(params: dict) -> dict:
     if new_hash == old_hash:
         return {"reply": f"未检测到变化: {old_data.get('name', target)}", "changed": False, "diff": ""}
 
-    # 有变化 - 读取旧内容做 diff
-    diff = ""
     # 保存旧快照内容用于 diff（简化：只报告哈希变化）
     return {
         "reply": f"检测到变化！{old_data.get('name', target)}\n旧哈希: {old_hash[:16]}...\n新哈希: {new_hash[:16]}...\n内容长度: {old_data['content_length']} → {len(content)}",

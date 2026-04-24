@@ -5,6 +5,56 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-04-24
+
+### 🔒 安全闭环 + ⏰ 调度闭环 + 🧭 路由归一 + 🧪 兼容性修复（非 Docker）
+
+> 目标：把 v0.3.x 已写好的能力真正接入默认运行路径，避免“写了但没接线”。范围排除 Docker。
+
+#### Module 1: 审批接线（默认仅高风险人工审批）
+
+- **Task 模型增强**：新增 `Task.context: dict`、`TaskStatus.PENDING_APPROVAL`、`EventType.APPROVAL_RESOLVED`
+- **Executor/FlowEngine 统一刹车**：普通 Skill 与交互式 Flow 步骤执行前统一走 `ApprovalEngine.review()`；pending 时挂起，批准后自动恢复执行，拒绝/超时转失败并发 `TASK_FAILED`
+- **默认策略调整**：`auto_approve` 默认改为 `false`；low/medium 自动通过，high 或 `requires_approval=true` 才进入人工审批
+
+#### Module 2: 调度结果闭环（run_id 回写 + 重试新 run_id）
+
+- **调度上下文贯穿**：`schedule_id/run_id/schedule_name/cron/is_retry` 写入 `Task.context`，并在 `TASK_COMPLETED/TASK_FAILED` payload 中带出
+- **HTTP 层回写**：监听 `TASK_COMPLETED/TASK_FAILED`，自动调用 `scheduler.record_run_result()` 更新 `schedule_runs`
+- **重试 run_id 修复**：每次重试先创建新的 `run_id`，保证每次尝试对应一条独立 run 记录
+
+#### Module 3: HTTP 安全 + 上传下载安全
+
+- **全局可选认证**：新增 `http_auth_token`（为空不启用）；受保护端点要求 `Authorization: Bearer <token>`，SSE `/events` 同时支持 `?token=`
+- **默认只监听本地**：`http_host` 默认改为 `127.0.0.1`
+- **路径穿越修复**：上传/下载统一使用安全文件名 + `resolve()/relative_to()` 目录边界校验，直接拒绝 `..`、路径分隔符等
+
+#### Module 4: 路由与 LLM 分流收敛
+
+- **Adapter 不再持有 LLM 分流规则**：`/chat/stream` 的 LLM fallback 分类、Skill 匹配和学习确认统一收敛到 `Executor.decide_llm_stream()`；adapter 只负责渲染 SSE
+- **低置信度保护**：`LlmClassifyResult` 支持 `confidence`；低于阈值（默认 `0.7`）不直接执行 Skill，改为提示用户确认/学习
+- **触发词补强**：补充常用 trigger/alias（文件整理、读取文件、浏览器截图等）减少 LLM 抢路由
+
+#### Module 5: 浏览器与意图分类
+
+- **BrowserSessionManager 接入默认路径**：内置 `web_automate` 不再默认走一次性 subprocess，`SkillRunner` 在父进程内调用 `run_browser_skill()`，通过 `BrowserSessionManager.acquire()/release()` 复用浏览器实例
+- **CDP 复用增强**：`web_automate` 在 CDP 模式启动时传入 `reuse_url`，优先复用同域已有 tab/登录态；无 URL 的截图/读取不再把当前页导航到 `about:blank`
+- **SessionManager 导入修复**：修复 `skills/web_automate/session_manager.py` 包导入路径，startup 启动清理循环，shutdown 清理不再因为导入失败报警
+- **意图分类可配置**：新增 `intent_classifier_type`（默认 `keyword`，设为 `model` 才启用 `ModelIntentClassifier`）
+
+#### Module 6: 兼容性、健康检查与版本一致性
+
+- **Python 3.11 编译通过**：修复 `learning_engine.py` 中不兼容语法
+- **FastAPI lifespan**：HTTP app 启停从 deprecated `on_event` 切换到 lifespan，避免 CI/运行日志带已知弃用警告
+- **/health 修复**：改用真实 SQLite 连接检查，避免访问不存在的内部属性导致 degraded
+- **依赖补齐**：补齐内置 Skill/通知通道常用依赖（`beautifulsoup4`、`feedparser`、`aiosmtplib`、`requests`）
+- **版本统一**：统一 `pyproject.toml`、`src/__init__.py`、FastAPI version、静态资源 cache 参数
+
+#### Breaking Changes
+
+- 默认 `http_host=127.0.0.1`：需要局域网/公网访问时必须显式配置 `0.0.0.0` 并建议同时设置 `http_auth_token`
+- 默认 `auto_approve=false`：高风险/显式审批 Skill 会进入 `PENDING_APPROVAL`，需审批后才能执行
+
 ## [0.3.5] - 2026-04-24
 
 ### 🌐 CDP 浏览器增强 + 🐳 部署标准化 + 📦 Skill 生态增强
@@ -46,7 +96,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### 🔧 工作流 + 记忆进化
 
-> 目标：工作流引擎从简单顺序执行升级为支持条件分支/循环/并行/LLM自动分解的完整引擎；MemCore 从静态存储进化为带衰减/归档/偏好学习的智能记忆系统；意图分类从关键词匹配升级为 LLM 模型分类 + 在线学习。
+> 目标：工作流引擎从简单顺序执行升级为支持条件分支/循环/并行/LLM自动分解的完整引擎；MemCore 从静态存储进化为带衰减/归档/偏好学习的智能记忆系统；意图分类新增可选 LLM 模型分类 + 在线学习能力。默认运行路径仍使用 keyword，需通过 `intent_classifier_type=model` 显式启用模型分类。
 
 #### Module 1: 工作流引擎增强
 
@@ -64,7 +114,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Module 3: 意图分类升级
 
-- **#9 ModelIntentClassifier**：LLM 轻量模型分类替代纯关键词匹配，三级分类流程：关键词优先（高置信度快速返回）→ 在线学习修正 → LLM 单次调用分类
+- **#9 ModelIntentClassifier**：新增可选 LLM 轻量模型分类，三级分类流程：关键词优先（高置信度快速返回）→ 在线学习修正 → LLM 单次调用分类；默认仍是 `KeywordIntentClassifier`
 - **#10 在线学习**：`OnlineLearningStore` 记录用户纠正，关键词重叠度 + 子串匹配评分，后续相似文本直接使用纠正后分类，最多保留 100 条纠正记录
 
 #### Module 4: 流式聊天修复

@@ -9,6 +9,7 @@ MVP 实现：
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -52,6 +53,9 @@ class SkillRunner:
         if "state" in params:
             input_data["state"] = params["state"]
 
+        if self._skill_dir.name == "web_automate" and self._entry == "main.py":
+            return await self._run_web_automate_in_process(input_data)
+
         entry_path = self._skill_dir / self._entry
         if not entry_path.exists():
             raise FileNotFoundError(f"Skill entry not found: {entry_path}")
@@ -91,3 +95,36 @@ class SkillRunner:
         except Exception as e:
             logger.error("skill_run_error", skill_dir=str(self._skill_dir), error=str(e))
             raise
+
+    async def _run_web_automate_in_process(self, input_data: dict[str, Any]) -> dict[str, Any]:
+        """内置 web_automate 走父进程会话池，避免 subprocess 退出后丢浏览器会话。"""
+        entry_path = self._skill_dir / self._entry
+        if not entry_path.exists():
+            raise FileNotFoundError(f"Skill entry not found: {entry_path}")
+
+        inserted = False
+        skill_dir_str = str(self._skill_dir)
+        if skill_dir_str not in sys.path:
+            sys.path.insert(0, skill_dir_str)
+            inserted = True
+
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "_raccoon_web_automate_main",
+                entry_path,
+            )
+            if spec is None or spec.loader is None:
+                raise ImportError(f"Cannot import web_automate entry: {entry_path}")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            run_browser_skill = getattr(module, "run_browser_skill")
+            return await run_browser_skill(input_data)
+        except Exception as e:
+            logger.error("web_automate_in_process_error", skill_dir=str(self._skill_dir), error=str(e))
+            raise
+        finally:
+            if inserted:
+                try:
+                    sys.path.remove(skill_dir_str)
+                except ValueError:
+                    pass
