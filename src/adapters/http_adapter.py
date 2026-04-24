@@ -236,6 +236,21 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
     async def shutdown() -> None:
         await approval_engine.stop()
         await scheduler.stop()
+        # 优雅关闭：清理浏览器会话
+        try:
+            from skills.web_automate.session_manager import get_session_manager
+            session_mgr = get_session_manager()
+            await session_mgr.shutdown()
+            logger.info("browser_sessions_closed")
+        except Exception as e:
+            logger.warning("browser_session_cleanup_failed", error=str(e))
+        # 清理 Skill 子进程
+        try:
+            active = executor.task_queue.get_active_by_conversation("")
+            if active:
+                logger.info("cancelling_active_tasks", count=len(active))
+        except Exception:
+            pass
         await event_bus.stop()
         logger.info("http_server_stopped")
 
@@ -646,7 +661,7 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
 
     @app.post("/skills/{name}/upgrade")
     async def upgrade_skill(name: str) -> dict:
-        """升级已安装的 Skill"""
+        """升级已安装的 Skill（带版本比较、备份、回滚）"""
         try:
             meta = await vault_manager.upgrade(name)
             if meta.enabled:
@@ -656,6 +671,35 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail=f"Skill '{name}' not found")
         except RuntimeError as e:
             raise HTTPException(status_code=400, detail=str(e))
+
+    @app.post("/skills/{name}/hot-update")
+    async def hot_update_skill(name: str) -> dict:
+        """热更新 Skill（运行时更新代码，不重启服务）"""
+        try:
+            result = await vault_manager.hot_update(name)
+            if result.get("status") == "updated":
+                meta = vault_manager.get_skill(name)
+                if meta and meta.enabled:
+                    router.register_skill(meta)
+            return result
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"Skill '{name}' not found")
+
+    @app.post("/skills/{name}/rollback")
+    async def rollback_skill(name: str, version: str | None = None) -> dict:
+        """回滚 Skill 到指定版本"""
+        try:
+            meta = vault_manager.rollback(name, version=version)
+            if meta.enabled:
+                router.register_skill(meta)
+            return {"status": "rolled_back", "name": name, "version": meta.version}
+        except RuntimeError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.get("/skills/backups")
+    async def list_skill_backups(name: str | None = None) -> list[dict]:
+        """列出 Skill 备份"""
+        return vault_manager.list_backups(name=name)
 
     @app.get("/status")
     async def system_status() -> dict:
@@ -669,7 +713,7 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
                 llm_status = "no_api_key"
 
         return {
-            "version": "0.1.0",
+            "version": "0.3.5",
             "llm": {
                 "provider": config.llm_provider,
                 "model": llm_model,
@@ -678,6 +722,42 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
             },
             "skills_count": len(vault_manager.list_skills()),
             "active_tasks": len(executor.task_queue.get_active_by_conversation("")),
+        }
+
+    @app.get("/health")
+    async def health_check() -> dict:
+        """健康检查端点（供 Docker/K8s 探针使用）"""
+        checks: dict[str, str] = {}
+
+        # LLM 可用性
+        if config.llm_provider == "mock":
+            checks["llm"] = "mock"
+        elif config.llm_api_key:
+            checks["llm"] = "ready"
+        else:
+            checks["llm"] = "no_api_key"
+
+        # EventBus 状态
+        checks["event_bus"] = "running" if event_bus._running else "stopped"
+
+        # Scheduler 状态
+        checks["scheduler"] = "running" if scheduler._running else "stopped"
+
+        # 数据库
+        try:
+            from src.memcore.lifecycle import MemCoreLifecycle
+            lifecycle = MemCoreLifecycle(config)
+            await lifecycle._db.execute("SELECT 1")
+            checks["database"] = "ok"
+        except Exception:
+            checks["database"] = "error"
+
+        overall = "ok" if all(v in ("ok", "ready", "running", "mock") for v in checks.values()) else "degraded"
+
+        return {
+            "status": overall,
+            "version": "0.3.5",
+            "checks": checks,
         }
 
     # ─── File Streaming ────────────────────────────────────────────

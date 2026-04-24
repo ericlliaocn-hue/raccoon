@@ -1,0 +1,47 @@
+# Raccoon AI Agent Framework - Docker Compose
+#
+# 使用方式：
+#   docker compose up -d        # 启动
+#   docker compose logs -f      # 查看日志
+#   docker compose down         # 停止
+#
+# 配置：
+#   1. 复制 config.example.json → config.json 并填入 LLM API Key
+#   2. 或通过环境变量设置（见下方 RACCOON_* 变量）
+
+services:
+  raccoon:
+    build: .
+    container_name: raccoon
+    restart: unless-stopped
+    ports:
+      - "${RACCOON_HTTP_PORT:-8900}:8900"
+    volumes:
+      # 配置文件（必须包含 LLM API Key）
+      - ./config.json:/app/config.json:ro
+      # 数据持久化
+      - raccoon_data:/app/data
+      # 输出文件（截图等）
+      - raccoon_output:/app/output
+      # 自定义 Skill
+      - ./skills:/app/skills
+    environment:
+      - RACCOON_HTTP_HOST=0.0.0.0
+      - RACCOON_HTTP_PORT=8900
+      # LLM 配置（也可在 config.json 中设置，环境变量优先级更高）
+      - RACCOON_LLM_PROVIDER=${RACCOON_LLM_PROVIDER:-spark}
+      - RACCOON_LLM_API_KEY=${RACCOON_LLM_API_KEY:-}
+      - RACCOON_LLM_MODEL=${RACCOON_LLM_MODEL:-astron-code-latest}
+      - RACCOON_LLM_BASE_URL=${RACCOON_LLM_BASE_URL:-https://maas-coding-api.cn-huabei-1.xf-yun.com/v2}
+      # Chrome 路径（Docker 内使用 Chromium）
+      - RACCOON_CHROME_PATH=/usr/bin/chromium
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8900/health')"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  raccoon_data:
+  raccoon_output:

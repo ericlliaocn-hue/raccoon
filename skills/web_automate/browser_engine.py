@@ -12,24 +12,137 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
+import logging
+import platform
 import subprocess
-import sys
-import time
 from pathlib import Path
 from typing import Any
 
 from actions import Actions, ActionResult
 
-# CDP 模式用的 Chrome 路径和 profile
-CHROME_PATH = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-CDP_PORT = 9222
+logger = logging.getLogger("raccoon.browser_engine")
+
+# CDP 模式用的 Chrome profile 目录
 CDP_PROFILE_DIR = Path.home() / ".raccoon" / "chrome_profile"
-CDP_INCOGNITO_PORT = 9223
 CDP_INCOGNITO_PROFILE_DIR = Path.home() / ".raccoon" / "chrome_incognito_profile"
 
 # 截图输出目录
 OUTPUT_DIR = Path(__file__).parent.parent.parent / "output"
+
+
+def _detect_chrome_path() -> str:
+    """自动检测 Chrome 可执行文件路径
+
+    按优先级检测：
+    1. RaccoonConfig.chrome_path（用户配置）
+    2. 系统默认路径（macOS / Linux / Windows）
+    3. PATH 中的 google-chrome / chromium-browser
+    """
+    # 1. 尝试从配置读取
+    try:
+        sys_path = Path(__file__).resolve().parent.parent.parent
+        config_path = sys_path / "config.json"
+        if config_path.exists():
+            with open(config_path) as f:
+                cfg = json.load(f)
+            if cfg.get("chrome_path"):
+                return cfg["chrome_path"]
+    except Exception:
+        pass
+
+    # 2. 系统默认路径
+    system = platform.system()
+    candidates = []
+    if system == "Darwin":
+        candidates = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        ]
+    elif system == "Linux":
+        candidates = [
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/chromium",
+            "/snap/bin/chromium",
+        ]
+    elif system == "Windows":
+        candidates = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files\Chromium\Application\chrome.exe",
+        ]
+
+    for path in candidates:
+        if Path(path).exists():
+            return path
+
+    # 3. 尝试 PATH 查找
+    import shutil
+    for name in ("google-chrome", "google-chrome-stable", "chromium-browser", "chromium", "chrome"):
+        found = shutil.which(name)
+        if found:
+            return found
+
+    # 回退到 macOS 默认路径（向后兼容）
+    return "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+
+
+def _detect_cdp_port() -> int:
+    """从配置读取 CDP 端口，默认 9222"""
+    try:
+        sys_path = Path(__file__).resolve().parent.parent.parent
+        config_path = sys_path / "config.json"
+        if config_path.exists():
+            with open(config_path) as f:
+                cfg = json.load(f)
+            if cfg.get("cdp_port"):
+                return int(cfg["cdp_port"])
+    except Exception:
+        pass
+    return 9222
+
+
+def _detect_cdp_incognito_port() -> int:
+    """从配置读取无痕模式 CDP 端口，默认 9223"""
+    try:
+        sys_path = Path(__file__).resolve().parent.parent.parent
+        config_path = sys_path / "config.json"
+        if config_path.exists():
+            with open(config_path) as f:
+                cfg = json.load(f)
+            if cfg.get("cdp_incognito_port"):
+                return int(cfg["cdp_incognito_port"])
+    except Exception:
+        pass
+    return 9223
+
+
+# 延迟检测缓存（模块加载时不执行，首次使用时计算）
+_detected_chrome_path: str | None = None
+_detected_cdp_port: int | None = None
+_detected_cdp_incognito_port: int | None = None
+
+
+def get_chrome_path() -> str:
+    global _detected_chrome_path
+    if _detected_chrome_path is None:
+        _detected_chrome_path = _detect_chrome_path()
+    return _detected_chrome_path
+
+
+def get_cdp_port() -> int:
+    global _detected_cdp_port
+    if _detected_cdp_port is None:
+        _detected_cdp_port = _detect_cdp_port()
+    return _detected_cdp_port
+
+
+def get_cdp_incognito_port() -> int:
+    global _detected_cdp_incognito_port
+    if _detected_cdp_incognito_port is None:
+        _detected_cdp_incognito_port = _detect_cdp_incognito_port()
+    return _detected_cdp_incognito_port
 
 
 class BrowserEngine:
@@ -84,7 +197,7 @@ class BrowserEngine:
             self._page = await self._context.new_page()
 
         elif self._mode == "cdp":
-            cdp_port = CDP_PORT
+            cdp_port = get_cdp_port()
             cdp_profile = CDP_PROFILE_DIR
             incognito = False
             try:
@@ -93,7 +206,7 @@ class BrowserEngine:
                 return str(e)
 
         elif self._mode == "cdp_incognito":
-            cdp_port = CDP_INCOGNITO_PORT
+            cdp_port = get_cdp_incognito_port()
             cdp_profile = CDP_INCOGNITO_PROFILE_DIR
             incognito = True
             try:
@@ -149,8 +262,10 @@ class BrowserEngine:
             pass
         return None
 
-    def _is_chrome_cdp_running(self, port: int = CDP_PORT) -> bool:
+    def _is_chrome_cdp_running(self, port: int | None = None) -> bool:
         """检查 Chrome CDP 是否已在运行"""
+        if port is None:
+            port = get_cdp_port()
         try:
             import urllib.request
             with urllib.request.urlopen(f"http://localhost:{port}/json/version", timeout=2) as resp:
@@ -158,12 +273,15 @@ class BrowserEngine:
         except Exception:
             return False
 
-    async def _start_chrome_cdp(self, port: int = CDP_PORT, profile_dir: Path = CDP_PROFILE_DIR, incognito: bool = False) -> None:
+    async def _start_chrome_cdp(self, port: int | None = None, profile_dir: Path = CDP_PROFILE_DIR, incognito: bool = False) -> None:
         """启动 Chrome 并开启 CDP 调试端口"""
+        if port is None:
+            port = get_cdp_port()
         profile_dir.mkdir(parents=True, exist_ok=True)
 
+        chrome_path = get_chrome_path()
         cmd = [
-            CHROME_PATH,
+            chrome_path,
             f"--remote-debugging-port={port}",
             f"--user-data-dir={profile_dir}",
             "--no-first-run",
@@ -212,7 +330,7 @@ class BrowserEngine:
             # Playwright connect_over_cdp 可能因 Browser.setDownloadBehavior 协议错误失败
             # 这是 Playwright 与较新 Chrome 版本（147+）的兼容性问题
             if "setDownloadBehavior" in error_msg or "Browser context management" in error_msg:
-                logger.warning("cdp_setDownloadBehavior_error_restarting_chrome", error=error_msg)
+                logger.warning("cdp_setDownloadBehavior_error_restarting_chrome: %s", error_msg)
                 # 如果 Chrome 是 Raccoon 启动的，关闭并用 --disable-features=DownloadBubble 重启
                 if self._chrome_process:
                     self._chrome_process.terminate()
@@ -341,6 +459,36 @@ class BrowserEngine:
             return await a.get_cookies(urls=act.get("urls"))
         elif action_type == "get_storage":
             return await a.get_storage(key=act.get("key"))
+        elif action_type == "select_option":
+            return await a.select_option(
+                selector=act.get("selector", ""),
+                value=act.get("value"),
+                label=act.get("label"),
+                index=act.get("index"),
+            )
+        elif action_type == "upload_file":
+            return await a.upload_file(
+                selector=act.get("selector", ""),
+                file_paths=act.get("file_paths", []),
+            )
+        elif action_type == "enter_iframe":
+            return await a.enter_iframe(selector=act.get("selector", ""))
+        elif action_type == "exit_iframe":
+            return await a.exit_iframe()
+        elif action_type == "hover":
+            return await a.hover(selector=act.get("selector", ""))
+        elif action_type == "drag_and_drop":
+            return await a.drag_and_drop(
+                source_selector=act.get("source_selector", ""),
+                target_selector=act.get("target_selector", ""),
+            )
+        elif action_type == "check":
+            return await a.check(
+                selector=act.get("selector", ""),
+                checked=act.get("checked", True),
+            )
+        elif action_type == "double_click":
+            return await a.double_click(selector=act.get("selector", ""))
         else:
             return ActionResult(success=False, message=f"❌ 未知动作：{action_type}")
 

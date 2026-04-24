@@ -58,6 +58,11 @@ class RaccoonConfig(BaseSettings):
     http_host: str = "0.0.0.0"
     http_port: int = 8900
 
+    # ─── Browser (CDP) ───
+    chrome_path: str = ""  # Chrome 可执行文件路径，为空则自动检测
+    cdp_port: int = 9222  # CDP 调试端口
+    cdp_incognito_port: int = 9223  # 无痕模式 CDP 端口
+
     # ─── LLM（讯飞 codeplan） ───
     llm_provider: str = "spark"  # mock / spark / openai
     llm_api_key: str = ""  # 通过 config.json 或环境变量 RACCOON_LLM_API_KEY 设置

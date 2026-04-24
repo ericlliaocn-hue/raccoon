@@ -272,3 +272,130 @@ class Actions:
                 )
         except Exception as e:
             return ActionResult(success=False, message=f"❌ 获取 localStorage 失败：{e}")
+
+    # ── 复杂页面交互 ──────────────────────────────────
+
+    async def select_option(self, selector: str, value: str | None = None, label: str | None = None, index: int | None = None) -> ActionResult:
+        """下拉框选择
+
+        通过 value / label / index 三种方式选择下拉框选项。
+        至少提供一种，优先级：value > label > index。
+        """
+        try:
+            sel = await self._try_selectors(selector)
+            if value is not None:
+                await self._page.select_option(sel, value=value)
+                return ActionResult(success=True, message=f"✅ 已选择 [{sel}]：value={value}")
+            elif label is not None:
+                await self._page.select_option(sel, label=label)
+                return ActionResult(success=True, message=f"✅ 已选择 [{sel}]：label={label}")
+            elif index is not None:
+                await self._page.select_option(sel, index=index)
+                return ActionResult(success=True, message=f"✅ 已选择 [{sel}]：index={index}")
+            else:
+                return ActionResult(success=False, message="❌ 请提供 value / label / index 之一")
+        except Exception as e:
+            return ActionResult(success=False, message=f"❌ 下拉框选择失败 [{selector}]：{e}")
+
+    async def upload_file(self, selector: str, file_paths: str | list[str]) -> ActionResult:
+        """文件上传
+
+        selector: 文件输入框（<input type="file">）的选择器
+        file_paths: 单个文件路径或文件路径列表
+        """
+        try:
+            sel = await self._try_selectors(selector)
+            if isinstance(file_paths, str):
+                # 支持逗号分隔的多文件
+                paths = [p.strip() for p in file_paths.split(",") if p.strip()]
+            else:
+                paths = file_paths
+
+            # 验证文件存在
+            valid_paths = []
+            for p in paths:
+                if Path(p).exists():
+                    valid_paths.append(p)
+                else:
+                    return ActionResult(success=False, message=f"❌ 文件不存在：{p}")
+
+            await self._page.set_input_files(sel, valid_paths)
+            return ActionResult(
+                success=True,
+                message=f"✅ 已上传 {len(valid_paths)} 个文件：{', '.join(valid_paths)}",
+                data={"files": valid_paths, "count": len(valid_paths)},
+            )
+        except Exception as e:
+            return ActionResult(success=False, message=f"❌ 文件上传失败 [{selector}]：{e}")
+
+    async def enter_iframe(self, selector: str) -> ActionResult:
+        """进入 iframe
+
+        selector: iframe 元素的选择器
+        进入后后续操作都在 iframe 内执行，直到调用 exit_iframe。
+        """
+        try:
+            sel = await self._try_selectors(selector)
+            frame_element = await self._page.query_selector(sel)
+            if not frame_element:
+                return ActionResult(success=False, message=f"❌ 未找到 iframe 元素 [{selector}]")
+            frame = await frame_element.content_frame()
+            if not frame:
+                return ActionResult(success=False, message=f"❌ iframe 内容不可访问 [{selector}]（可能跨域）")
+            # 保存原始 page，后续操作切换到 iframe
+            self._original_page = self._page
+            self._page = frame
+            return ActionResult(
+                success=True,
+                message=f"✅ 已进入 iframe [{selector}]",
+                data={"iframe_url": frame.url},
+            )
+        except Exception as e:
+            return ActionResult(success=False, message=f"❌ 进入 iframe 失败 [{selector}]：{e}")
+
+    async def exit_iframe(self) -> ActionResult:
+        """退出 iframe，回到主页面"""
+        if not hasattr(self, "_original_page") or self._original_page is None:
+            return ActionResult(success=False, message="❌ 当前不在 iframe 中")
+        self._page = self._original_page
+        self._original_page = None
+        return ActionResult(success=True, message="✅ 已退出 iframe，回到主页面")
+
+    async def hover(self, selector: str) -> ActionResult:
+        """鼠标悬停（触发下拉菜单、tooltip 等）"""
+        try:
+            sel = await self._try_selectors(selector)
+            await self._page.hover(sel)
+            return ActionResult(success=True, message=f"✅ 已悬停 [{sel}]")
+        except Exception as e:
+            return ActionResult(success=False, message=f"❌ 悬停失败 [{selector}]：{e}")
+
+    async def drag_and_drop(self, source_selector: str, target_selector: str) -> ActionResult:
+        """拖拽元素"""
+        try:
+            source_sel = await self._try_selectors(source_selector)
+            target_sel = await self._try_selectors(target_selector)
+            await self._page.drag_and_drop(source_sel, target_sel)
+            return ActionResult(success=True, message=f"✅ 已拖拽 [{source_sel}] → [{target_sel}]")
+        except Exception as e:
+            return ActionResult(success=False, message=f"❌ 拖拽失败 [{source_selector}] → [{target_selector}]：{e}")
+
+    async def check(self, selector: str, checked: bool = True) -> ActionResult:
+        """勾选/取消勾选 checkbox/radio"""
+        try:
+            sel = await self._try_selectors(selector)
+            await self._page.set_checked(sel, checked)
+            action = "勾选" if checked else "取消勾选"
+            return ActionResult(success=True, message=f"✅ 已{action} [{sel}]")
+        except Exception as e:
+            action = "勾选" if checked else "取消勾选"
+            return ActionResult(success=False, message=f"❌ {action}失败 [{selector}]：{e}")
+
+    async def double_click(self, selector: str) -> ActionResult:
+        """双击元素"""
+        try:
+            sel = await self._try_selectors(selector)
+            await self._page.dblclick(sel)
+            return ActionResult(success=True, message=f"✅ 已双击 [{sel}]")
+        except Exception as e:
+            return ActionResult(success=False, message=f"❌ 双击失败 [{selector}]：{e}")

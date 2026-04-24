@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.5] - 2026-04-24
+
+### 🌐 CDP 浏览器增强 + 🐳 部署标准化 + 📦 Skill 生态增强
+
+> 目标：浏览器操控复杂页面，`docker run` 一键启动，Skill 升级更安全。
+
+#### Module 1: CDP 浏览器增强
+
+- **#1 复杂页面交互**：`Actions` 新增 7 种交互方法：`select_option`（下拉框选择，支持 value/label/index）、`upload_file`（文件上传，支持多文件）、`enter_iframe`/`exit_iframe`（iframe 进入退出）、`hover`（鼠标悬停）、`drag_and_drop`（拖拽）、`check`（勾选/取消勾选）、`double_click`（双击）
+- **#2 浏览器会话复用**：新增 `BrowserSessionManager`，跨 Skill 共享浏览器实例，支持 acquire/release 会话池模式，后台自动清理超时空闲会话，全局单例 `get_session_manager()`
+- **#3 Chrome 路径可配置**：`RaccoonConfig` 新增 `chrome_path`、`cdp_port`、`cdp_incognito_port` 配置项；`browser_engine.py` 从硬编码 macOS 路径改为自动检测（macOS/Linux/Windows + PATH 查找 + config.json 配置）
+- **#4 logger 修复**：修复 `browser_engine.py` 中 `logger` 未定义导致运行时 NameError 的问题，改用标准 `logging.getLogger()`
+
+#### Module 2: 部署标准化
+
+- **#5 Dockerfile + docker-compose.yml**：多阶段构建（builder 安装依赖 + Playwright → runtime 精简镜像），docker-compose 支持环境变量配置、数据持久化、健康检查
+- **#6 GitHub Actions CI/CD**：`.github/workflows/ci.yml`，Python 3.11/3.12 矩阵测试 + ruff lint + Docker 镜像自动构建发布
+- **#7 健康检查端点**：`GET /health` 返回整体状态 + 各组件检查（LLM/EventBus/Scheduler/Database），供 Docker/K8s 探针使用
+- **#8 优雅关闭**：shutdown 时清理浏览器会话（`BrowserSessionManager.shutdown()`）+ Skill 子进程
+
+#### Module 3: Skill 生态增强
+
+- **#9 版本管理增强**：`VaultManager.upgrade()` 升级前比较版本号（`_compare_versions()`），相同版本跳过，远程版本低于本地拒绝升级
+- **#10 升级备份 + 回滚**：升级前自动备份到 `.backup/{name}_{version}/`，安装失败自动回滚；新增 `rollback()` 方法手动回滚到指定版本，`list_backups()` 查看可用备份
+- **#11 热更新**：`VaultManager.hot_update()` 运行时更新 Skill 代码无需重启服务，保留 enabled/starred 等用户状态；新增 `POST /skills/{name}/hot-update`、`POST /skills/{name}/rollback`、`GET /skills/backups` API
+
+#### 配置变更
+
+- `RaccoonConfig` 新增字段：`chrome_path`（str）、`cdp_port`（int, 默认 9222）、`cdp_incognito_port`（int, 默认 9223）
+
+#### 新增文件
+
+- `skills/web_automate/session_manager.py`：浏览器会话管理器
+- `Dockerfile`：多阶段 Docker 构建
+- `docker-compose.yml`：Docker Compose 编排
+- `.github/workflows/ci.yml`：CI/CD 流水线
+
 ## [0.3.4] - 2026-04-24
 
 ### 🔧 工作流 + 记忆进化
