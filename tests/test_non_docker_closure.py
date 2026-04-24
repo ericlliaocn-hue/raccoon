@@ -110,10 +110,25 @@ def test_learning_runs_filter_and_core_benchmark_endpoint(tmp_path):
         quality_score=0.9,
     )
     app.state.learning_store.add(run)
+    for i in range(6):
+        app.state.learning_store.add(
+            LearningRun(
+                conversation_id=f"c_fail_{i % 3}",
+                user_id="u1",
+                request_text="采集素材并去重",
+                scenario_id="material_collection",
+                status=LearningRunStatus.FAILED,
+                first_pass=False,
+                final_success=False,
+                failure_code="data_hollow",
+                quality_score=0.2,
+            )
+        )
 
     with TestClient(app) as client:
         unauth = client.get("/benchmarks/core-scenarios/latest")
         assert unauth.status_code == 401
+        assert client.get("/learning/candidates").status_code == 401
 
         res = client.get("/learning/runs?scenario_id=daily_brief&first_pass=true", headers=headers)
         assert res.status_code == 200
@@ -126,6 +141,16 @@ def test_learning_runs_filter_and_core_benchmark_endpoint(tmp_path):
         payload = bench.json()
         assert "overall" in payload
         assert "scenarios" in payload
+
+        candidates = client.get(
+            "/learning/candidates?days=7&min_failures=5&min_conversations=2",
+            headers=headers,
+        )
+        assert candidates.status_code == 200
+        candidate_payload = candidates.json()
+        assert len(candidate_payload) >= 1
+        assert candidate_payload[0]["failure_code"] == "data_hollow"
+        assert candidate_payload[0]["triggered"] is True
 
 
 @pytest.mark.asyncio
@@ -219,3 +244,32 @@ def test_web_automate_without_url_preserves_current_page():
     from skills.web_automate.main import _parse_actions
 
     assert _parse_actions("浏览器截图", None) == [{"action": "screenshot"}]
+
+
+def test_web_automate_auto_resume_from_failed_step():
+    from types import SimpleNamespace
+
+    from skills.web_automate.main import _resolve_resume_plan
+
+    session = SimpleNamespace(
+        last_run={
+            "owner": "conv-1",
+            "action_list": [
+                {"action": "open", "url": "https://example.com"},
+                {"action": "click", "selector": "#login"},
+                {"action": "type", "selector": "#kw", "text": "raccoon"},
+            ],
+            "failed_step": 1,
+        }
+    )
+    actions, resume_from, resumed = _resolve_resume_plan(
+        origin="继续",
+        params={},
+        action_list=[{"action": "screenshot"}],
+        session=session,
+        owner="conv-1",
+    )
+
+    assert resumed is True
+    assert resume_from == 1
+    assert actions == session.last_run["action_list"][1:]

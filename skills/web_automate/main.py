@@ -171,10 +171,61 @@ def _parse_actions(text: str, url: str | None) -> list[dict]:
     return actions
 
 
+_RESUME_SIGNALS = ("继续", "重试", "再试", "接着", "恢复", "从断点")
+
+
+def _is_resume_intent(text: str) -> bool:
+    lower = str(text or "").lower()
+    return any(signal in lower for signal in _RESUME_SIGNALS)
+
+
+def _resolve_resume_plan(
+    *,
+    origin: str,
+    params: dict[str, Any],
+    action_list: list[dict[str, Any]],
+    session: Any,
+    owner: str,
+) -> tuple[list[dict[str, Any]], int, bool]:
+    explicit = params.get("resume_from_step")
+    if isinstance(explicit, int):
+        start = max(0, explicit)
+        if start >= len(action_list):
+            return action_list, 0, False
+        return action_list[start:], start, start > 0
+
+    if params.get("auto_resume", True) is False:
+        return action_list, 0, False
+
+    last_run = getattr(session, "last_run", {}) or {}
+    if not isinstance(last_run, dict):
+        return action_list, 0, False
+    if str(last_run.get("owner") or "") != str(owner):
+        return action_list, 0, False
+
+    failed_step = last_run.get("failed_step")
+    prev_actions = last_run.get("action_list")
+    if not isinstance(failed_step, int) or failed_step < 0:
+        return action_list, 0, False
+
+    should_resume = _is_resume_intent(origin)
+    # 用户只说“继续/重试”这类短消息时，优先续跑上一次链路
+    if not should_resume and not (not params.get("actions") and len(action_list) <= 1):
+        return action_list, 0, False
+
+    base_actions = prev_actions if isinstance(prev_actions, list) and prev_actions else action_list
+    if failed_step >= len(base_actions):
+        return action_list, 0, False
+    return base_actions[failed_step:], failed_step, True
+
+
 def _build_result(
     mode: str,
     details: list[dict[str, Any]],
     runtime_artifacts: dict[str, Any] | None = None,
+    *,
+    resumed: bool = False,
+    resume_from: int = 0,
 ) -> dict[str, Any]:
     """把动作结果整理成 Skill 协议输出。"""
     files = []
@@ -186,6 +237,8 @@ def _build_result(
     success_count = sum(1 for d in details if d.get("success"))
     total = len(details)
     summary_lines = [f"🌐 浏览器自动化完成（{success_count}/{total} 成功，模式：{mode}）"]
+    if resumed:
+        summary_lines.append(f"🔁 已从步骤 #{resume_from} 自动恢复执行")
     for detail in details:
         marker = "✅" if detail.get("success") else "❌"
         summary_lines.append(f"  {marker} {detail.get('message', '')}")
@@ -195,6 +248,8 @@ def _build_result(
         "files": files,
         "details": details,
         "artifacts": runtime_artifacts or {},
+        "resumed": resumed,
+        "resume_from_step": resume_from if resumed else 0,
     }
 
 
@@ -202,15 +257,14 @@ async def run_browser_skill(data: dict[str, Any]) -> dict[str, Any]:
     """默认运行路径：通过 BrowserSessionManager 获取/释放浏览器会话。"""
     task_id = data.get("task_id", "")
     origin = data.get("origin_message", "")
+    conversation_id = data.get("conversation_id", "")
     params = data.get("params", {}) or {}
 
     mode = _detect_mode(origin)
     raw = str(params.get("prompt") or origin).strip()
     url = _extract_url(raw)
     action_list = params.get("actions") if isinstance(params.get("actions"), list) else _parse_actions(raw, url)
-    resume_from = params.get("resume_from_step")
-    if isinstance(resume_from, int) and resume_from > 0:
-        action_list = action_list[resume_from:]
+    owner = str(conversation_id or task_id or "web_automate")
 
     try:
         from .session_manager import get_session_manager
@@ -220,9 +274,38 @@ async def run_browser_skill(data: dict[str, Any]) -> dict[str, Any]:
     session = None
     manager = get_session_manager()
     try:
-        session = await manager.acquire(mode, owner=task_id or "web_automate", reuse_url=url or "")
-        details = await session.engine.execute(action_list)
-        result = _build_result(mode, details, session.engine.get_runtime_artifacts())
+        session = await manager.acquire(mode, owner=owner, reuse_url=url or "")
+        run_actions, resume_from, resumed = _resolve_resume_plan(
+            origin=origin,
+            params=params,
+            action_list=action_list,
+            session=session,
+            owner=owner,
+        )
+        details = await session.engine.execute(run_actions, start_index=resume_from)
+        runtime = session.engine.get_runtime_artifacts()
+        result = _build_result(
+            mode,
+            details,
+            runtime,
+            resumed=resumed,
+            resume_from=resume_from,
+        )
+        failed_step: int | None = None
+        for detail in details:
+            if not detail.get("success"):
+                checkpoint = detail.get("step_checkpoint") or {}
+                step_index = checkpoint.get("step_index")
+                if isinstance(step_index, int):
+                    failed_step = step_index
+                break
+        session.last_run = {
+            "owner": owner,
+            "action_list": action_list,
+            "failed_step": failed_step,
+            "details": details,
+            "runtime": runtime,
+        }
     finally:
         if session is not None:
             await manager.release(session.id)

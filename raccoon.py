@@ -502,6 +502,12 @@ def _cmd_doctor() -> None:
                 print("  ✅ 失败码分布正常")
         else:
             print("  ✅ 最近无集中失败码")
+
+        candidates = store.list_new_skill_candidates(days=7, min_failures=5, min_conversations=2, limit=20)
+        if candidates:
+            print(f"  ⚠️  新增 Skill 候选池待处理: {len(candidates)}")
+        else:
+            print("  ✅ 新增 Skill 候选池为空")
     except Exception as e:
         print(f"  ⚠️  LearningRun 质量检查失败: {e}")
 

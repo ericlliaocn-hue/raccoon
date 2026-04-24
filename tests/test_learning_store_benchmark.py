@@ -84,3 +84,8 @@ def test_failure_cluster_counts(tmp_path: Path):
     assert clusters[0]["failure_code"] == "data_hollow"
     assert clusters[0]["failures"] >= 6
     assert clusters[0]["conversations"] >= 2
+
+    candidates = store.list_new_skill_candidates(days=7, min_failures=5, min_conversations=2, limit=5)
+    assert candidates
+    assert candidates[0]["failure_code"] == "data_hollow"
+    assert candidates[0]["triggered"] is True

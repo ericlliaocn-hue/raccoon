@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.2] - 2026-04-25
+
+### 🔧 场景补强收口 + 浏览器断点续跑
+
+> 目标：候选池接口落地、浏览器长链路断点续跑、doctor 检查补齐。
+
+- **候选池接口**：新增 `GET /learning/candidates`，按失败聚类输出新增 Skill 候选（含 sample request、建议 skill 名）
+- **浏览器断点续跑**：`_resolve_resume_plan()` 解析"继续"指令，从上次失败步骤恢复执行；`execute()` 支持 `start_index` 参数跳过已完成步骤
+- **doctor 候选池检查**：`raccoon doctor` 新增 Skill 候选池待处理检查
+- **候选池接口鉴权**：`/learning/candidates` 纳入受保护端点
+- **测试补齐**：新增断点续跑单元测试、候选池接口集成测试
+
 ## [0.5.1] - 2026-04-24
 
 ### 🎯 场景驱动补强（0.5.x）
@@ -15,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **质量门升级**：学习验证阶段增加场景质量评分（字段完整性、来源可解释性、数据新鲜度）；低于阈值会被 `quality_gate_failed` 拦下，不进入安装
 - **失败码驱动修复**：学习失败从“纯字符串重试”升级为 `failure_code` 分类（parse/auth/dependency/data_hollow/timeout 等）+ 定向修复提示
 - **失败聚类触发新增 Skill 候选**：同类失败 7 天内达到阈值（`>=5` 且跨 `>=2` 会话）会在 run artifacts 标记“可新增通用 Skill”候选
+- **候选池接口**：新增 `GET /learning/candidates`，按失败聚类输出新增 Skill 候选（含 sample request、建议 skill 名）
 - **核心场景看板接口**：新增 `GET /benchmarks/core-scenarios/latest`，按 6 场景返回首轮命中率、最终成功率、平均修复次数、质量分和发布门禁
 - **CLI 基准入口**：新增 `raccoon benchmark core`（支持 `--json`），可作为发布前门禁命令
 - **学习前复用更稳**：候选召回接入意图短语归一化；中低置信候选增加二次确认，不再直接误学

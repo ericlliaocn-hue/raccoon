@@ -615,12 +615,18 @@ class BrowserEngine:
 
     # ── 执行动作序列 ─────────────────────────────────
 
-    async def execute(self, action_list: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    async def execute(
+        self,
+        action_list: list[dict[str, Any]],
+        *,
+        start_index: int = 0,
+    ) -> list[dict[str, Any]]:
         """执行动作序列，返回每个动作的结果"""
         results = []
         self._checkpoints = []
         self._artifacts = []
-        for index, act in enumerate(action_list):
+        for offset, act in enumerate(action_list):
+            index = start_index + offset
             action_type = act.get("action", "")
             self._record_checkpoint(index, action_type, "before")
             result = await self._execute_action_reliable(index, act, action_type)

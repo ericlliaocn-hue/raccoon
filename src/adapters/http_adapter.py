@@ -807,6 +807,21 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="学习运行不存在")
         return run.model_dump(mode="json")
 
+    @app.get("/learning/candidates")
+    async def list_learning_candidates(
+        days: int = 7,
+        min_failures: int = 5,
+        min_conversations: int = 2,
+        limit: int = 50,
+    ) -> list[dict]:
+        """列出由失败聚类触发的新增 Skill 候选池。"""
+        return learning_store.list_new_skill_candidates(
+            days=max(1, days),
+            min_failures=max(1, min_failures),
+            min_conversations=max(1, min_conversations),
+            limit=min(max(1, limit), 200),
+        )
+
     @app.get("/benchmarks/core-scenarios/latest")
     async def get_core_scenarios_benchmark() -> dict:
         """核心场景基准聚合（只读）。"""

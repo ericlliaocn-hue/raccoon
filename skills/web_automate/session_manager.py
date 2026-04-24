@@ -41,6 +41,7 @@ class BrowserSession:
     last_used_at: float = field(default_factory=time.time)
     in_use: bool = True
     owner: str = ""  # 占用者标识（如 skill_name）
+    last_run: dict[str, Any] = field(default_factory=dict)  # 最近一次执行信息（断点恢复）
 
     def touch(self) -> None:
         """更新最后使用时间"""
