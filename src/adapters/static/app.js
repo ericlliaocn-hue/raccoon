@@ -166,6 +166,18 @@ function handleSSE(ev) {
   } else if (ev.event === 'skill_install_failed') {
     addMsg('system', `❌ 技能安装失败: ${ev.payload?.name || ''} - ${ev.payload?.error || ''}`);
     loadMarketSkills();
+  } else if (ev.event === 'learning_started') {
+    addMsg('system', `🧠 开始学习新需求 #${(ev.payload?.learning_run_id || '').slice(0, 8)}`);
+  } else if (ev.event === 'learning_validated') {
+    addMsg('system', `🧪 学习技能已通过验证: ${ev.payload?.skill_name || ''}`);
+  } else if (ev.event === 'learning_approval_required') {
+    addMsg('system', `⏳ 学习技能等待审批: ${ev.payload?.skill_name || ''}`);
+  } else if (ev.event === 'learning_installed') {
+    const reply = ev.payload?.reply ? `\n${ev.payload.reply}` : '';
+    addMsg('system', `✅ 学习技能安装完成: ${ev.payload?.name || ev.payload?.skill_name || ''}${reply}`);
+    loadSkills();
+  } else if (ev.event === 'learning_failed') {
+    addMsg('system', `❌ 学习失败: ${ev.payload?.error || ''}`);
   }
 
   loadTasks();

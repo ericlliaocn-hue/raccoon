@@ -948,7 +948,11 @@ confidence 是 0.0-1.0 的小数；只有非常确定时才高于 0.7。"""
             return await self._chat_fallback(text)
 
         if classify.classification == LlmClassification.SKILL_MATCHED:
-            threshold = getattr(self._config, "llm_skill_match_threshold", 0.7)
+            raw_threshold = getattr(self._config, "llm_skill_match_threshold", 0.7)
+            try:
+                threshold = float(raw_threshold)
+            except (TypeError, ValueError):
+                threshold = 0.7
             if classify.confidence < threshold:
                 logger.info(
                     "llm_fallback_low_confidence",
@@ -1020,6 +1024,10 @@ confidence 是 0.0-1.0 的小数；只有非常确定时才高于 0.7。"""
             # 模糊回复，当作拒绝，走闲聊
             return await self._chat_fallback(event.payload.get("text", ""))
 
+        existing_skill_reply = await self._try_existing_skill_before_learning(original_request, event)
+        if existing_skill_reply is not None:
+            return existing_skill_reply
+
         # ── 用户确认：走 LearningEngine ──
         if not self._learning_engine:
             return "⚠️ 学习引擎未初始化，无法创建新技能。请联系管理员配置。"
@@ -1046,6 +1054,41 @@ confidence 是 0.0-1.0 的小数；只有非常确定时才高于 0.7。"""
         except Exception as e:
             logger.error("learn_confirm_failed", error=str(e))
             return f"❌ 学习过程出错：{e}"
+
+    async def _try_existing_skill_before_learning(self, text: str, event: Event) -> str | None:
+        """学习前再做一次本地 Skill 候选复用，避免重复造轮子。"""
+        skills = self._vault_manager.list_skills()
+        if not skills:
+            return None
+
+        candidates = self._find_skill_candidates(text, skills)
+        if not candidates:
+            return None
+
+        candidate = candidates[0]
+        raw_threshold = getattr(self._config, "llm_skill_match_threshold", 0.7)
+        try:
+            threshold = max(float(raw_threshold), 0.78)
+        except (TypeError, ValueError):
+            threshold = 0.78
+        if candidate.confidence < threshold:
+            return None
+
+        logger.info(
+            "reuse_existing_skill_before_learning",
+            skill=candidate.skill_name,
+            confidence=candidate.confidence,
+        )
+        reply = await self._handle_skill(
+            RouteResult(
+                route_type=RouteType.SKILL,
+                skill_name=candidate.skill_name,
+                params={"rest": text},
+                confidence=candidate.confidence,
+            ),
+            event,
+        )
+        return f"我先复用已有技能「{candidate.skill_name}」处理，不再重复学习。\n\n{reply}"
 
     async def _chat_fallback(self, text: str) -> str:
         """纯闲聊兜底"""

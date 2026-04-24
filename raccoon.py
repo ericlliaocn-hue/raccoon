@@ -22,7 +22,6 @@ import asyncio
 import json
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 # 确保项目根目录在 sys.path
@@ -41,7 +40,7 @@ def main() -> None:
 
     # ─── start ────────────────────────────────────────────────
     p_start = sub.add_parser("start", help="后台启动 Raccoon")
-    p_start.add_argument("--host", default="0.0.0.0", help="监听地址")
+    p_start.add_argument("--host", default="127.0.0.1", help="监听地址")
     p_start.add_argument("--port", type=int, default=8900, help="监听端口")
     p_start.add_argument("--cli", action="store_true", help="以 CLI 模式启动（默认 HTTP）")
 
@@ -50,7 +49,7 @@ def main() -> None:
 
     # ─── restart ──────────────────────────────────────────────
     p_restart = sub.add_parser("restart", help="重启后台 Raccoon")
-    p_restart.add_argument("--host", default="0.0.0.0", help="监听地址")
+    p_restart.add_argument("--host", default="127.0.0.1", help="监听地址")
     p_restart.add_argument("--port", type=int, default=8900, help="监听端口")
     p_restart.add_argument("--cli", action="store_true", help="以 CLI 模式重启")
 
@@ -93,7 +92,7 @@ def main() -> None:
 
     # ─── 前台模式参数 ─────────────────────────────────────────
     parser.add_argument("--http", action="store_true", help="前台启动 HTTP 模式")
-    parser.add_argument("--host", default="0.0.0.0", help="监听地址")
+    parser.add_argument("--host", default="127.0.0.1", help="监听地址")
     parser.add_argument("--port", type=int, default=8900, help="监听端口")
 
     args = parser.parse_args()
@@ -147,7 +146,7 @@ def _cmd_status() -> None:
     from src.daemon import status
     st = status()
     if st["running"]:
-        print(f"🦝 Raccoon 运行中")
+        print("🦝 Raccoon 运行中")
         print(f"   PID:   {st['pid']}")
         print(f"   模式:  {st['mode']}")
         print(f"   时长:  {st['uptime']}")
@@ -168,7 +167,7 @@ def _cmd_update(args) -> None:
             print(f"✅ 已是最新版本 ({current})")
         else:
             print(f"🔄 有新版本可用: {current} → {latest}")
-            print(f"   运行 `raccoon update` 更新")
+            print("   运行 `raccoon update` 更新")
         return
 
     # 执行更新
@@ -366,6 +365,9 @@ def _cmd_doctor() -> None:
         ("click", "click"),
         ("rich", "rich"),
         ("aiosqlite", "aiosqlite"),
+        ("bs4", "beautifulsoup4"),
+        ("feedparser", "feedparser"),
+        ("aiosmtplib", "aiosmtplib"),
     ]
     for mod, pkg in deps:
         try:
@@ -379,36 +381,92 @@ def _cmd_doctor() -> None:
     # 3. 配置文件
     config_path = PROJECT_ROOT / "config.json"
     if config_path.exists():
-        print(f"  ✅ config.json 存在")
+        print("  ✅ config.json 存在")
         try:
             from src.config import load_config
             config = load_config()
             if config.llm_api_key:
-                print(f"  ✅ LLM API Key 已配置")
+                print("  ✅ LLM API Key 已配置")
             else:
-                print(f"  ⚠️  LLM API Key 未配置")
+                print("  ⚠️  LLM API Key 未配置")
                 issues.append("LLM API Key 未配置")
+            if config.http_host == "127.0.0.1":
+                print("  ✅ HTTP 默认仅监听本地")
+            else:
+                print(f"  ⚠️  HTTP 监听地址为 {config.http_host}，请确认已配置认证")
+                issues.append("HTTP 未使用本地监听地址")
         except Exception as e:
             print(f"  ❌ 配置加载失败: {e}")
             issues.append("配置加载失败")
     else:
-        print(f"  ⚠️  config.json 不存在（将使用默认配置）")
+        print("  ⚠️  config.json 不存在（将使用默认配置）")
 
     # 4. Skills 目录
     skills_dir = PROJECT_ROOT / "skills"
     if skills_dir.exists():
         skill_count = len([d for d in skills_dir.iterdir() if d.is_dir()])
         print(f"  ✅ Skills 目录 ({skill_count} 个)")
+        try:
+            import json
+            from src.types import SkillMetadata
+
+            invalid = 0
+            for skill_dir in [d for d in skills_dir.iterdir() if d.is_dir()]:
+                meta_path = skill_dir / "metadata.json"
+                if not meta_path.exists():
+                    invalid += 1
+                    continue
+                try:
+                    SkillMetadata.model_validate(json.loads(meta_path.read_text(encoding="utf-8")))
+                except Exception:
+                    invalid += 1
+            if invalid == 0:
+                print("  ✅ Skill metadata 校验通过")
+            else:
+                print(f"  ⚠️  {invalid} 个 Skill metadata 无效")
+                issues.append("存在无效 Skill metadata")
+        except Exception as e:
+            print(f"  ⚠️  Skill metadata 校验失败: {e}")
     else:
-        print(f"  ❌ Skills 目录不存在")
+        print("  ❌ Skills 目录不存在")
         issues.append("Skills 目录不存在")
 
     # 5. 数据目录
     data_dir = PROJECT_ROOT / "data"
     if data_dir.exists():
-        print(f"  ✅ 数据目录存在")
+        print("  ✅ 数据目录存在")
     else:
-        print(f"  ⚠️  数据目录不存在（首次运行会自动创建）")
+        print("  ⚠️  数据目录不存在（首次运行会自动创建）")
+
+    # 5b. Learning staging
+    try:
+        from src.config import load_config
+        config = load_config()
+        staging_dir = config.learning_staging_dir
+        if staging_dir.exists():
+            leftovers = [p for p in staging_dir.iterdir() if p.is_dir()]
+            if leftovers:
+                print(f"  ⚠️  learning staging 残留 {len(leftovers)} 个目录")
+            else:
+                print("  ✅ learning staging 目录干净")
+        else:
+            print("  ✅ learning staging 尚未创建")
+    except Exception as e:
+        print(f"  ⚠️  learning staging 检查失败: {e}")
+
+    # 5c. MemCore 可读写
+    try:
+        from src.memcore.writer import MemCoreWriter
+        from src.config import load_config
+
+        config = load_config()
+        writer = MemCoreWriter(config)
+        asyncio.run(writer.init())
+        asyncio.run(writer.close())
+        print("  ✅ MemCore 可初始化")
+    except Exception as e:
+        print(f"  ❌ MemCore 初始化失败: {e}")
+        issues.append("MemCore 初始化失败")
 
     # 6. 端口检查
     import socket
@@ -427,7 +485,7 @@ def _cmd_doctor() -> None:
     if st["running"]:
         print(f"  ✅ Raccoon 运行中 (PID: {st['pid']})")
     else:
-        print(f"  ℹ️  Raccoon 未运行")
+        print("  ℹ️  Raccoon 未运行")
 
     # 总结
     print()

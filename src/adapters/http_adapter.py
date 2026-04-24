@@ -32,6 +32,7 @@ from src import __version__
 from src.adapters.auth import is_protected_http_endpoint, request_has_auth_token
 from src.config import load_config, RaccoonConfig, LLM_PRESETS
 from src.conversation_store import ConversationStore
+from src.memcore.writer import MemCoreWriter
 from src.eventbus.bus import EventBus
 from src.eventbus.events import EventType, make_event
 from src.executor.agent import Executor
@@ -138,6 +139,9 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
         intent_classifier = KeywordIntentClassifier()
     router = Router(intent_classifier=intent_classifier)
     audit_logger = AuditLogger(config)
+    memcore_writer = MemCoreWriter(config)
+    from src.brain.learning_store import LearningRunStore
+    learning_store = LearningRunStore(config)
 
     # 只注册已启用的 Skill
     for skill in vault_manager.list_enabled_skills():
@@ -168,9 +172,13 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
     learning_engine = LearningEngine(
         config=config,
         vault_manager=vault_manager,
+        memcore_writer=memcore_writer,
         llm_client=llm_client,
         scheduler=scheduler,
         router=router,
+        event_bus=event_bus,
+        approval_engine=approval_engine,
+        learning_store=learning_store,
     )
     executor.set_learning_engine(learning_engine)
     executor.set_scheduler(scheduler)
@@ -208,6 +216,7 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        await memcore_writer.init()
         await event_bus.start()
         await scheduler.start()
         await approval_engine.start()
@@ -236,6 +245,7 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
                     logger.info("cancelling_active_tasks", count=len(active))
             except Exception:
                 pass
+            await memcore_writer.close()
             await event_bus.stop()
             logger.info("http_server_stopped")
 
@@ -257,6 +267,8 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
     app.state.workflow_engine = workflow_engine
     app.state.gateway = gateway
     app.state.conversation_store = conversation_store
+    app.state.memcore_writer = memcore_writer
+    app.state.learning_store = learning_store
 
     @app.middleware("http")
     async def auth_middleware(request: Request, call_next):
@@ -769,6 +781,20 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
             "version": __version__,
             "checks": checks,
         }
+
+    @app.get("/learning/runs")
+    async def list_learning_runs(limit: int = 50) -> list[dict]:
+        """列出最近学习运行记录。"""
+        runs = learning_store.list_recent(limit=min(max(limit, 1), 200))
+        return [run.model_dump(mode="json") for run in runs]
+
+    @app.get("/learning/runs/{run_id}")
+    async def get_learning_run(run_id: str) -> dict:
+        """获取单个学习运行记录。"""
+        run = learning_store.get(run_id)
+        if not run:
+            raise HTTPException(status_code=404, detail="学习运行不存在")
+        return run.model_dump(mode="json")
 
     # ─── File Streaming ────────────────────────────────────────────
 

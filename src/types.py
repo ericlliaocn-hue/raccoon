@@ -56,6 +56,11 @@ class EventType(str, Enum):
     SKILL_INSTALLING = "skill_installing"   # Skill 安装中
     SKILL_INSTALLED = "skill_installed"     # Skill 安装完成
     SKILL_INSTALL_FAILED = "skill_install_failed"  # Skill 安装失败
+    LEARNING_STARTED = "learning_started"
+    LEARNING_VALIDATED = "learning_validated"
+    LEARNING_APPROVAL_REQUIRED = "learning_approval_required"
+    LEARNING_INSTALLED = "learning_installed"
+    LEARNING_FAILED = "learning_failed"
 
 
 # ─── Event ─────────────────────────────────────────────────────
@@ -245,6 +250,45 @@ class MemoryEntry(BaseModel):
     # ─── v0.3.4 访问追踪 ───
     access_count: int = 0
     last_accessed_at: datetime | None = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class LearningRunStatus(str, Enum):
+    ANALYZING = "analyzing"
+    GENERATING = "generating"
+    VALIDATING = "validating"
+    PENDING_APPROVAL = "pending_approval"
+    INSTALLING = "installing"
+    EXECUTING = "executing"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+class LearningRun(BaseModel):
+    """学习链路运行记录。"""
+
+    run_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    conversation_id: str
+    user_id: str = "anonymous"
+    request_text: str
+    source_task_id: str | None = None
+    status: LearningRunStatus = LearningRunStatus.ANALYZING
+    skill_name: str | None = None
+    candidate_skill_name: str | None = None
+    candidate_confidence: float = 0.0
+    staging_dir: str = ""
+    analysis: dict[str, Any] = Field(default_factory=dict)
+    validation: dict[str, Any] = Field(default_factory=dict)
+    dependencies: list[str] = Field(default_factory=list)
+    repair_count: int = 0
+    approval_id: str | None = None
+    approval_status: str | None = None
+    execution_result: dict[str, Any] | None = None
+    reply: str | None = None
+    error: str | None = None
+    schedule_created: str | None = None
+    attempt_log: list[dict[str, Any]] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 

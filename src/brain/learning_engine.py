@@ -27,8 +27,11 @@
 from __future__ import annotations
 
 import asyncio
+import ast
 import json
+import py_compile
 import re
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -37,12 +40,18 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from src.config import RaccoonConfig
+from src.eventbus.events import EventType, make_event
+from src.memcore.reader import MemCoreReader
 from src.skill_vault.vault_manager import VaultManager
-from src.types import ScheduleEntry, Task
+from src.skill_vault.sandbox_runner import SkillRunner
+from src.types import LearningRun, LearningRunStatus, MemoryEntry, ScheduleEntry, SkillMetadata, Task
 
 if TYPE_CHECKING:
+    from src.brain.learning_store import LearningRunStore
+    from src.eventbus.bus import EventBus
     from src.scheduler.scheduler import Scheduler
     from src.router.router import Router
+    from src.supervisor.approval_engine import ApprovalEngine
 
 logger = structlog.get_logger(__name__)
 
@@ -91,6 +100,9 @@ class LearningEngine:
         llm_client=None,
         scheduler: Scheduler | None = None,
         router: Router | None = None,
+        event_bus: EventBus | None = None,
+        approval_engine: ApprovalEngine | None = None,
+        learning_store: LearningRunStore | None = None,
     ) -> None:
         self._config = config or RaccoonConfig()
         self._vault = vault_manager
@@ -98,8 +110,22 @@ class LearningEngine:
         self._llm = llm_client
         self._scheduler = scheduler
         self._router = router
-        self._auto_install = getattr(config, "learning_auto_install", True)
-        self._requires_approval = getattr(config, "learning_requires_approval", True)
+        self._event_bus = event_bus
+        self._approval_engine = approval_engine
+        self._learning_store = learning_store
+        self._auto_install = getattr(
+            self._config,
+            "learning_auto_install_dependencies",
+            getattr(self._config, "learning_auto_install", False),
+        )
+        self._requires_approval = getattr(
+            self._config,
+            "learning_require_approval",
+            getattr(self._config, "learning_requires_approval", True),
+        )
+        self._pending_approval_runs: dict[str, str] = {}
+        if self._event_bus:
+            self._event_bus.on(EventType.APPROVAL_RESOLVED, self._on_approval_resolved)
 
     # ─── 主入口 ──────────────────────────────────────────────────
 
@@ -114,227 +140,668 @@ class LearningEngine:
             {"reply": "...", "files": [], "learned": True/False}
         """
         logger.info("learning_engine_start", message=user_message)
-
-        # 1. 检索经验
-        experience = await self._search_experience(user_message)
-        if experience:
-            logger.info("learning_reuse_experience", key=experience.get("key"))
-            return {
-                "reply": f"📋 复用已有经验：{experience.get('key', '')}\n\n{experience.get('value', '')}",
-                "files": [],
-                "learned": False,
-            }
-
-        # 2. LLM 推理：需要什么工具/Skill
-        analysis = await self._analyze_need(user_message)
-        if not analysis:
-            return {
-                "reply": "🤔 无法分析需求，请更具体地描述你想做什么",
-                "files": [],
-                "learned": False,
-            }
-
-        logger.info("learning_analysis", analysis=analysis)
-
-        # 3. 数据获取策略决策：探测候选数据源，选最优方案（API > HTML > CDP）
-        analysis = await self._decide_data_strategy(analysis)
-        logger.info(
-            "data_strategy_decided",
-            strategy=analysis.get("data_strategy"),
-            approach=analysis.get("approach", "")[:80],
+        run = self._create_run(task, user_message)
+        await self._emit_learning_event(
+            EventType.LEARNING_STARTED,
+            run,
+            {"request_text": user_message},
         )
 
-        # 4. 安装缺失依赖
-        deps = analysis.get("dependencies", [])
-        if deps and self._auto_install:
-            install_result = await self._install_dependencies(deps)
-            if not install_result["success"]:
-                return {
-                    "reply": f"❌ 依赖安装失败：{install_result['error']}\n\n需要手动安装：`pip install {' '.join(deps)}`",
-                    "files": [],
-                    "learned": False,
-                }
+        try:
+            experience = await self._search_experience(user_message)
+            if experience:
+                reused = await self._try_reuse_experience(task, user_message, run, experience)
+                if reused:
+                    return reused
 
-        # 5. API 探针：探测真实数据结构（基于策略决策选中的数据源）
-        probe_data = await self._probe_api(analysis)
-        if probe_data:
-            logger.info("api_probe_data_obtained", url=probe_data.get("api_url"))
+            analysis = await self._analyze_need(user_message)
+            if not analysis:
+                return await self._fail_run(
+                    run,
+                    "🤔 无法分析需求，请更具体地描述你想做什么",
+                    "analysis_failed",
+                )
 
-        # 6. 生成 Skill 代码（注入探针数据）
-        skill_code = await self._generate_skill(user_message, analysis, probe_data=probe_data)
-        if not skill_code:
-            return {
-                "reply": "❌ 无法自动生成 Skill 代码，请手动实现",
-                "files": [],
-                "learned": False,
-            }
+            analysis = await self._decide_data_strategy(analysis)
+            skill_name = analysis.get("skill_name", f"learned_{task.task_id[:8]}")
+            run.skill_name = skill_name
+            run.analysis = analysis
+            run.dependencies = list(analysis.get("dependencies", []))
+            self._save_run(run, status=LearningRunStatus.GENERATING)
 
-        # 7. 注册到 Vault
-        skill_name = analysis.get("skill_name", f"learned_{task.task_id[:8]}")
-        register_result = await self._register_skill(skill_name, skill_code, analysis)
-        if not register_result:
-            return {
-                "reply": "❌ Skill 注册失败",
-                "files": [],
-                "learned": False,
-            }
+            probe_data = await self._probe_api(analysis)
+            skill_code = await self._generate_skill(user_message, analysis, probe_data=probe_data)
+            if not skill_code:
+                return await self._fail_run(
+                    run,
+                    "❌ 无法自动生成 Skill 代码，请手动实现",
+                    "code_generation_failed",
+                )
 
-        # 8. 执行验证 + 自动修复循环（含方案重选）
-        #    流程：执行 → 语义验证 → 代码修复(最多3次) → 方案重选(最多2次) → 详尽反馈
-        attempt_log: list[dict] = []  # 记录所有尝试，用于最终反馈
-        current_analysis = analysis
-        current_skill_name = skill_name
-
-        max_replans = 2
-        for replan_round in range(max_replans + 1):
-            # 6a. 执行 + 代码修复循环
-            exec_result = await self._execute_learned_skill(
-                task, current_skill_name, user_message
-            )
-
+            current_analysis = analysis
+            current_code = skill_code
+            validation: dict[str, Any] | None = None
             error_history: list[str] = []
-            max_code_retries = 3
-            for code_attempt in range(1, max_code_retries + 1):
-                if exec_result.get("success"):
+            max_repairs = max(0, int(getattr(self._config, "learning_max_repair_attempts", 2)))
+            replan_used = False
+
+            while True:
+                stage_dir = self._prepare_stage_dir(run.run_id, skill_name)
+                run.staging_dir = str(stage_dir)
+                metadata = self._build_generated_metadata(skill_name, current_analysis)
+                self._write_staged_skill(stage_dir, current_code, metadata)
+                self._save_run(run, status=LearningRunStatus.VALIDATING)
+
+                validation = await self._validate_staged_skill(
+                    task,
+                    user_message,
+                    stage_dir,
+                    metadata,
+                    dependencies=run.dependencies,
+                )
+                run.validation = validation
+                self._save_run(run)
+
+                if validation.get("success"):
                     break
 
-                error_msg = exec_result.get("error", "未知错误")
+                error_msg = str(validation.get("error") or "validation_failed")
                 error_history.append(error_msg)
-                attempt_log.append({
-                    "phase": "code_fix",
-                    "replan_round": replan_round,
-                    "attempt": code_attempt,
+                run.attempt_log.append({
+                    "phase": "validation",
+                    "attempt": run.repair_count + 1,
                     "approach": current_analysis.get("approach", ""),
                     "error": error_msg,
                 })
-                logger.warning(
-                    "skill_exec_failed_retry",
-                    skill=current_skill_name,
-                    replan_round=replan_round,
-                    attempt=code_attempt,
-                    error=error_msg,
-                )
 
-                # 尝试自动修复代码
-                fixed_code = await self._repair_skill(
-                    current_skill_name, error_msg, user_message, current_analysis,
-                    actual_reply=exec_result.get("reply", ""),
-                    debug_info=exec_result.get("debug_info"),
-                )
-                if not fixed_code:
-                    logger.warning("skill_repair_failed", skill=current_skill_name, attempt=code_attempt)
-                    break
+                if run.repair_count < max_repairs:
+                    fixed_code = await self._repair_skill(
+                        skill_name,
+                        error_msg,
+                        user_message,
+                        current_analysis,
+                        actual_reply=validation.get("reply", ""),
+                        debug_info=validation.get("debug_info"),
+                        current_code=current_code,
+                    )
+                    if fixed_code:
+                        current_code = fixed_code
+                        run.repair_count += 1
+                        self._save_run(run)
+                        continue
 
-                # 更新 Skill 代码
-                update_ok = await self._update_skill_code(current_skill_name, fixed_code)
-                if not update_ok:
-                    break
+                if not replan_used:
+                    new_analysis = await self._replan_approach(
+                        user_message,
+                        current_analysis,
+                        error_history,
+                        last_reply=validation.get("reply", ""),
+                        debug_info=validation.get("debug_info"),
+                    )
+                    if new_analysis:
+                        replan_used = True
+                        current_analysis = await self._decide_data_strategy(new_analysis)
+                        skill_name = current_analysis.get("skill_name", skill_name)
+                        run.skill_name = skill_name
+                        run.analysis = current_analysis
+                        run.dependencies = list(current_analysis.get("dependencies", []))
+                        run.attempt_log.append({
+                            "phase": "replan",
+                            "old_approach": analysis.get("approach", ""),
+                            "new_approach": current_analysis.get("approach", ""),
+                            "reason": current_analysis.get("replan_reason", ""),
+                        })
+                        new_probe = await self._probe_api(current_analysis)
+                        regenerated = await self._generate_skill(
+                            user_message,
+                            current_analysis,
+                            probe_data=new_probe,
+                        )
+                        if regenerated:
+                            current_code = regenerated
+                            continue
 
-                # 重新执行
-                exec_result = await self._execute_learned_skill(
-                    task, current_skill_name, user_message
-                )
-
-            # 6b. 如果代码修复后成功了，跳出方案重选循环
-            if exec_result.get("success"):
                 break
 
-            # 6c. 代码修复失败 → 尝试方案重选
-            if replan_round < max_replans:
-                logger.info(
-                    "approach_replan_start",
-                    replan_round=replan_round + 1,
-                    failed_approach=current_analysis.get("approach", ""),
+            if not validation or not validation.get("success"):
+                reply = self._build_failure_report(
+                    user_message,
+                    run.attempt_log,
+                    validation or {"error": "validation_failed"},
                 )
-                new_analysis = await self._replan_approach(
-                    user_message, current_analysis, error_history,
-                    last_reply=exec_result.get("reply", ""),
-                    debug_info=exec_result.get("debug_info"),
+                return await self._fail_run(
+                    run,
+                    reply,
+                    str((validation or {}).get("error") or "validation_failed"),
                 )
-                if not new_analysis:
-                    logger.warning("approach_replan_no_alternative")
-                    break
 
-                attempt_log.append({
-                    "phase": "replan",
-                    "replan_round": replan_round + 1,
-                    "old_approach": current_analysis.get("approach", ""),
-                    "new_approach": new_analysis.get("approach", ""),
-                    "reason": new_analysis.get("replan_reason", ""),
-                })
-
-                # 安装新方案可能需要的依赖
-                new_deps = new_analysis.get("dependencies", [])
-                if new_deps and self._auto_install:
-                    install_result = await self._install_dependencies(new_deps)
-                    if not install_result["success"]:
-                        attempt_log.append({
-                            "phase": "dep_install_failed",
-                            "deps": new_deps,
-                            "error": install_result["error"],
-                        })
-                        continue
-
-                # 生成新方案的 Skill 代码（重新探测 API）
-                new_probe = await self._probe_api(new_analysis)
-                new_code = await self._generate_skill(user_message, new_analysis, probe_data=new_probe)
-                if not new_code:
-                    attempt_log.append({
-                        "phase": "code_gen_failed",
-                        "approach": new_analysis.get("approach", ""),
-                    })
-                    continue
-
-                # 注册新 Skill（如果 skill_name 不同则创建新 Skill，否则更新）
-                new_skill_name = new_analysis.get("skill_name", current_skill_name)
-                if new_skill_name != current_skill_name:
-                    # 新方案用新 Skill 名 → 注册新 Skill
-                    register_ok = await self._register_skill(new_skill_name, new_code, new_analysis)
-                    if not register_ok:
-                        attempt_log.append({
-                            "phase": "register_failed",
-                            "skill": new_skill_name,
-                        })
-                        continue
-                else:
-                    # 同名 Skill → 更新代码
-                    update_ok = await self._update_skill_code(new_skill_name, new_code)
-                    if not update_ok:
-                        continue
-
-                current_analysis = new_analysis
-                current_skill_name = new_skill_name
-            # else: 已达最大方案重选次数，退出循环
-
-        # 9. 结果处理
-        if exec_result.get("success"):
-            # 经验写入 MemCore（包含数据获取策略，方便下次复用）
-            experience_data = {
-                **current_analysis,
-                "data_strategy": current_analysis.get("data_strategy", "unknown"),
-                "chosen_source": current_analysis.get("chosen_source"),
-            }
-            await self._write_experience(
-                key=user_message[:100],
-                value=json.dumps(experience_data, ensure_ascii=False),
-                skill_name=current_skill_name,
+            await self._emit_learning_event(
+                EventType.LEARNING_VALIDATED,
+                run,
+                {
+                    "skill_name": skill_name,
+                    "validation": validation,
+                    "dependencies": run.dependencies,
+                },
             )
-            reply = exec_result.get("reply", "✅ 学习并执行成功")
-            reply += f"\n\n🎓 已学会新技能：{current_skill_name}"
 
-            # 如果经历过方案重选，告知用户
-            replan_entries = [a for a in attempt_log if a["phase"] == "replan"]
-            if replan_entries:
-                reply += f"\n💡 （经过 {len(replan_entries)} 次方案调整后成功）"
+            approval_reply = await self._request_install_approval(run, task)
+            if approval_reply:
+                return {
+                    "reply": approval_reply,
+                    "files": [],
+                    "learned": False,
+                    "skill_name": skill_name,
+                    "learning_run_id": run.run_id,
+                }
+
+            return await self._install_and_execute_learning_run(run, task, user_message)
+
+        except Exception as e:
+            logger.exception("learning_engine_run_failed", run_id=run.run_id)
+            return await self._fail_run(
+                run,
+                f"❌ 学习过程出错：{e}",
+                str(e),
+            )
+
+    def _create_run(self, task: Task, user_message: str) -> LearningRun:
+        run = LearningRun(
+            conversation_id=task.conversation_id,
+            user_id=task.user_id,
+            request_text=user_message,
+            source_task_id=task.task_id,
+        )
+        store = getattr(self, "_learning_store", None)
+        if store:
+            store.add(run)
+        return run
+
+    def _save_run(
+        self,
+        run: LearningRun,
+        *,
+        status: LearningRunStatus | None = None,
+        reply: str | None = None,
+        error: str | None = None,
+    ) -> LearningRun:
+        if status is not None:
+            run.status = status
+        if reply is not None:
+            run.reply = reply
+        if error is not None:
+            run.error = error
+        store = getattr(self, "_learning_store", None)
+        if store:
+            store.update(run)
+        return run
+
+    async def _emit_learning_event(
+        self,
+        event_type: EventType,
+        run: LearningRun,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        event_bus = getattr(self, "_event_bus", None)
+        if not event_bus:
+            return
+        data = {
+            "learning_run_id": run.run_id,
+            "status": run.status.value,
+            "skill_name": run.skill_name,
+        }
+        if payload:
+            data.update(payload)
+        await event_bus.emit(
+            make_event(
+                event_type,
+                conversation_id=run.conversation_id,
+                user_id=run.user_id,
+                task_id=run.source_task_id,
+                skill_name=run.skill_name,
+                payload=data,
+            )
+        )
+
+    async def _fail_run(self, run: LearningRun, reply: str, error: str) -> dict[str, Any]:
+        self._save_run(
+            run,
+            status=LearningRunStatus.FAILED,
+            reply=reply,
+            error=error,
+        )
+        await self._emit_learning_event(
+            EventType.LEARNING_FAILED,
+            run,
+            {"error": error, "reply": reply},
+        )
+        return {
+            "reply": reply,
+            "files": [],
+            "learned": False,
+            "skill_name": run.skill_name,
+            "learning_run_id": run.run_id,
+        }
+
+    def _prepare_stage_dir(self, run_id: str, skill_name: str) -> Path:
+        safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", skill_name or "learned_skill").strip("_") or "learned_skill"
+        stage_dir = self._config.learning_staging_dir / run_id / safe_name
+        if stage_dir.exists():
+            shutil.rmtree(stage_dir)
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        return stage_dir
+
+    def _build_generated_metadata(self, skill_name: str, analysis: dict) -> dict[str, Any]:
+        permissions = self._infer_permissions(analysis)
+        risk_level = "medium" if permissions else "low"
+        if "subprocess" in permissions:
+            risk_level = "high"
+        return {
+            "name": skill_name,
+            "version": "0.1.0",
+            "description": analysis.get("description", f"Auto-learned: {skill_name}"),
+            "trigger_words": analysis.get("trigger_words", [skill_name]),
+            "aliases": analysis.get("aliases", []),
+            "intent_tags": list(dict.fromkeys(["learned", *analysis.get("intent_tags", [])])),
+            "risk_level": risk_level,
+            "requires_approval": False,
+            "timeout_seconds": 60,
+            "entry": "main.py",
+            "permissions": permissions,
+        }
+
+    def _infer_permissions(self, analysis: dict) -> list[str]:
+        permissions: list[str] = []
+        text = " ".join(
+            str(v) for v in (
+                analysis.get("approach", ""),
+                analysis.get("description", ""),
+                analysis.get("skill_name", ""),
+            )
+        ).lower()
+        data_strategy = str(analysis.get("data_strategy", "")).lower()
+
+        if data_strategy in {"api", "html", "cdp"}:
+            permissions.append("network")
+        if any(word in text for word in ("file", "文件", "保存", "下载", "写入")):
+            permissions.append("filesystem")
+        if any(word in text for word in ("shell", "命令", "终端", "subprocess")):
+            permissions.append("subprocess")
+        return list(dict.fromkeys(permissions))
+
+    def _write_staged_skill(self, stage_dir: Path, code: str, metadata: dict[str, Any]) -> None:
+        (stage_dir / "main.py").write_text(code, encoding="utf-8")
+        (stage_dir / "metadata.json").write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    async def _validate_staged_skill(
+        self,
+        task: Task,
+        user_message: str,
+        stage_dir: Path,
+        metadata: dict[str, Any],
+        *,
+        dependencies: list[str] | None = None,
+        strict_smoke: bool = False,
+    ) -> dict[str, Any]:
+        validation: dict[str, Any] = {
+            "success": False,
+            "metadata_ok": False,
+            "compile_ok": False,
+            "smoke_ok": False,
+            "smoke_deferred": False,
+            "risk_warnings": [],
+            "warnings": [],
+        }
+
+        try:
+            parsed = SkillMetadata.model_validate(metadata)
+            validation["metadata_ok"] = True
+        except Exception as e:
+            validation["error"] = f"metadata_invalid: {e}"
+            return validation
+
+        main_path = stage_dir / parsed.entry
+        if not main_path.exists():
+            validation["error"] = f"entry_not_found: {parsed.entry}"
+            return validation
+
+        try:
+            py_compile.compile(str(main_path), doraise=True)
+            validation["compile_ok"] = True
+        except Exception as e:
+            validation["error"] = f"compile_failed: {e}"
+            return validation
+
+        code = main_path.read_text(encoding="utf-8")
+        validation["risk_warnings"] = self._scan_skill_risks(code, parsed)
+
+        smoke_task = Task(
+            conversation_id=task.conversation_id,
+            user_id=task.user_id,
+            origin_message=f"validation::{user_message}",
+            skill_name=parsed.name,
+        )
+        try:
+            runner = SkillRunner(stage_dir, parsed.entry, self._config)
+            smoke_result = await asyncio.wait_for(
+                runner.run(smoke_task, {"prompt": user_message, "validation_mode": True}),
+                timeout=min(parsed.timeout_seconds, self._config.task_timeout_seconds, 15),
+            )
+            if isinstance(smoke_result, dict) and "reply" in smoke_result:
+                validation["smoke_ok"] = True
+                validation["result_preview"] = str(smoke_result.get("reply", ""))[:200]
+                validation["reply"] = smoke_result.get("reply", "")
+                validation["debug_info"] = smoke_result.get("_debug")
+            else:
+                validation["error"] = "protocol_smoke_failed: output missing reply"
+                return validation
+        except Exception as e:
+            validation["reply"] = ""
+            validation["debug_info"] = {}
+            missing_match = re.search(r"No module named '([^']+)'", str(e))
+            declared_deps = {
+                str(dep).strip().lower()
+                for dep in (dependencies or [])
+                if str(dep).strip()
+            }
+            missing_module = missing_match.group(1).lower() if missing_match else ""
+            missing_pip = _IMPORT_TO_PIP.get(missing_module, missing_module)
+            if missing_match and missing_pip in declared_deps and not strict_smoke:
+                validation["smoke_deferred"] = True
+                validation["warnings"].append("protocol_smoke_deferred_until_dependency_install")
+                validation["missing_module"] = missing_module
+            else:
+                validation["error"] = f"protocol_smoke_failed: {e}"
+                return validation
+
+        validation["success"] = (
+            validation["metadata_ok"]
+            and validation["compile_ok"]
+            and (validation["smoke_ok"] or validation["smoke_deferred"])
+        )
+        if not validation["success"] and "error" not in validation:
+            validation["error"] = "validation_failed"
+        return validation
+
+    def _scan_skill_risks(self, code: str, metadata: SkillMetadata) -> list[str]:
+        warnings: list[str] = []
+        lowered = code.lower()
+
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            return warnings
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func = getattr(node.func, "attr", "") or getattr(node.func, "id", "")
+                if func in {"system", "popen", "run", "call"}:
+                    warnings.append("uses_subprocess_calls")
+                if func == "open":
+                    mode = ""
+                    if len(node.args) > 1 and isinstance(node.args[1], ast.Constant):
+                        mode = str(node.args[1].value)
+                    for kw in node.keywords:
+                        if kw.arg == "mode" and isinstance(kw.value, ast.Constant):
+                            mode = str(kw.value.value)
+                    if any(flag in mode for flag in ("w", "a", "+")):
+                        warnings.append("writes_files")
+
+        if any(pkg in lowered for pkg in ("httpx", "requests", "aiohttp", "feedparser")):
+            warnings.append("uses_network_requests")
+        if any(pkg in lowered for pkg in ("playwright", "selenium")):
+            warnings.append("controls_browser")
+        if "# requires:" in lowered:
+            warnings.append("declares_extra_dependencies")
+        for perm in metadata.permissions:
+            warnings.append(f"permission:{perm}")
+
+        return list(dict.fromkeys(warnings))
+
+    async def _request_install_approval(self, run: LearningRun, task: Task) -> str | None:
+        if not getattr(self, "_approval_engine", None) or not getattr(self, "_requires_approval", True):
+            return None
+
+        approval_task = Task(
+            conversation_id=task.conversation_id,
+            user_id=task.user_id,
+            origin_message=task.origin_message,
+            skill_name=run.skill_name or "learning_install",
+            context={"learning_run_id": run.run_id},
+        )
+        meta = SkillMetadata(
+            name=run.skill_name or "learning_install",
+            description="LearningEngine staged install approval",
+            trigger_words=[],
+            intent_tags=["learning"],
+            risk_level="high",
+            requires_approval=True,
+            timeout_seconds=60,
+            entry="main.py",
+            permissions=["filesystem", "subprocess"] if run.dependencies else ["filesystem"],
+        )
+        result = await self._approval_engine.review(approval_task, metadata=meta, risk_level="high")
+        run.approval_id = result.approval_id
+        run.approval_status = result.status.value
+
+        if result.approved:
+            self._save_run(run)
+            return None
+
+        if result.approval_id:
+            self._pending_approval_runs[result.approval_id] = run.run_id
+        self._save_run(run, status=LearningRunStatus.PENDING_APPROVAL)
+        await self._emit_learning_event(
+            EventType.LEARNING_APPROVAL_REQUIRED,
+            run,
+            {
+                "approval_id": result.approval_id,
+                "dependencies": run.dependencies,
+                "validation": run.validation,
+            },
+        )
+        return (
+            f"学习运行 [{run.run_id[:8]}] 已通过验证，等待审批后安装。"
+            f"{' 需要安装依赖: ' + ', '.join(run.dependencies) if run.dependencies else ''}"
+        )
+
+    async def _install_and_execute_learning_run(
+        self,
+        run: LearningRun,
+        task: Task,
+        user_message: str,
+        *,
+        resumed: bool = False,
+    ) -> dict[str, Any]:
+        if not run.staging_dir:
+            return await self._fail_run(run, "❌ 找不到 staging Skill，无法继续安装", "staging_missing")
+
+        stage_dir = Path(run.staging_dir)
+        meta_path = stage_dir / "metadata.json"
+        if not meta_path.exists():
+            return await self._fail_run(run, "❌ staging Skill 元数据缺失", "metadata_missing")
+
+        metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+        skill_name = str(metadata.get("name") or run.skill_name or "")
+        run.skill_name = skill_name
+
+        if self._vault and self._vault.get_skill(skill_name):
+            return await self._fail_run(
+                run,
+                f"❌ Skill「{skill_name}」已存在，当前学习流程不会直接覆盖同名 Skill。",
+                "skill_already_exists",
+            )
+
+        self._save_run(run, status=LearningRunStatus.INSTALLING)
+
+        if run.dependencies:
+            install_result = await self._install_dependencies(run.dependencies, force=True)
+            if not install_result["success"]:
+                return await self._fail_run(
+                    run,
+                    f"❌ 依赖安装失败：{install_result['error']}",
+                    str(install_result["error"]),
+                )
+
+        validation = await self._validate_staged_skill(
+            task,
+            user_message,
+            stage_dir,
+            metadata,
+            dependencies=run.dependencies,
+            strict_smoke=True,
+        )
+        run.validation = validation
+        if not validation.get("success"):
+            return await self._fail_run(
+                run,
+                self._build_failure_report(user_message, run.attempt_log, validation),
+                str(validation.get("error") or "post_approval_validation_failed"),
+            )
+
+        if not self._vault:
+            return await self._fail_run(run, "❌ VaultManager 未初始化", "vault_unavailable")
+
+        try:
+            installed_meta = self._vault._install_from_local(str(stage_dir))
+            if self._router and installed_meta:
+                self._router.register_skill(installed_meta)
+        except Exception as e:
+            return await self._fail_run(run, f"❌ Skill 安装失败：{e}", str(e))
+
+        self._save_run(run, status=LearningRunStatus.EXECUTING)
+        exec_result = await self._execute_learned_skill(task, skill_name, user_message)
+        if not exec_result.get("success"):
+            return await self._fail_run(
+                run,
+                self._build_failure_report(user_message, run.attempt_log, exec_result),
+                str(exec_result.get("error") or "execute_failed"),
+            )
+
+        await self._write_experience(
+            key=user_message[:100],
+            value=json.dumps(
+                {
+                    **run.analysis,
+                    "skill_name": skill_name,
+                    "dependencies": run.dependencies,
+                    "repair_count": run.repair_count,
+                    "validation": run.validation,
+                },
+                ensure_ascii=False,
+            ),
+            skill_name=skill_name,
+        )
+
+        if self._scheduler:
+            schedule_info = await self._try_create_schedule(
+                user_message,
+                skill_name,
+                task.conversation_id,
+            )
+            if schedule_info:
+                run.schedule_created = schedule_info
+
+        reply = exec_result.get("reply", "✅ 学习并执行成功")
+        if resumed:
+            reply = f"✅ 审批通过，已安装并执行技能「{skill_name}」。\n\n{reply}"
         else:
-            # 详尽失败反馈
-            reply = self._build_failure_report(user_message, attempt_log, exec_result)
+            reply = f"{reply}\n\n🎓 已学会新技能：{skill_name}"
+        if run.schedule_created:
+            reply += f"\n⏰ 已创建定时任务：{run.schedule_created}"
+
+        run.execution_result = exec_result
+        self._save_run(
+            run,
+            status=LearningRunStatus.SUCCEEDED,
+            reply=reply,
+            error=None,
+        )
+        await self._emit_learning_event(
+            EventType.LEARNING_INSTALLED,
+            run,
+            {
+                "name": skill_name,
+                "version": metadata.get("version", "0.1.0"),
+                "reply": reply,
+                "files": exec_result.get("files", []),
+                "resumed": resumed,
+            },
+        )
 
         return {
             "reply": reply,
             "files": exec_result.get("files", []),
             "learned": True,
-            "skill_name": current_skill_name,
+            "skill_name": skill_name,
+            "learning_run_id": run.run_id,
+            "schedule_created": run.schedule_created,
+        }
+
+    async def _on_approval_resolved(self, event) -> None:
+        approval_id = event.payload.get("approval_id")
+        if not approval_id:
+            return
+        pending_runs = getattr(self, "_pending_approval_runs", {})
+        run_id = pending_runs.pop(approval_id, None)
+        store = getattr(self, "_learning_store", None)
+        if not run_id and store:
+            run = store.find_by_approval(approval_id)
+            run_id = run.run_id if run else None
+        if not run_id or not store:
+            return
+
+        run = store.get(run_id)
+        if not run:
+            return
+
+        run.approval_status = str(event.payload.get("status") or "")
+        if not event.payload.get("approved"):
+            await self._fail_run(
+                run,
+                f"❌ 学习安装审批未通过：{event.payload.get('reason') or run.approval_status}",
+                str(event.payload.get("reason") or run.approval_status or "approval_rejected"),
+            )
+            return
+
+        task = Task(
+            conversation_id=run.conversation_id,
+            user_id=run.user_id,
+            origin_message=run.request_text,
+            skill_name=run.skill_name or "learning",
+            context={"learning_run_id": run.run_id},
+        )
+        asyncio.create_task(self._install_and_execute_learning_run(run, task, run.request_text, resumed=True))
+
+    async def _try_reuse_experience(
+        self,
+        task: Task,
+        user_message: str,
+        run: LearningRun,
+        experience: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        skill_name = str(experience.get("skill_name") or "")
+        if not skill_name or not self._vault or not self._vault.get_skill_runner(skill_name):
+            return None
+
+        run.skill_name = skill_name
+        self._save_run(run, status=LearningRunStatus.EXECUTING)
+        exec_result = await self._execute_learned_skill(task, skill_name, user_message)
+        if not exec_result.get("success"):
+            return None
+
+        reply = f"📋 复用已有学习经验，直接使用技能「{skill_name}」。\n\n{exec_result.get('reply', '')}"
+        run.execution_result = exec_result
+        self._save_run(run, status=LearningRunStatus.SUCCEEDED, reply=reply, error=None)
+        return {
+            "reply": reply,
+            "files": exec_result.get("files", []),
+            "learned": False,
+            "skill_name": skill_name,
+            "learning_run_id": run.run_id,
         }
 
     async def learn_and_schedule(
@@ -353,7 +820,7 @@ class LearningEngine:
 
         # 如果学习成功，尝试识别定时需求并创建 Schedule
         schedule_info = None
-        if result.get("learned") and self._scheduler:
+        if result.get("learned") and self._scheduler and not result.get("schedule_created"):
             # skill_name 可能在 learn() 内部因方案重选而变化
             # 从 reply 中提取，或使用空字符串让 _try_create_schedule 自行处理
             schedule_info = await self._try_create_schedule(
@@ -370,16 +837,25 @@ class LearningEngine:
         """从 MemCore 检索相关经验"""
         if not self._memcore_writer:
             return None
+        reader: MemCoreReader | None = None
         try:
-            # 使用 MemCore reader 搜索
-            from src.memcore.reader import MemCoreReader
-
             reader = MemCoreReader(self._config)
-            results = await reader.search(message, limit=3)
+            await reader.init()
+            results = await reader.search("learning_engine", message)
             if results:
-                return {"key": results[0].key, "value": results[0].value}
+                top = results[0]
+                payload = top.value
+                if isinstance(payload, str):
+                    try:
+                        payload = json.loads(payload)
+                    except json.JSONDecodeError:
+                        payload = {"raw": top.value}
+                return {"key": top.key, "value": top.value, **(payload if isinstance(payload, dict) else {})}
         except Exception as e:
             logger.warning("experience_search_failed", error=str(e))
+        finally:
+            if reader is not None:
+                await reader.close()
         return None
 
     # ─── LLM 需求分析 ────────────────────────────────────────────
@@ -498,15 +974,16 @@ class LearningEngine:
 
     # ─── 依赖安装 ────────────────────────────────────────────────
 
-    async def _install_dependencies(self, deps: list[str]) -> dict:
+    async def _install_dependencies(self, deps: list[str], *, force: bool = False) -> dict:
         """自动 pip install 缺失依赖"""
         if not deps:
             return {"success": True}
 
-        if self._requires_approval:
-            logger.warning("install_requires_approval", deps=deps)
-            # MVP: 自动通过，记录审计日志
-            # 完整版应暂停等待用户确认
+        if not force and not self._auto_install:
+            return {
+                "success": False,
+                "error": "dependency_install_requires_post_approval",
+            }
 
         for dep in deps:
             try:
@@ -1134,6 +1611,7 @@ if __name__ == "__main__":
         analysis: dict,
         actual_reply: str = "",
         debug_info: dict | None = None,
+        current_code: str | None = None,
     ) -> str | None:
         """根据执行错误信息，让 LLM 修复 Skill 代码
 
@@ -1148,7 +1626,7 @@ if __name__ == "__main__":
             return None
 
         # 读取当前（有 bug 的）代码
-        current_code = self._read_skill_code(skill_name)
+        current_code = current_code or self._read_skill_code(skill_name)
         if not current_code:
             return None
 
@@ -1357,16 +1835,12 @@ Skill 名称：{skill_name}
             # 映射 import 名 → pip 包名
             pip_name = _IMPORT_TO_PIP.get(missing_pkg, missing_pkg)
 
-            # 策略1: 尝试 pip install
-            install_result = await self._install_dependencies([pip_name])
-            if install_result["success"]:
-                logger.info("quick_fix_installed", package=pip_name)
-                return code  # 代码不用改，装好包就行
-
-            # 策略2: requests → httpx（项目已有依赖，API 更优）
+            # 策略1: requests → httpx（项目已有依赖，API 更优）
             if missing_pkg == "requests":
                 logger.info("quick_fix_requests_to_httpx")
                 return self._replace_requests_with_httpx(code)
+
+            logger.info("quick_fix_dependency_deferred", package=pip_name)
 
         return None
 
@@ -1433,11 +1907,13 @@ Skill 名称：{skill_name}
 
         try:
             await self._memcore_writer.write(
-                user_id="learning_engine",
-                key=f"learned:{skill_name}",
-                value=value,
-                confidence=0.8,
-                source="learning_engine",
+                MemoryEntry(
+                    user_id="learning_engine",
+                    key=f"learned:{skill_name}:{key}",
+                    value=value,
+                    confidence=0.8,
+                    source="learning_engine",
+                )
             )
             logger.info("experience_written", skill=skill_name)
         except Exception as e:

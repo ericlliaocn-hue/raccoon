@@ -33,6 +33,10 @@ class RaccoonConfig(BaseSettings):
     db_path: Path = Field(default=PROJECT_ROOT / "data" / "memcore.db")
     write_lock_timeout_ms: int = 500
     write_lock_retries: int = 3
+    learning_staging_dir: Path = Field(default=PROJECT_ROOT / "data" / "learning" / "staging")
+    learning_max_repair_attempts: int = 2
+    learning_auto_install_dependencies: bool = False
+    learning_require_approval: bool = True
 
     # ─── Supervisor ───
     auto_approve: bool = False  # 默认仅高风险/显式审批进入人工确认，低中风险自动通过

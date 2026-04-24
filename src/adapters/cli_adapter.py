@@ -18,6 +18,7 @@ from src.eventbus.bus import EventBus
 from src.eventbus.events import EventType, make_event
 from src.executor.agent import Executor
 from src.llm import LLMFactory
+from src.memcore.writer import MemCoreWriter
 from src.router.router import Router
 from src.scheduler.schedule_store import ScheduleStore
 from src.scheduler.scheduler import Scheduler
@@ -39,12 +40,14 @@ class CLISession:
         router: Router,
         executor: Executor,
         vault_manager: VaultManager,
+        memcore_writer: MemCoreWriter | None = None,
         audit_logger: "AuditLogger | None" = None,
     ) -> None:
         self._event_bus = event_bus
         self._router = router
         self._executor = executor
         self._vault_manager = vault_manager
+        self._memcore_writer = memcore_writer
         self._audit_logger = audit_logger
         self._conversation_id = str(uuid.uuid4())
         self._user_id = "cli_user"
@@ -52,6 +55,8 @@ class CLISession:
     async def start(self) -> None:
         """启动 CLI 交互循环"""
         # 注册事件处理器：监听 task_completed / task_failed
+        if self._memcore_writer:
+            await self._memcore_writer.init()
         self._event_bus.on(EventType.TASK_COMPLETED, self._on_task_completed)
         self._event_bus.on(EventType.TASK_FAILED, self._on_task_failed)
 
@@ -89,6 +94,8 @@ class CLISession:
                         border_style="yellow",
                     ))
         finally:
+            if self._memcore_writer:
+                await self._memcore_writer.close()
             await self._event_bus.stop()
 
     async def _process_message(self, text: str) -> str:
@@ -169,6 +176,7 @@ def run_cli() -> None:
     vault_manager = VaultManager(config)
     router = Router()
     executor = Executor(event_bus, vault_manager, config)
+    memcore_writer = MemCoreWriter(config)
 
     # 定时调度
     schedule_store = ScheduleStore(config)
@@ -178,12 +186,16 @@ def run_cli() -> None:
     # L3 学习引擎
     llm_client = LLMFactory.create(config)
     from src.brain.learning_engine import LearningEngine
+    from src.brain.learning_store import LearningRunStore
     learning_engine = LearningEngine(
         config=config,
         vault_manager=vault_manager,
+        memcore_writer=memcore_writer,
         llm_client=llm_client,
         scheduler=scheduler,
         router=router,
+        event_bus=event_bus,
+        learning_store=LearningRunStore(config),
     )
     executor.set_learning_engine(learning_engine)
     executor.set_scheduler(scheduler)
@@ -191,5 +203,5 @@ def run_cli() -> None:
     from src.supervisor.audit_logger import AuditLogger
     audit_logger = AuditLogger(config)
 
-    session = CLISession(event_bus, router, executor, vault_manager, audit_logger)
+    session = CLISession(event_bus, router, executor, vault_manager, memcore_writer, audit_logger)
     asyncio.run(session.start())

@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-04-24
+
+### 🧠 自学习闭环补强
+
+> 目标：把“没有 Skill → 生成 → 验证 → 审批 → 安装 → 执行 → 记忆复用”真正接成一条稳定链路。
+
+- **LearningRun 持久化**：新增 `learning_runs` 运行记录，保存学习请求、分析结果、staging 路径、验证结果、审批状态、执行结果和失败原因；新增 `GET /learning/runs`、`GET /learning/runs/{run_id}`
+- **staging 验证闸门**：LearningEngine 生成的新 Skill 先写入 `data/learning/staging/{run_id}/...`，先做 metadata/schema 校验、Python 编译检查、风险扫描和协议 smoke test，通过后才进入安装审批
+- **审批后恢复执行**：学习安装审批通过后，不需要用户再发一条消息，`ApprovalEngine` 事件会自动恢复安装和执行；新增 `LEARNING_STARTED`、`LEARNING_VALIDATED`、`LEARNING_APPROVAL_REQUIRED`、`LEARNING_INSTALLED`、`LEARNING_FAILED` 事件
+- **依赖安装收紧**：验证阶段不再静默把依赖装进运行环境；审批通过后才安装依赖并做严格复验，失败不会污染正式 Skill 目录
+- **MemCore 真接线**：HTTP/CLI 默认初始化 `MemCoreWriter` 并注入 LearningEngine；修复学习经验读写 API，用结构化 JSON 写入经验并在相似需求下优先复用已有 Skill
+- **学习前先复用已有 Skill**：用户确认学习前，Executor 会再做一次本地 Skill 候选召回；高置信度命中时直接复用已有 Skill，减少重复造轮子
+- **工程收口**：CLI/daemon 默认 host 调整为 `127.0.0.1`；`raccoon doctor` 新增 MemCore、Skill metadata、learning staging 和监听地址检查
+
 ## [0.4.1] - 2026-04-24
 
 ### 🛡️ LLM Fallback 本地候选兜底

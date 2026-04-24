@@ -2,20 +2,20 @@
 
 Raccoon 是一个本地优先、事件驱动的 AI Agent 框架。核心理念：**不是你给它装工具它去用，而是它自己会长出能力来。**
 
-> 💬 你说一句话 → 没有对应 Skill → LLM 自动生成代码 → 执行失败 → 自动装包/修代码 → 重试直到成功 → 下次直接复用
+> 💬 你说一句话 → 没有对应 Skill → LLM 自动生成代码 → 先写入 staging 验证 → 审批通过后安装执行 → 下次直接复用
 
 ## 为什么选 Raccoon
 
 | | 传统 Agent | Raccoon |
 |---|---|---|
 | 新需求 | 等人开发插件 | 对话中自动学会 |
-| 执行报错 | 停下来等你修 | 自己装依赖、改代码、重试 |
+| 执行报错 | 停下来等你修 | 先验证、再审批、再安装执行 |
 | 能力增长 | 装多少用多少 | 越用越强，经验自动积累 |
 
 ## 特性
 
-- **🧠 L3 对话自学**：没有的 Skill？说一句话，Raccoon 自己生成、自己调试、自己学会。执行失败自动修复，最多重试 3 次
-- **🔄 自修复闭环**：`ModuleNotFoundError` → 自动 `pip install` → 装不了自动换库 → 还不行 LLM 重写代码 → 直到跑通
+- **🧠 L3 对话自学**：没有的 Skill？说一句话，Raccoon 先生成到 staging，再做验证、审批、安装、执行，学习过程有完整运行记录
+- **🔄 自修复闭环**：生成后的 Skill 先过 metadata/编译/协议检查，失败时自动修复，再决定是否进入安装审批
 - **📡 事件驱动架构**：EventBus 解耦所有模块，消息即指令
 - **🏗 三层能力体系**：L1 基础技能 → L2 市场扩展 → L3 对话自学
 - **🔒 Skill 沙箱隔离**：每个 Skill 以 subprocess 运行，崩溃不影响主进程
@@ -89,7 +89,9 @@ Raccoon 支持三种配置方式，优先级从高到低：
 | `llm_model` | 模型名称 | `RACCOON_LLM_MODEL` |
 | `llm_base_url` | API 端点 | `RACCOON_LLM_BASE_URL` |
 | `http_port` | HTTP 服务端口，默认 8900 | `RACCOON_HTTP_PORT` |
-| `auto_approve` | 自动审批，默认 true | `RACCOON_AUTO_APPROVE` |
+| `auto_approve` | 自动审批，默认 false | `RACCOON_AUTO_APPROVE` |
+| `learning_require_approval` | 自学习安装前是否要求审批，默认 true | `RACCOON_LEARNING_REQUIRE_APPROVAL` |
+| `learning_staging_dir` | 自学习 staging 目录 | `RACCOON_LEARNING_STAGING_DIR` |
 
 ### 支持的 LLM
 
@@ -259,7 +261,7 @@ raccoon/
 - **`config.json` 不入库**：已通过 `.gitignore` 排除，包含 API Key 等敏感信息
 - **环境变量优先**：生产环境建议通过环境变量注入敏感配置，而非写入文件
 - **Skill 沙箱**：所有 Skill 以 subprocess 运行，受内存/超时限制
-- **审批机制**：高风险操作可开启 `auto_approve: false`，需人工确认
+- **审批机制**：默认 `auto_approve: false`；高风险操作和自学习安装都会进入审批
 
 ### LLM 配置
 

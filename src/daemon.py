@@ -107,7 +107,7 @@ def status() -> dict:
     return {"running": True, "pid": pid, "uptime": uptime, "mode": mode}
 
 
-def start(http: bool = True, host: str = "0.0.0.0", port: int = 8900) -> bool:
+def start(http: bool = True, host: str = "127.0.0.1", port: int = 8900) -> bool:
     """后台启动 raccoon
 
     Args:
@@ -202,7 +202,7 @@ def stop() -> bool:
     return True
 
 
-def restart(http: bool = True, host: str = "0.0.0.0", port: int = 8900) -> bool:
+def restart(http: bool = True, host: str = "127.0.0.1", port: int = 8900) -> bool:
     """重启 raccoon"""
     st = status()
     if st["running"]:
