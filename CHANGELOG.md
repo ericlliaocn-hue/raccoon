@@ -5,6 +5,48 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.4] - 2026-04-24
+
+### 🔧 工作流 + 记忆进化
+
+> 目标：工作流引擎从简单顺序执行升级为支持条件分支/循环/并行/LLM自动分解的完整引擎；MemCore 从静态存储进化为带衰减/归档/偏好学习的智能记忆系统；意图分类从关键词匹配升级为 LLM 模型分类 + 在线学习。
+
+#### Module 1: 工作流引擎增强
+
+- **#1 LLM 自动分解**：`WorkflowEngine.execute_from_decomposition()` 集成 `Planner.decompose()`，复杂请求自动拆解为多步骤工作流
+- **#2 条件分支增强**：`WorkflowStep` 新增 `if/else`（`if_condition` + `then_steps` + `else_steps`）、`loop`（`loop_var` + `loop_over` + `loop_steps` + `max_iterations`）、`parallel`（`parallel_steps`）三种步骤类型
+- **#3 工作流模板市场**：`WorkflowTemplateMarket` 提供 5 个预置模板（写作辅助、日报生成、代码审查、研究摘要、内容发布），支持搜索和一键加载
+- **#4 崩溃恢复**：`WorkflowStore` 从 JSON 迁移到 SQLite，新增 `workflow_executions` 表存储执行中间状态，`WorkflowEngine.resume_execution()` 支持从崩溃点恢复执行
+
+#### Module 2: MemCore 记忆进化
+
+- **#5 置信度衰减算法**：`MemCoreLifecycle.decay()` 从 noop 升级为指数衰减算法（`confidence *= e^(-λ*age_days)`），高频访问记忆衰减更慢（access_count > 5 时 λ 减半）
+- **#6 经验复用率统计**：`MemCoreReader` 新增访问追踪（`_track_access` 更新 `access_count` + `last_accessed_at`），`get_top_accessed()` 和 `get_access_stats()` 提供复用率统计，搜索结果按 `confidence * (1 + access_count * 0.1)` 加权排序
+- **#7 记忆归档**：`MemCoreLifecycle.archive_unused()` 归档超过 30 天未访问且 confidence < 0.3 的记忆
+- **#8 偏好学习**：`MemCoreWriter.learn_preference_from_behavior()` 从用户行为中提取偏好（skill_used → frequent_skill, model_switched → preferred_model 等），相同偏好增加 access_count，偏好变化自动归档旧偏好
+
+#### Module 3: 意图分类升级
+
+- **#9 ModelIntentClassifier**：LLM 轻量模型分类替代纯关键词匹配，三级分类流程：关键词优先（高置信度快速返回）→ 在线学习修正 → LLM 单次调用分类
+- **#10 在线学习**：`OnlineLearningStore` 记录用户纠正，关键词重叠度 + 子串匹配评分，后续相似文本直接使用纠正后分类，最多保留 100 条纠正记录
+
+#### Module 4: 流式聊天修复
+
+- **#11 chat_stream LLM 分流**：`classify_llm_message()` 对 LLM 路由消息做三段式前两步分类，闲聊走 `llm.chat_stream()` 流式推送（保留打字机效果），Skill 匹配/学习确认走一次性 SSE 返回
+- **#12 _ACTION_SIGNALS 清理**：移除冗余信号词，"帮我"前缀通过子串匹配覆盖所有"帮我X"变体
+
+#### 数据模型变更
+
+- `WorkflowStep` 新增字段：`if_condition`, `then_steps`, `else_steps`, `loop_var`, `loop_over`, `loop_steps`, `parallel_steps`, `max_iterations`
+- `MemoryEntry` 新增字段：`access_count`, `last_accessed_at`
+- `WorkflowStore` 从 JSON 迁移到 SQLite，自动迁移旧 `workflows/` 目录
+
+#### 测试
+
+- `test_workflow.py`：51/51 通过（Store CRUD + Engine 执行 + if/else/loop/parallel + 持久化 + 模板市场 + Planner）
+- `test_memcore.py`：14/14 通过（读写 + 偏好冲突 + 衰减 + 归档 + 访问追踪 + 复用统计 + 偏好学习）
+- `test_intent_classifier.py`：12/12 通过（关键词分类 + 模型分类 + 在线学习 + 纠正记录）
+
 ## [0.3.3] - 2025-04-24
 
 ### ⏰ 定时 + 通知 + 审批

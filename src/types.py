@@ -196,11 +196,20 @@ class ScheduleEntry(BaseModel):
 class WorkflowStep(BaseModel):
     """工作流步骤"""
     step_id: int
-    type: str                    # "skill" | "system" | "llm"
+    type: str                    # "skill" | "system" | "llm" | "if" | "loop" | "parallel"
     skill_name: str | None = None
     params: dict[str, Any] = Field(default_factory=dict)
     input_from: int | None = None  # 从第几步的输出取输入（None=不依赖前序步骤）
     condition: str | None = None    # "on_success" | "on_failure" | None
+    # ─── v0.3.4 条件分支增强 ───
+    if_condition: str | None = None   # 表达式，如 "step_0.success == true"
+    then_steps: list[WorkflowStep] | None = None   # if 分支子步骤（递归）
+    else_steps: list[WorkflowStep] | None = None   # else 分支子步骤
+    loop_var: str | None = None       # 循环变量名，如 "item"
+    loop_over: str | None = None      # 循环来源，如 "step_0.result.items"
+    loop_steps: list[WorkflowStep] | None = None   # 循环体子步骤
+    parallel_steps: list[WorkflowStep] | None = None  # 并行子步骤
+    max_iterations: int = 100         # 循环最大迭代次数（防死循环）
 
 
 class WorkflowEntry(BaseModel):
@@ -224,6 +233,9 @@ class MemoryEntry(BaseModel):
     confidence: float = 1.0
     source: str = "user"  # user / skill / system
     is_archived: bool = False
+    # ─── v0.3.4 访问追踪 ───
+    access_count: int = 0
+    last_accessed_at: datetime | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 

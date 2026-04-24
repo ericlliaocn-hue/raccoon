@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -16,6 +15,7 @@ from src.eventbus.events import EventType, make_event
 from src.types import WorkflowEntry, WorkflowStep
 from src.workflow.workflow_store import WorkflowStore
 from src.workflow.workflow_engine import WorkflowEngine, WorkflowExecution
+from src.workflow.workflow_templates import WorkflowTemplateMarket
 from src.brain.planner import Plan, Planner
 
 
@@ -24,9 +24,11 @@ from src.brain.planner import Plan, Planner
 class TestWorkflowStore:
     @pytest.fixture
     def store(self, tmp_path):
-        cfg = RaccoonConfig(workflows_dir=tmp_path / "workflows")
+        cfg = RaccoonConfig(
+            workflows_dir=tmp_path / "workflows",
+            db_path=tmp_path / "test_workflow.db",
+        )
         s = WorkflowStore(cfg)
-        s.recover()
         return s
 
     def test_add_and_get(self, store):
@@ -77,9 +79,11 @@ class TestWorkflowStore:
         assert got.name == "updated"
 
     def test_persistence(self, tmp_path):
-        cfg = RaccoonConfig(workflows_dir=tmp_path / "workflows")
+        cfg = RaccoonConfig(
+            workflows_dir=tmp_path / "workflows",
+            db_path=tmp_path / "test_workflow.db",
+        )
         store1 = WorkflowStore(cfg)
-        store1.recover()
         entry = WorkflowEntry(name="persist_test", steps=[
             WorkflowStep(step_id=0, type="skill", skill_name="echo"),
         ])
@@ -87,23 +91,83 @@ class TestWorkflowStore:
 
         # 新 store 实例应能恢复
         store2 = WorkflowStore(cfg)
-        store2.recover()
         got = store2.get(entry.workflow_id)
         assert got is not None
         assert got.name == "persist_test"
+
+    def test_execution_state_crud(self, store):
+        """测试执行状态持久化"""
+        entry = WorkflowEntry(name="exec_test", steps=[])
+        store.add(entry)
+
+        store.save_execution_state(
+            execution_id="exec_001",
+            workflow_id=entry.workflow_id,
+            conversation_id="conv_001",
+            current_step=2,
+            status="running",
+            step_results={0: "ok", 1: "done"},
+        )
+
+        state = store.get_execution_state("exec_001")
+        assert state is not None
+        assert state["current_step"] == 2
+        assert state["status"] == "running"
+
+        # 更新状态
+        store.save_execution_state(
+            execution_id="exec_001",
+            workflow_id=entry.workflow_id,
+            conversation_id="conv_001",
+            current_step=3,
+            status="completed",
+            step_results={0: "ok", 1: "done", 2: "final"},
+        )
+
+        state = store.get_execution_state("exec_001")
+        assert state["status"] == "completed"
+
+        # 清除
+        store.clear_execution_state("exec_001")
+        assert store.get_execution_state("exec_001") is None
+
+    def test_pending_executions(self, store):
+        """测试获取未完成执行"""
+        entry = WorkflowEntry(name="pending_test", steps=[])
+        store.add(entry)
+
+        store.save_execution_state(
+            execution_id="exec_p1",
+            workflow_id=entry.workflow_id,
+            conversation_id="conv_001",
+            current_step=1,
+            status="running",
+            step_results={},
+        )
+        store.save_execution_state(
+            execution_id="exec_p2",
+            workflow_id=entry.workflow_id,
+            conversation_id="conv_002",
+            current_step=0,
+            status="completed",
+            step_results={},
+        )
+
+        pending = store.get_pending_executions()
+        assert len(pending) == 1
+        assert pending[0]["execution_id"] == "exec_p1"
 
 
 # ─── WorkflowEngine 测试 ─────────────────────────────────────
 
 class TestWorkflowEngine:
     @pytest.fixture
-    def components(self):
-        config = RaccoonConfig()
+    def components(self, tmp_path):
+        config = RaccoonConfig(db_path=tmp_path / "test_workflow.db")
         event_bus = EventBus(config)
         router = MagicMock()
         executor = AsyncMock()
         store = WorkflowStore(config)
-        store.recover()
         engine = WorkflowEngine(event_bus, router, executor, store, config)
         return engine, event_bus, router, executor, store
 
@@ -205,6 +269,100 @@ class TestWorkflowEngine:
         await engine.execute(workflow)
         assert len(engine.list_executions()) == 2
 
+    # ─── v0.3.4 新增测试 ──────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_execute_if_else_true_branch(self, components):
+        """测试 if/else 分支 — 条件为真走 then"""
+        engine, event_bus, router, executor, store = components
+        executor.handle_route_result = AsyncMock(return_value="ok")
+
+        workflow = WorkflowEntry(name="if_test", steps=[
+            WorkflowStep(step_id=0, type="system", params={"command": "help"}),
+            WorkflowStep(step_id=1, type="if", if_condition="step_0.success",
+                         then_steps=[
+                             WorkflowStep(step_id=10, type="system", params={"command": "then_cmd"}),
+                         ],
+                         else_steps=[
+                             WorkflowStep(step_id=11, type="system", params={"command": "else_cmd"}),
+                         ]),
+        ])
+        ctx = await engine.execute(workflow)
+        assert ctx.status == "completed"
+        assert ctx.step_results[1]["branch"] == "then"
+
+    @pytest.mark.asyncio
+    async def test_execute_if_else_false_branch(self, components):
+        """测试 if/else 分支 — 条件为假走 else"""
+        engine, event_bus, router, executor, store = components
+        executor.handle_route_result = AsyncMock(return_value="ok")
+
+        workflow = WorkflowEntry(name="if_false_test", steps=[
+            WorkflowStep(step_id=0, type="system", params={"command": "help"}),
+            WorkflowStep(step_id=1, type="if", if_condition="step_0.error",
+                         then_steps=[
+                             WorkflowStep(step_id=10, type="system", params={"command": "then_cmd"}),
+                         ],
+                         else_steps=[
+                             WorkflowStep(step_id=11, type="system", params={"command": "else_cmd"}),
+                         ]),
+        ])
+        ctx = await engine.execute(workflow)
+        assert ctx.status == "completed"
+        assert ctx.step_results[1]["branch"] == "else"
+
+    @pytest.mark.asyncio
+    async def test_execute_loop(self, components):
+        """测试循环步骤"""
+        engine, event_bus, router, executor, store = components
+        executor.handle_route_result = AsyncMock(return_value="item_result")
+
+        # 先设置 step_0 的结果作为循环数据源
+        workflow = WorkflowEntry(name="loop_test", steps=[
+            WorkflowStep(step_id=0, type="system", params={"command": "help"}),
+            WorkflowStep(step_id=1, type="loop", loop_var="item", loop_over="step_0.result.items",
+                         loop_steps=[
+                             WorkflowStep(step_id=10, type="skill", skill_name="echo", params={"text": "{item}"}),
+                         ]),
+        ])
+        ctx = await engine.execute(workflow)
+        assert ctx.status == "completed"
+        # step_0 没有返回 items 列表，所以循环 0 次
+        assert ctx.step_results[1]["iterations"] == 0
+
+    @pytest.mark.asyncio
+    async def test_execute_parallel(self, components):
+        """测试并行步骤"""
+        engine, event_bus, router, executor, store = components
+        executor.handle_route_result = AsyncMock(return_value="parallel_result")
+
+        workflow = WorkflowEntry(name="parallel_test", steps=[
+            WorkflowStep(step_id=0, type="parallel",
+                         parallel_steps=[
+                             WorkflowStep(step_id=10, type="skill", skill_name="web_search", params={"query": "a"}),
+                             WorkflowStep(step_id=11, type="skill", skill_name="web_search", params={"query": "b"}),
+                         ]),
+        ])
+        ctx = await engine.execute(workflow)
+        assert ctx.status == "completed"
+        assert len(ctx.step_results[0]["parallel_result"]) == 2
+
+    @pytest.mark.asyncio
+    async def test_execution_state_persisted(self, components):
+        """测试执行中间状态持久化"""
+        engine, event_bus, router, executor, store = components
+        executor.handle_route_result = AsyncMock(return_value="ok")
+
+        workflow = WorkflowEntry(name="persist_exec", steps=[
+            WorkflowStep(step_id=0, type="system", params={"command": "help"}),
+        ])
+        ctx = await engine.execute(workflow)
+
+        # 验证执行状态已持久化
+        state = store.get_execution_state(ctx.execution_id)
+        assert state is not None
+        assert state["status"] == "completed"
+
 
 # ─── Planner 测试 ────────────────────────────────────────────
 
@@ -295,12 +453,47 @@ class TestWorkflowStep:
         assert step.input_from == 0
         assert step.condition == "on_success"
 
+    def test_if_step(self):
+        step = WorkflowStep(
+            step_id=1, type="if",
+            if_condition="step_0.success",
+            then_steps=[WorkflowStep(step_id=10, type="system", params={"command": "then"})],
+            else_steps=[WorkflowStep(step_id=11, type="system", params={"command": "else"})],
+        )
+        assert step.type == "if"
+        assert step.if_condition == "step_0.success"
+        assert len(step.then_steps) == 1
+        assert len(step.else_steps) == 1
+
+    def test_loop_step(self):
+        step = WorkflowStep(
+            step_id=1, type="loop",
+            loop_var="item",
+            loop_over="step_0.result.items",
+            loop_steps=[WorkflowStep(step_id=10, type="skill", skill_name="echo")],
+            max_iterations=50,
+        )
+        assert step.type == "loop"
+        assert step.loop_var == "item"
+        assert step.max_iterations == 50
+
+    def test_parallel_step(self):
+        step = WorkflowStep(
+            step_id=1, type="parallel",
+            parallel_steps=[
+                WorkflowStep(step_id=10, type="skill", skill_name="web_search"),
+                WorkflowStep(step_id=11, type="skill", skill_name="image_gen"),
+            ],
+        )
+        assert step.type == "parallel"
+        assert len(step.parallel_steps) == 2
+
 
 class TestWorkflowEntry:
     def test_basic_entry(self):
         entry = WorkflowEntry(name="test", steps=[])
         assert entry.name == "test"
-        assert entry.workflow_id  # 自动生成
+        assert entry.workflow_id
         assert entry.description == ""
 
     def test_entry_with_steps(self):
@@ -310,3 +503,29 @@ class TestWorkflowEntry:
         ]
         entry = WorkflowEntry(name="two_step", steps=steps)
         assert len(entry.steps) == 2
+
+
+# ─── WorkflowTemplateMarket 测试 ──────────────────────────────
+
+class TestWorkflowTemplateMarket:
+    def test_list_templates(self):
+        market = WorkflowTemplateMarket()
+        templates = market.list_templates()
+        assert len(templates) >= 5  # 至少 5 个预置模板
+
+    def test_get_template(self):
+        market = WorkflowTemplateMarket()
+        t = market.get_template("写作辅助")
+        assert t is not None
+        assert t.name == "写作辅助"
+        assert len(t.steps) == 4
+
+    def test_search_templates(self):
+        market = WorkflowTemplateMarket()
+        results = market.search_templates("日报")
+        assert len(results) >= 1
+        assert any("日报" in t.name for t in results)
+
+    def test_get_template_not_found(self):
+        market = WorkflowTemplateMarket()
+        assert market.get_template("不存在的模板") is None

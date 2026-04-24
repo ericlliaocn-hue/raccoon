@@ -5,5 +5,6 @@
 
 from src.workflow.workflow_engine import WorkflowEngine
 from src.workflow.workflow_store import WorkflowStore
+from src.workflow.workflow_templates import WorkflowTemplateMarket
 
-__all__ = ["WorkflowEngine", "WorkflowStore"]
+__all__ = ["WorkflowEngine", "WorkflowStore", "WorkflowTemplateMarket"]
