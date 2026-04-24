@@ -50,3 +50,7 @@ Thumbs.db
 *.log
 *.tmp
 *.bak
+/workflows.migrated/
+/.playwright-cli/
+/schedules.migrated/
+/before-market.yaml

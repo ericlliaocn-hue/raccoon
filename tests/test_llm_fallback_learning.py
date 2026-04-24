@@ -4,6 +4,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 from src.types import Task, RouteResult, RouteType, Event, EventType
 from src.executor.agent import Executor, LlmClassification, LlmClassifyResult
+from src.skill_vault.vault_manager import VaultManager
+from src.config import RaccoonConfig
 
 
 def _make_executor(**overrides) -> Executor:
@@ -155,8 +157,8 @@ class TestLlmClassify:
         assert result.classification == LlmClassification.NEEDS_LEARN
 
     @pytest.mark.asyncio
-    async def test_llm_failure_fallback_chitchat(self):
-        """LLM 调用失败 → 安全降级为 CHITCHAT"""
+    async def test_llm_failure_uses_local_skill_candidate(self):
+        """LLM 调用失败 + 本地候选明确 → 命中 Skill"""
         mock_skill = MagicMock()
         mock_skill.name = "weather_query"
         mock_skill.trigger_words = ["天气"]
@@ -169,11 +171,12 @@ class TestLlmClassify:
         executor._get_llm = MagicMock(return_value=mock_llm)
 
         result = await executor._llm_classify("帮我查天气")
-        assert result.classification == LlmClassification.CHITCHAT
+        assert result.classification == LlmClassification.SKILL_MATCHED
+        assert result.skill_name == "weather_query"
 
     @pytest.mark.asyncio
-    async def test_llm_unparseable_response_fallback_chitchat(self):
-        """LLM 返回无法解析的内容 → 安全降级为 CHITCHAT"""
+    async def test_llm_unparseable_response_uses_local_skill_candidate(self):
+        """LLM 返回无法解析 + 本地候选明确 → 命中 Skill"""
         mock_skill = MagicMock()
         mock_skill.name = "weather_query"
         mock_skill.trigger_words = ["天气"]
@@ -186,7 +189,120 @@ class TestLlmClassify:
         executor._get_llm = MagicMock(return_value=mock_llm)
 
         result = await executor._llm_classify("帮我查天气")
+        assert result.classification == LlmClassification.SKILL_MATCHED
+        assert result.skill_name == "weather_query"
+
+    @pytest.mark.asyncio
+    async def test_llm_wrong_chitchat_overridden_by_local_candidate(self):
+        """LLM 把动作误判为 CHITCHAT 时，本地明确候选可覆盖。"""
+        mock_skill = MagicMock()
+        mock_skill.name = "screenshot"
+        mock_skill.trigger_words = ["截图"]
+        mock_skill.aliases = []
+        mock_skill.intent_tags = ["screen"]
+        executor = self._make_executor_with_skills(skills=[mock_skill])
+
+        mock_llm = AsyncMock()
+        mock_llm.chat = AsyncMock(return_value="CHITCHAT")
+        executor._get_llm = MagicMock(return_value=mock_llm)
+
+        result = await executor._llm_classify("帮我截图")
+        assert result.classification == LlmClassification.SKILL_MATCHED
+        assert result.skill_name == "screenshot"
+
+    @pytest.mark.asyncio
+    async def test_llm_failure_action_without_candidate_needs_learn(self):
+        """LLM 调用失败 + 无本地候选 + 明显动作 → NEEDS_LEARN"""
+        mock_skill = MagicMock()
+        mock_skill.name = "echo"
+        mock_skill.trigger_words = ["echo"]
+        mock_skill.aliases = []
+        mock_skill.intent_tags = ["utility"]
+        executor = self._make_executor_with_skills(skills=[mock_skill])
+
+        mock_llm = AsyncMock()
+        mock_llm.chat = AsyncMock(side_effect=Exception("LLM timeout"))
+        executor._get_llm = MagicMock(return_value=mock_llm)
+
+        result = await executor._llm_classify("帮我查天气")
+        assert result.classification == LlmClassification.NEEDS_LEARN
+
+    @pytest.mark.asyncio
+    async def test_llm_failure_creative_without_candidate_stays_chitchat(self):
+        """LLM 调用失败 + 创作闲聊 + 无本地候选 → CHITCHAT"""
+        mock_skill = MagicMock()
+        mock_skill.name = "echo"
+        mock_skill.trigger_words = ["echo"]
+        mock_skill.aliases = []
+        mock_skill.intent_tags = ["utility"]
+        executor = self._make_executor_with_skills(skills=[mock_skill])
+
+        mock_llm = AsyncMock()
+        mock_llm.chat = AsyncMock(side_effect=Exception("LLM timeout"))
+        executor._get_llm = MagicMock(return_value=mock_llm)
+
+        result = await executor._llm_classify("帮我写一首关于春天的诗")
         assert result.classification == LlmClassification.CHITCHAT
+
+    @pytest.mark.asyncio
+    async def test_llm_failure_real_skill_catalog_benchmark(self):
+        """真实内置 Skill 元数据 + LLM 全挂时，动作请求不能漏成 CHITCHAT。"""
+        config = RaccoonConfig()
+        vault = VaultManager(config)
+        executor = _make_executor(_vault_manager=vault)
+        mock_llm = AsyncMock()
+        mock_llm.chat = AsyncMock(side_effect=Exception("LLM offline"))
+        executor._get_llm = MagicMock(return_value=mock_llm)
+
+        chitchat_cases = [
+            "帮我写一首关于春天的诗",
+            "讲个笑话",
+            "翻译一下这段英文",
+            "润色这段话",
+            "总结一下这篇文章",
+            "解释一下量子力学",
+            "Python 怎么排序列表",
+            "今天心情怎么样",
+        ]
+        action_cases = [
+            ("帮我查天气", None),  # 没有 weather skill，应进入学习链路
+            ("打开浏览器访问百度", "web_automate"),
+            ("监控网站变化", "change_detector"),
+            ("生成一张猫的图片", "image_gen"),
+            ("查看系统信息", "system_info"),
+            ("执行 ls 命令", "shell_exec"),
+            ("截图", "screenshot"),
+            ("获取微博热搜", "weibo_hot"),
+            ("获取 36kr 热门", "36kr_hot"),
+            ("获取小红书日报", "xiaohongshu_daily_report"),
+            ("获取 AI 日报", "ai_daily_report"),
+            ("获取 B站热门", "bilibili_hot"),
+            ("获取掘金热门", "juejin_hot"),
+            ("获取 CSDN 热门", "csdn_hot"),
+            ("获取百度热搜", "baidu_hot"),
+            ("获取博客园热门", "cnblogs_hot"),
+            ("读取文件", "file_read"),
+            ("搜索文件", "file_search"),
+            ("分析文件", "file_analyze"),
+            ("批量处理文件", "file_batch"),
+            ("控制应用", "app_control"),
+            ("操作剪贴板", "clipboard"),
+            ("查看日志", "log_watcher"),
+            ("Git 帮助", "git_helper"),
+            ("网页浏览", "web_browse"),
+        ]
+
+        for text in chitchat_cases:
+            result = await executor._llm_classify(text)
+            assert result.classification == LlmClassification.CHITCHAT, text
+
+        for text, expected_skill in action_cases:
+            result = await executor._llm_classify(text)
+            if expected_skill is None:
+                assert result.classification == LlmClassification.NEEDS_LEARN, text
+            else:
+                assert result.classification == LlmClassification.SKILL_MATCHED, text
+                assert result.skill_name == expected_skill, text
 
     @pytest.mark.asyncio
     async def test_skill_name_fuzzy_match(self):

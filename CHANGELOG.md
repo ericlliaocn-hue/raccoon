@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-04-24
+
+### 🛡️ LLM Fallback 本地候选兜底
+
+> 目标：LLM 超时/失败/误判 CHITCHAT 时，动作请求不再漏成闲聊。
+
+- **本地 Skill 候选召回**：LLM 不可用或返回 CHITCHAT 时，先用本地 Skill 元数据（trigger_words/aliases/intent_tags）召回候选；有明确候选则命中 Skill，无候选但明显是动作则进入 `NEEDS_LEARN`
+- **`SkillCandidate` 数据结构**：新增 `SkillCandidate` dataclass，记录 skill_name/confidence/matched_terms
+- **强动作信号词区分**：`_STRONG_ACTION_SIGNALS` 与弱信号 `_ACTION_SIGNALS` 分离，"帮我"不再单独作为无 LLM 时的动作证据
+- **触发词补强**：`app_control` 补充"控制应用"、"应用控制"触发词
+- **基准测试**：新增真实 Skill 目录基准测试，覆盖 25+ 动作场景 + 8 闲聊场景，LLM 全挂时验证不漏判
+- **`.gitignore` 补充**：排除 `workflows.migrated/`、`.playwright-cli/`、`schedules.migrated/`、`before-market.yaml`
+
 ## [0.4.0] - 2026-04-24
 
 ### 🔒 安全闭环 + ⏰ 调度闭环 + 🧭 路由归一 + 🧪 兼容性修复（非 Docker）
@@ -32,6 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 #### Module 4: 路由与 LLM 分流收敛
 
 - **Adapter 不再持有 LLM 分流规则**：`/chat/stream` 的 LLM fallback 分类、Skill 匹配和学习确认统一收敛到 `Executor.decide_llm_stream()`；adapter 只负责渲染 SSE
+- **LLM fallback 本地候选兜底**：LLM 超时、连接失败、返回不可解析或误判 `CHITCHAT` 时，会先用本地 Skill 元数据召回候选；有明确候选则命中 Skill，无候选但明显是动作则进入 `NEEDS_LEARN`，避免动作请求漏成闲聊
 - **低置信度保护**：`LlmClassifyResult` 支持 `confidence`；低于阈值（默认 `0.7`）不直接执行 Skill，改为提示用户确认/学习
 - **触发词补强**：补充常用 trigger/alias（文件整理、读取文件、浏览器截图等）减少 LLM 抢路由
 

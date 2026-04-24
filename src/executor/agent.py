@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any
@@ -85,6 +86,15 @@ class LlmStreamDecision:
     reply: str | None = None
     source: str = "llm"
     skill_name: str = ""
+
+
+@dataclass
+class SkillCandidate:
+    """本地 Skill 候选召回结果。"""
+
+    skill_name: str
+    confidence: float
+    matched_terms: list[str] = field(default_factory=list)
 
 
 class Executor:
@@ -597,7 +607,7 @@ class Executor:
 
     # 启发式信号词：判断用户消息是否可能需要执行动作
     _ACTION_SIGNALS = (
-        # "帮我" 是所有"帮我X"的前缀，子串匹配即可覆盖
+        # "帮我" 用于触发 LLM fallback，但不能单独作为无 LLM 时的动作证据
         "帮我",
         "每天", "每周", "每月", "定时", "自动", "监控",
         "抓取", "爬取", "下载", "截图", "截屏",
@@ -605,6 +615,25 @@ class Executor:
         "浏览器", "打开网页", "网页操作", "填表",
         "发送消息", "推送", "通知",
         "写一个", "做一个", "搞一个", "来一个",
+    )
+    _STRONG_ACTION_SIGNALS = (
+        "每天", "每周", "每月", "定时", "自动", "监控",
+        "抓取", "爬取", "下载", "截图", "截屏",
+        "生成图片", "画一张", "画个图", "画图", "生图",
+        "转换", "压缩", "批量", "整理", "重命名",
+        "浏览器", "打开网页", "打开浏览器", "访问网页", "网页操作", "填表",
+        "发送消息", "推送", "通知",
+        "读取文件", "搜索文件", "查找文件", "分析文件",
+        "执行", "运行", "命令", "shell", "终端",
+        "系统信息", "电脑状态", "内存", "进程",
+        "热搜", "热门", "排行榜", "日报",
+        "剪贴板", "控制应用", "打开应用",
+        "获取", "查天气",
+    )
+    _CREATIVE_OR_CHAT_SIGNALS = (
+        "写诗", "写一首", "写个故事", "讲个笑话", "翻译",
+        "润色", "总结", "解释", "为什么", "是什么", "怎么办",
+        "心情", "你好", "hello", "hi",
     )
 
     def _get_llm(self) -> LLMClient:
@@ -640,6 +669,8 @@ class Executor:
         # 无 Skill 可匹配 → 直接 NEEDS_LEARN
         if not skills:
             return LlmClassifyResult(classification=LlmClassification.NEEDS_LEARN)
+
+        local_candidates = self._find_skill_candidates(text, skills)
 
         # 构建 Skill 清单
         skill_catalog = self._build_skill_catalog(skills)
@@ -680,6 +711,15 @@ confidence 是 0.0-1.0 的小数；只有非常确定时才高于 0.7。"""
 
             # 解析 CHITCHAT
             if "CHITCHAT" in result.upper():
+                local = self._local_fallback_classify(text, skills, local_candidates)
+                if local.classification != LlmClassification.CHITCHAT:
+                    logger.info(
+                        "llm_chitchat_overridden_by_local_candidate",
+                        classification=local.classification.value,
+                        skill=local.skill_name,
+                        confidence=local.confidence,
+                    )
+                    return local
                 return LlmClassifyResult(classification=LlmClassification.CHITCHAT)
 
             # 解析 SKILL:xxx
@@ -694,6 +734,10 @@ confidence 是 0.0-1.0 的小数；只有非常确定时才高于 0.7。"""
                         confidence = 0.6
                 matched = self._verify_skill_name(skill_name, skills)
                 if matched:
+                    local_confidence = self._candidate_confidence(matched, local_candidates)
+                    if len(parts) <= 2:
+                        confidence = max(confidence, 0.75)
+                    confidence = max(confidence, local_confidence)
                     return LlmClassifyResult(
                         classification=LlmClassification.SKILL_MATCHED,
                         skill_name=matched,
@@ -701,20 +745,151 @@ confidence 是 0.0-1.0 的小数；只有非常确定时才高于 0.7。"""
                     )
                 # LLM 返回了不存在的 Skill → 降级为 NEEDS_LEARN
                 logger.warning("llm_classify_skill_not_found", llm_returned=skill_name)
+                local = self._local_fallback_classify(text, skills, local_candidates)
+                if local.classification == LlmClassification.SKILL_MATCHED:
+                    return local
                 return LlmClassifyResult(classification=LlmClassification.NEEDS_LEARN)
 
             # 解析 NEEDS_LEARN
             if "LEARN" in result.upper():
+                local = self._local_fallback_classify(text, skills, local_candidates)
+                if local.classification == LlmClassification.SKILL_MATCHED:
+                    logger.info(
+                        "llm_needs_learn_overridden_by_local_candidate",
+                        skill=local.skill_name,
+                        confidence=local.confidence,
+                    )
+                    return local
                 return LlmClassifyResult(classification=LlmClassification.NEEDS_LEARN)
 
-            # 无法解析 → 安全降级为 CHITCHAT
+            # 无法解析 → 本地候选兜底
             logger.warning("llm_classify_unparseable", raw=result)
-            return LlmClassifyResult(classification=LlmClassification.CHITCHAT)
+            return self._local_fallback_classify(text, skills, local_candidates)
 
         except Exception as e:
-            # LLM 调用失败 → 安全降级为 CHITCHAT
+            # LLM 调用失败 → 本地候选兜底，避免动作请求漏成闲聊
             logger.warning("llm_classify_failed", error=str(e))
-            return LlmClassifyResult(classification=LlmClassification.CHITCHAT)
+            return self._local_fallback_classify(text, skills, local_candidates)
+
+    def _local_fallback_classify(
+        self,
+        text: str,
+        skills: list,
+        candidates: list[SkillCandidate] | None = None,
+    ) -> LlmClassifyResult:
+        """LLM 不可靠时的本地确定性兜底。
+
+        不替代 Router；只在 LLM fallback 内防止动作请求被错误降级为闲聊。
+        """
+        candidates = candidates if candidates is not None else self._find_skill_candidates(text, skills)
+        if candidates and candidates[0].confidence >= 0.7:
+            return LlmClassifyResult(
+                classification=LlmClassification.SKILL_MATCHED,
+                skill_name=candidates[0].skill_name,
+                confidence=candidates[0].confidence,
+            )
+        if self._has_strong_action_signal(text):
+            return LlmClassifyResult(classification=LlmClassification.NEEDS_LEARN)
+        return LlmClassifyResult(classification=LlmClassification.CHITCHAT)
+
+    def _find_skill_candidates(self, text: str, skills: list) -> list[SkillCandidate]:
+        """用本地 Skill 元数据召回候选，LLM 失败时保底。"""
+        text_norm = self._normalize_match_text(text)
+        text_compact = self._compact_match_text(text)
+        candidates: list[SkillCandidate] = []
+
+        for skill in skills:
+            skill_name = self._safe_skill_name(skill)
+            if not skill_name:
+                continue
+            score = 0.0
+            matched_terms: list[str] = []
+
+            for term in self._safe_string_list(getattr(skill, "trigger_words", [])):
+                term_score = self._term_score(term, text_norm, text_compact, base=0.66)
+                if term_score > 0:
+                    score += term_score
+                    matched_terms.append(term)
+
+            for term in self._safe_string_list(getattr(skill, "aliases", [])):
+                term_score = self._term_score(term, text_norm, text_compact, base=0.56)
+                if term_score > 0:
+                    score += term_score
+                    matched_terms.append(term)
+
+            for tag in self._safe_string_list(getattr(skill, "intent_tags", [])):
+                tag_norm = self._normalize_match_text(tag)
+                if tag_norm and tag_norm in text_norm:
+                    score += 0.18
+                    matched_terms.append(tag)
+
+            name_parts = [p for p in re.split(r"[_\W]+", skill_name.lower()) if len(p) >= 2]
+            for part in name_parts:
+                if part and part in text_norm:
+                    score += 0.12
+                    matched_terms.append(part)
+
+            if score > 0:
+                candidates.append(
+                    SkillCandidate(
+                        skill_name=skill_name,
+                        confidence=max(0.0, min(0.95, score)),
+                        matched_terms=list(dict.fromkeys(matched_terms)),
+                    )
+                )
+
+        candidates.sort(key=lambda c: (c.confidence, len("".join(c.matched_terms))), reverse=True)
+        return candidates
+
+    def _term_score(self, term: str, text_norm: str, text_compact: str, base: float) -> float:
+        term_norm = self._normalize_match_text(term)
+        if not term_norm:
+            return 0.0
+        term_compact = self._compact_match_text(term)
+        if term_norm == text_norm or term_compact == text_compact:
+            return 0.95
+        if term_norm in text_norm or term_compact in text_compact:
+            return min(0.9, base + min(len(term_compact) * 0.035, 0.25))
+        if len(term_compact) >= 4:
+            prefix = term_compact[:2]
+            suffix = term_compact[-2:]
+            if prefix in text_compact and suffix in text_compact:
+                return min(0.82, base - 0.02 + min(len(term_compact) * 0.025, 0.18))
+        return 0.0
+
+    def _candidate_confidence(self, skill_name: str, candidates: list[SkillCandidate]) -> float:
+        for candidate in candidates:
+            if candidate.skill_name == skill_name:
+                return candidate.confidence
+        return 0.0
+
+    def _has_strong_action_signal(self, text: str) -> bool:
+        text_norm = self._normalize_match_text(text)
+        text_compact = self._compact_match_text(text)
+        if any(
+            signal in text_norm or self._compact_match_text(signal) in text_compact
+            for signal in self._CREATIVE_OR_CHAT_SIGNALS
+        ):
+            return False
+        return any(
+            signal in text_norm or self._compact_match_text(signal) in text_compact
+            for signal in self._STRONG_ACTION_SIGNALS
+        )
+
+    def _normalize_match_text(self, text: str) -> str:
+        return str(text or "").lower().strip()
+
+    def _compact_match_text(self, text: str) -> str:
+        return re.sub(r"\s+", "", self._normalize_match_text(text))
+
+    def _safe_skill_name(self, skill: Any) -> str:
+        name = getattr(skill, "name", "")
+        return name if isinstance(name, str) else ""
+
+    def _safe_string_list(self, value: Any) -> list[str]:
+        if not isinstance(value, (list, tuple, set)):
+            return []
+        return [str(item).strip() for item in value if str(item).strip()]
 
     def _build_skill_catalog(self, skills: list) -> str:
         """构建 Skill 清单摘要"""
