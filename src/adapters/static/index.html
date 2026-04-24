@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>浣熊 · Project Raccoon</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github-dark.min.css">
-<link rel="stylesheet" href="/static/style.css?v=0.3.1c">
+<link rel="stylesheet" href="/static/style.css?v=0.3.2.1">
 <script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/core.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/languages/python.min.js"></script>
@@ -190,8 +190,8 @@
       <!-- 右侧内容区 -->
       <div class="market-main">
         <div class="market-tabs">
-          <button class="market-tab active" data-tab="disabled" onclick="switchMarketTab('disabled')">未启用</button>
-          <button class="market-tab" data-tab="enabled" onclick="switchMarketTab('enabled')">已启用</button>
+          <button class="market-tab active" data-tab="not_installed" onclick="switchMarketTab('not_installed')">未安装</button>
+          <button class="market-tab" data-tab="installed" onclick="switchMarketTab('installed')">已安装</button>
           <button class="market-tab" data-tab="ranking" onclick="switchMarketTab('ranking')">🏆 排行榜</button>
         </div>
         <div class="market-content" id="market-content">
@@ -270,6 +270,6 @@
   </div>
 </div>
 
-<script src="/static/app.js?v=0.3.1c"></script>
+<script src="/static/app.js?v=0.3.2.1"></script>
 </body>
 </html>

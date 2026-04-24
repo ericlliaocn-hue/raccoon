@@ -467,6 +467,34 @@ body {
 }
 .sk-star.on { color: #facc15; }
 .sk-star:hover { color: #facc15; transform: scale(1.2); }
+
+/* Install button */
+.sk-install {
+  background: var(--accent); color: #fff; border: none; cursor: pointer;
+  font-size: 11px; padding: 3px 10px; border-radius: 10px;
+  transition: all var(--tr); white-space: nowrap;
+}
+.sk-install:hover { filter: brightness(1.1); }
+.sk-install:disabled { opacity: .6; cursor: wait; }
+
+/* Uninstall button */
+.sk-uninstall {
+  background: none; border: none; cursor: pointer;
+  font-size: 13px; color: var(--t3); transition: all var(--tr);
+  padding: 2px 4px;
+}
+.sk-uninstall:hover { color: #ef4444; }
+
+/* Outdated badge */
+.sk-badge.outdated {
+  background: #f59e0b; color: #fff; font-size: 10px;
+  padding: 1px 6px; border-radius: 8px; margin-left: 4px;
+}
+
+/* Installed card subtle border */
+.market-skill-card.installed {
+  border-left: 3px solid var(--ok);
+}
 .market-skill-name {
   font-weight: 600;
   font-size: 13px;

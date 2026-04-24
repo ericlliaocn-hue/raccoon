@@ -136,6 +136,15 @@ function handleSSE(ev) {
     const status = ev.payload?.status || '';
     if (status === 'completed') addMsg('system', '✅ 流程已完成');
     else if (status === 'cancelled') addMsg('system', '🚫 流程已取消');
+  } else if (ev.event === 'skill_installing') {
+    addMsg('system', `📥 正在安装技能: ${ev.payload?.name || ''}`);
+  } else if (ev.event === 'skill_installed') {
+    addMsg('system', `✅ 技能「${ev.payload?.name || ''}」安装成功 (v${ev.payload?.version || ''})`);
+    loadSkills();
+    loadMarketSkills();
+  } else if (ev.event === 'skill_install_failed') {
+    addMsg('system', `❌ 技能安装失败: ${ev.payload?.name || ''} - ${ev.payload?.error || ''}`);
+    loadMarketSkills();
   }
 
   loadTasks();
@@ -534,7 +543,7 @@ async function toggleSkill(name, currentEnabled) {
 // ─── Skill Market Modal ──────────────────────────────────
 // ═════════════════════════════════════════════════════════
 
-let marketTab = 'disabled';  // 'disabled' | 'enabled' | 'ranking'
+let marketTab = 'not_installed';  // 'not_installed' | 'installed' | 'ranking'
 let marketCat = 'all';       // 'all' | 'builtin' | 'essential' | ...
 let marketSkillsCache = [];   // 缓存技能列表
 
@@ -596,11 +605,12 @@ function switchMarketCat(cat) {
 
 async function loadMarketSkills() {
   try {
-    const res = await fetch('/skills');
+    // 从市场 API 获取（包含远程索引 + 已安装状态）
+    const res = await fetch('/market');
     const skills = await res.json();
     marketSkillsCache = skills.map(s => ({
       ...s,
-      category: getSkillCategory(s),
+      category: s.category || getSkillCategory(s),
       rankScore: RANKING_WEIGHTS[s.name] || 10,
     }));
 
@@ -629,10 +639,10 @@ function renderMarketContent() {
   }
 
   // Tab 过滤
-  if (marketTab === 'disabled') {
-    skills = skills.filter(s => !s.enabled);
-  } else if (marketTab === 'enabled') {
-    skills = skills.filter(s => s.enabled);
+  if (marketTab === 'not_installed') {
+    skills = skills.filter(s => !s.installed);
+  } else if (marketTab === 'installed') {
+    skills = skills.filter(s => s.installed);
   }
   if (marketTab === 'ranking') {
     skills.sort((a, b) => b.rankScore - a.rankScore);
@@ -641,8 +651,8 @@ function renderMarketContent() {
   if (!skills.length) {
     empty.style.display = '';
     const msgs = {
-      disabled: '<div class="empty-icon">✅</div><div>该分类下所有技能均已启用</div>',
-      enabled:  '<div class="empty-icon">📦</div><div>该分类下暂无已启用技能</div>',
+      not_installed: '<div class="empty-icon">✅</div><div>所有技能均已安装</div>',
+      installed:  '<div class="empty-icon">📦</div><div>该分类下暂无已安装技能</div>',
       ranking:  '<div class="empty-icon">🏆</div><div>暂无排行数据</div>',
     };
     empty.innerHTML = msgs[marketTab] || '<div class="empty-icon">📦</div><div>暂无技能</div>';
@@ -665,16 +675,28 @@ function renderMarketSkillCard(s) {
   const riskBadge = s.risk_level && s.risk_level !== 'low'
     ? `<span class="sk-risk ${s.risk_level}">${s.risk_level === 'medium' ? '⚠️' : '🔴'} ${s.risk_level}</span>` : '';
   const interBadge = s.interactive ? '<span class="sk-badge interactive">交互式</span>' : '';
-  const toggleClass = s.enabled ? 'sk-toggle on' : 'sk-toggle';
   const starClass = s.starred ? 'sk-star on' : 'sk-star';
 
-  return `<div class="market-skill-card${s.enabled ? ' enabled' : ''}">
+  // 操作按钮：已安装 → star + toggle + 卸载；未安装 → 安装
+  let actionsHtml;
+  if (s.installed) {
+    const toggleClass = s.enabled ? 'sk-toggle on' : 'sk-toggle';
+    actionsHtml = `
+      <button class="${starClass}" onclick="event.stopPropagation();toggleStarInMarket('${s.name}',${!!s.starred})" title="${s.starred ? '取消收藏' : '收藏'}">★</button>
+      <button class="${toggleClass}" onclick="event.stopPropagation();toggleSkillInMarket('${s.name}',${s.enabled})" title="${s.enabled ? '禁用' : '启用'}"><span class="sk-toggle-dot"></span></button>
+      <button class="sk-uninstall" onclick="event.stopPropagation();uninstallSkillInMarket('${s.name}')" title="卸载">🗑</button>`;
+  } else {
+    actionsHtml = `<button class="sk-install" onclick="event.stopPropagation();installSkillFromMarket('${s.name}')" title="安装">📥 安装</button>`;
+  }
+
+  const versionBadge = s.installed && s.installed_version && s.installed_version !== s.version
+    ? `<span class="sk-badge outdated">v${s.installed_version} → v${s.version}</span>`
+    : '';
+
+  return `<div class="market-skill-card${s.installed && s.enabled ? ' enabled' : ''}${s.installed ? ' installed' : ''}">
     <div class="market-skill-top">
-      <div class="market-skill-name">${s.name}<span class="market-skill-ver">v${s.version}</span><span class="market-skill-cat">${catLabel}</span>${riskBadge}${interBadge}</div>
-      <div class="market-skill-actions">
-        <button class="${starClass}" onclick="event.stopPropagation();toggleStarInMarket('${s.name}',${!!s.starred})" title="${s.starred ? '取消收藏' : '收藏'}">★</button>
-        <button class="${toggleClass}" onclick="event.stopPropagation();toggleSkillInMarket('${s.name}',${s.enabled})" title="${s.enabled ? '禁用' : '启用'}"><span class="sk-toggle-dot"></span></button>
-      </div>
+      <div class="market-skill-name">${s.name}<span class="market-skill-ver">v${s.installed ? (s.installed_version || s.version) : s.version}</span><span class="market-skill-cat">${catLabel}</span>${riskBadge}${interBadge}${versionBadge}</div>
+      <div class="market-skill-actions">${actionsHtml}</div>
     </div>
     <div class="market-skill-desc">${s.description || '无描述'}</div>
     <div class="market-skill-triggers">${(s.trigger_words || []).map(w => `<span class="ttag">${w}</span>`).join('')}</div>
@@ -687,19 +709,25 @@ function renderMarketRankCard(s, rank) {
   const rankCls = rank <= 3 ? `r${rank}` : 'rn';
   const riskBadge = s.risk_level && s.risk_level !== 'low'
     ? `<span class="sk-risk ${s.risk_level}">${s.risk_level === 'medium' ? '⚠️' : '🔴'} ${s.risk_level}</span>` : '';
-  const toggleClass = s.enabled ? 'sk-toggle on' : 'sk-toggle';
   const starClass = s.starred ? 'sk-star on' : 'sk-star';
 
-  return `<div class="market-skill-card${s.enabled ? ' enabled' : ''}">
+  let actionsHtml;
+  if (s.installed) {
+    const toggleClass = s.enabled ? 'sk-toggle on' : 'sk-toggle';
+    actionsHtml = `
+      <button class="${starClass}" onclick="event.stopPropagation();toggleStarInMarket('${s.name}',${!!s.starred})" title="${s.starred ? '取消收藏' : '收藏'}">★</button>
+      <button class="${toggleClass}" onclick="event.stopPropagation();toggleSkillInMarket('${s.name}',${s.enabled})" title="${s.enabled ? '禁用' : '启用'}"><span class="sk-toggle-dot"></span></button>`;
+  } else {
+    actionsHtml = `<button class="sk-install" onclick="event.stopPropagation();installSkillFromMarket('${s.name}')" title="安装">📥 安装</button>`;
+  }
+
+  return `<div class="market-skill-card${s.installed && s.enabled ? ' enabled' : ''}${s.installed ? ' installed' : ''}">
     <div class="market-skill-top">
       <div class="market-skill-name">
         <span class="market-rank-badge ${rankCls}">${rank}</span>
-        ${s.name}<span class="market-skill-ver">v${s.version}</span><span class="market-skill-cat">${catLabel}</span>${riskBadge}
+        ${s.name}<span class="market-skill-ver">v${s.installed ? (s.installed_version || s.version) : s.version}</span><span class="market-skill-cat">${catLabel}</span>${riskBadge}
       </div>
-      <div class="market-skill-actions">
-        <button class="${starClass}" onclick="event.stopPropagation();toggleStarInMarket('${s.name}',${!!s.starred})" title="${s.starred ? '取消收藏' : '收藏'}">★</button>
-        <button class="${toggleClass}" onclick="event.stopPropagation();toggleSkillInMarket('${s.name}',${s.enabled})" title="${s.enabled ? '禁用' : '启用'}"><span class="sk-toggle-dot"></span></button>
-      </div>
+      <div class="market-skill-actions">${actionsHtml}</div>
     </div>
     <div class="market-skill-desc">${s.description || '无描述'}</div>
     <div class="market-skill-triggers">
@@ -724,6 +752,36 @@ async function toggleStarInMarket(name, currentStarred) {
     const res = await fetch(`/skills/${name}/star`, { method: 'POST' });
     if (res.ok) {
       loadMarketSkills();  // 刷新商城弹窗
+    }
+  } catch {}
+}
+
+async function installSkillFromMarket(name) {
+  try {
+    // 立即在 UI 上显示安装中状态
+    const btn = document.querySelector(`.sk-install[onclick*="${name}"]`);
+    if (btn) { btn.disabled = true; btn.textContent = '⏳ 安装中...'; }
+    const res = await fetch(`/market/${name}/install`, { method: 'POST' });
+    const data = await res.json();
+    if (data.status === 'installed' || data.status === 'already_installed') {
+      loadSkills();        // 刷新侧边栏
+      loadMarketSkills();  // 刷新商城弹窗
+    } else {
+      if (btn) { btn.disabled = false; btn.textContent = '📥 安装'; }
+    }
+  } catch (e) {
+    const btn = document.querySelector(`.sk-install[onclick*="${name}"]`);
+    if (btn) { btn.disabled = false; btn.textContent = '📥 安装'; }
+  }
+}
+
+async function uninstallSkillInMarket(name) {
+  if (!confirm(`确定卸载技能「${name}」？`)) return;
+  try {
+    const res = await fetch(`/skills/${name}`, { method: 'DELETE' });
+    if (res.ok) {
+      loadSkills();
+      loadMarketSkills();
     }
   } catch {}
 }

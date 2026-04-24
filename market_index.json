@@ -1,0 +1,257 @@
+{
+  "version": "1.0",
+  "updated_at": "2025-04-24",
+  "skills": [
+    {
+      "name": "echo",
+      "version": "0.1.0",
+      "description": "回显用户消息的示例 Skill",
+      "trigger_words": ["echo", "回显"],
+      "intent_tags": ["utility"],
+      "category": "builtin",
+      "risk_level": "low",
+      "source": "builtin"
+    },
+    {
+      "name": "file_read",
+      "version": "1.0.0",
+      "description": "读取本地文件并通过 Web UI 发送给用户",
+      "trigger_words": ["读取文件", "看文件", "read file"],
+      "intent_tags": ["file"],
+      "category": "essential",
+      "risk_level": "low",
+      "source": "builtin"
+    },
+    {
+      "name": "file_search",
+      "version": "1.0.0",
+      "description": "搜索本地文件并推送给用户，支持按关键词、扩展名、时间范围检索",
+      "trigger_words": ["搜索文件", "找文件", "search file"],
+      "intent_tags": ["file", "search"],
+      "category": "essential",
+      "risk_level": "low",
+      "source": "builtin"
+    },
+    {
+      "name": "shell_exec",
+      "version": "1.0.0",
+      "description": "执行 Shell 命令并返回输出，支持白名单安全控制",
+      "trigger_words": ["执行命令", "运行", "shell"],
+      "intent_tags": ["system", "utility"],
+      "category": "essential",
+      "risk_level": "medium",
+      "source": "builtin"
+    },
+    {
+      "name": "web_browse",
+      "version": "1.0.0",
+      "description": "打开网页/获取网页标题和摘要",
+      "trigger_words": ["打开网页", "浏览", "browse"],
+      "intent_tags": ["web", "browse"],
+      "category": "essential",
+      "risk_level": "low",
+      "source": "builtin"
+    },
+    {
+      "name": "clipboard",
+      "version": "1.0.0",
+      "description": "读写剪贴板内容（macOS：pbcopy/pbpaste）",
+      "trigger_words": ["剪贴板", "复制", "clipboard"],
+      "intent_tags": ["clipboard", "utility"],
+      "category": "efficiency",
+      "risk_level": "low",
+      "source": "builtin"
+    },
+    {
+      "name": "screenshot",
+      "version": "1.0.0",
+      "description": "截取屏幕截图并推送给用户（macOS）",
+      "trigger_words": ["截图", "截屏", "screenshot"],
+      "intent_tags": ["screen", "capture"],
+      "category": "efficiency",
+      "risk_level": "low",
+      "source": "builtin"
+    },
+    {
+      "name": "system_info",
+      "version": "1.0.0",
+      "description": "查看系统信息：CPU/内存/磁盘/进程/网络/系统版本等",
+      "trigger_words": ["系统信息", "CPU", "内存", "system info"],
+      "intent_tags": ["system", "monitor"],
+      "category": "efficiency",
+      "risk_level": "low",
+      "source": "builtin"
+    },
+    {
+      "name": "change_detector",
+      "version": "1.0.0",
+      "description": "监控网页或文件变化，检测到变化时通知用户",
+      "trigger_words": ["监控变化", "检测变化", "change detect"],
+      "intent_tags": ["monitor", "notification"],
+      "category": "efficiency",
+      "risk_level": "low",
+      "source": "builtin"
+    },
+    {
+      "name": "file_batch",
+      "version": "1.0.0",
+      "description": "批量文件操作：重命名、压缩、格式转换、归类整理",
+      "trigger_words": ["批量", "重命名", "file batch"],
+      "intent_tags": ["filesystem", "utility"],
+      "category": "efficiency",
+      "risk_level": "low",
+      "source": "builtin"
+    },
+    {
+      "name": "file_analyze",
+      "version": "1.0.0",
+      "description": "读取文本类文件内容并分析，支持代码/配置/文档/日志等文件",
+      "trigger_words": ["分析文件", "文件分析", "analyze file"],
+      "intent_tags": ["file", "analyze"],
+      "category": "efficiency",
+      "risk_level": "low",
+      "source": "builtin"
+    },
+    {
+      "name": "36kr_hot",
+      "version": "0.1.0",
+      "description": "获取36氪热门排行榜，抓取并整理当前热门文章的标题、热度、分类等信息",
+      "trigger_words": ["36氪", "氪热点", "36kr"],
+      "intent_tags": ["learned"],
+      "category": "info",
+      "risk_level": "low",
+      "source": "builtin"
+    },
+    {
+      "name": "baidu_hot",
+      "version": "0.1.0",
+      "description": "获取百度热搜排行榜，抓取并整理当前百度热搜词条、热度及相关信息",
+      "trigger_words": ["百度热搜", "百度热点", "baidu hot"],
+      "intent_tags": ["learned"],
+      "category": "info",
+      "risk_level": "low",
+      "source": "builtin"
+    },
+    {
+      "name": "bilibili_hot",
+      "version": "0.1.0",
+      "description": "获取B站热门视频排行榜，抓取并整理当前热门视频的标题、播放量、UP主等信息",
+      "trigger_words": ["B站热门", "B站排行", "bilibili hot"],
+      "intent_tags": ["learned"],
+      "category": "info",
+      "risk_level": "low",
+      "source": "builtin"
+    },
+    {
+      "name": "weibo_hot",
+      "version": "0.2.0",
+      "description": "获取微博热门排行榜，抓取并整理当前微博热搜词条、热度及相关信息",
+      "trigger_words": ["微博热搜", "微博热点", "weibo hot"],
+      "intent_tags": ["learned", "hot_search"],
+      "category": "info",
+      "risk_level": "low",
+      "source": "builtin"
+    },
+    {
+      "name": "csdn_hot",
+      "version": "0.1.0",
+      "description": "获取CSDN热门排行榜，抓取并整理当前热门文章的标题、热度、作者等信息",
+      "trigger_words": ["CSDN热门", "CSDN排行", "csdn hot"],
+      "intent_tags": ["learned"],
+      "category": "info",
+      "risk_level": "low",
+      "source": "builtin"
+    },
+    {
+      "name": "juejin_hot",
+      "version": "0.1.0",
+      "description": "获取掘金热门排行榜，抓取并整理当前热门文章的标题、热度、作者等信息",
+      "trigger_words": ["掘金热门", "掘金排行", "juejin hot"],
+      "intent_tags": ["learned"],
+      "category": "info",
+      "risk_level": "low",
+      "source": "builtin"
+    },
+    {
+      "name": "cnblogs_hot",
+      "version": "0.1.0",
+      "description": "获取博客园热门排行榜，抓取并整理当前热门文章的标题、热度、作者等信息",
+      "trigger_words": ["博客园热门", "博客园排行", "cnblogs hot"],
+      "intent_tags": ["learned"],
+      "category": "info",
+      "risk_level": "low",
+      "source": "builtin"
+    },
+    {
+      "name": "ai_daily_report",
+      "version": "0.1.0",
+      "description": "每日定时生成并推送前一天的AI领域日报，自动抓取、总结最新资讯",
+      "trigger_words": ["AI日报", "AI简报", "ai daily"],
+      "intent_tags": ["learned"],
+      "category": "info",
+      "risk_level": "low",
+      "source": "builtin"
+    },
+    {
+      "name": "xiaohongshu_daily_report",
+      "version": "0.1.0",
+      "description": "每日定时抓取并推送前一天的小红书爆文前20榜单",
+      "trigger_words": ["小红书日报", "小红书爆文", "xiaohongshu daily"],
+      "intent_tags": ["learned"],
+      "category": "info",
+      "risk_level": "low",
+      "source": "builtin"
+    },
+    {
+      "name": "image_gen",
+      "version": "1.2.0",
+      "description": "AI 文生图：调用 QFZY API 生成图片，支持即梦/Seedream 等模型",
+      "trigger_words": ["生成图片", "画一张", "文生图"],
+      "intent_tags": ["image", "generation", "ai"],
+      "category": "creative",
+      "risk_level": "medium",
+      "interactive": true,
+      "source": "builtin"
+    },
+    {
+      "name": "git_helper",
+      "version": "1.0.0",
+      "description": "Git 操作助手：查看日志、diff 总结、分支管理",
+      "trigger_words": ["git", "代码仓库", "git log"],
+      "intent_tags": ["development", "utility"],
+      "category": "dev",
+      "risk_level": "low",
+      "source": "builtin"
+    },
+    {
+      "name": "log_watcher",
+      "version": "1.0.0",
+      "description": "日志监控：tail 日志文件，关键词匹配，异常检测",
+      "trigger_words": ["日志监控", "tail日志", "log watch"],
+      "intent_tags": ["monitor", "development"],
+      "category": "dev",
+      "risk_level": "low",
+      "source": "builtin"
+    },
+    {
+      "name": "web_automate",
+      "version": "1.0.0",
+      "description": "浏览器自动化：三种模式（headless后台 / headed前台可见 / CDP操控）",
+      "trigger_words": ["浏览器自动化", "自动操作", "web automate"],
+      "intent_tags": ["web", "automate", "browser"],
+      "category": "browser",
+      "risk_level": "medium",
+      "source": "builtin"
+    },
+    {
+      "name": "app_control",
+      "version": "1.0.0",
+      "description": "控制应用程序：打开/列出/关闭应用（macOS）",
+      "trigger_words": ["打开应用", "关闭应用", "app control"],
+      "intent_tags": ["app", "control"],
+      "category": "browser",
+      "risk_level": "low",
+      "source": "builtin"
+    }
+  ]
+}

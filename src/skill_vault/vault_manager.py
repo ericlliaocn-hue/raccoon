@@ -17,6 +17,7 @@ skills/<skill_name>/
 from __future__ import annotations
 
 import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol
 
@@ -129,10 +130,14 @@ class VaultManager:
         meta_path = self._skills_dir / name / "metadata.json"
         if not meta_path.exists():
             return
-        # 读取原始数据，只更新 enabled/starred 字段，保留其他原始格式
+        # 读取原始数据，只更新 enabled/starred/installed_from/installed_at 字段，保留其他原始格式
         data = json.loads(meta_path.read_text(encoding="utf-8"))
         data["enabled"] = meta.enabled
         data["starred"] = meta.starred
+        if meta.installed_from is not None:
+            data["installed_from"] = meta.installed_from
+        if meta.installed_at is not None:
+            data["installed_at"] = meta.installed_at
         meta_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def get_skill(self, name: str) -> SkillMetadata | None:
@@ -171,7 +176,11 @@ class VaultManager:
             with tempfile.TemporaryDirectory() as tmp_dir:
                 logger.info("cloning_skill", url=url)
                 gitpython.Repo.clone_from(url, tmp_dir, depth=1)
-                return self._install_from_local(tmp_dir)
+                meta = self._install_from_local(tmp_dir)
+                meta.installed_from = url
+                meta.installed_at = datetime.now(timezone.utc).isoformat()
+                self._persist_skill_meta(meta.name)
+                return meta
         except ImportError:
             raise RuntimeError("GitPython not installed. Run: pip install gitpython")
         except Exception as e:
@@ -219,3 +228,16 @@ class VaultManager:
 
         del self._skills[name]
         logger.info("skill_uninstalled", name=name)
+
+    async def upgrade(self, name: str) -> SkillMetadata:
+        """升级已安装的 Skill（重新从 installed_from 拉取）"""
+        meta = self._skills.get(name)
+        if not meta:
+            raise KeyError(f"Skill not found: {name}")
+        source = meta.installed_from
+        if not source or source == "builtin":
+            raise RuntimeError(f"Skill '{name}' is builtin, cannot upgrade")
+        # 卸载旧版
+        self.uninstall(name)
+        # 重新安装
+        return await self.install(source)

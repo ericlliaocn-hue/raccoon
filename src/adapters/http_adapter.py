@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import AsyncGenerator
 
@@ -85,6 +86,8 @@ class SkillInfo(APIModel):
     interactive: bool = False
     intent_tags: list[str] = []
     starred: bool = False
+    installed_from: str | None = None
+    installed_at: str | None = None
 
 
 class ScheduleCreateRequest(APIModel):
@@ -461,6 +464,8 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
                 interactive=s.interactive,
                 intent_tags=getattr(s, 'intent_tags', []) or [],
                 starred=getattr(s, 'starred', False) or False,
+                installed_from=getattr(s, 'installed_from', None),
+                installed_at=getattr(s, 'installed_at', None),
             )
             for s in skills
         ]
@@ -489,6 +494,150 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
         except KeyError:
             from fastapi.responses import JSONResponse
             return JSONResponse(status_code=404, content={"error": f"Skill '{name}' not found"})
+
+    # ─── Market API ──────────────────────────────────────────────
+
+    class MarketSkillInfo(APIModel):
+        name: str
+        version: str = "0.1.0"
+        description: str = ""
+        trigger_words: list[str] = []
+        intent_tags: list[str] = []
+        category: str = ""
+        risk_level: str = "low"
+        interactive: bool = False
+        source: str = "builtin"
+        installed: bool = False
+        installed_version: str | None = None
+
+    @app.get("/market", response_model=list[MarketSkillInfo])
+    async def list_market(category: str | None = None, q: str | None = None) -> list[MarketSkillInfo]:
+        """列出市场 Skill（合并市场索引 + 已安装状态）"""
+        import json as _json
+        market_path = Path(__file__).parent.parent.parent / "market_index.json"
+        if not market_path.exists():
+            return []
+        data = _json.loads(market_path.read_text(encoding="utf-8"))
+        skills = data.get("skills", [])
+
+        # 搜索过滤
+        if q:
+            ql = q.lower()
+            skills = [s for s in skills if ql in s.get("name", "").lower() or ql in s.get("description", "").lower()]
+
+        # 分类过滤
+        if category:
+            skills = [s for s in skills if s.get("category") == category]
+
+        # 标记已安装状态
+        installed_names = {s.name for s in vault_manager.list_skills()}
+        result = []
+        for s in skills:
+            is_installed = s["name"] in installed_names
+            installed_ver = None
+            if is_installed:
+                local = vault_manager.get_skill(s["name"])
+                if local:
+                    installed_ver = local.version
+            result.append(MarketSkillInfo(
+                name=s["name"],
+                version=s.get("version", "0.1.0"),
+                description=s.get("description", ""),
+                trigger_words=s.get("trigger_words", []),
+                intent_tags=s.get("intent_tags", []),
+                category=s.get("category", ""),
+                risk_level=s.get("risk_level", "low"),
+                interactive=s.get("interactive", False),
+                source=s.get("source", "builtin"),
+                installed=is_installed,
+                installed_version=installed_ver,
+            ))
+        return result
+
+    @app.post("/market/{name}/install")
+    async def install_skill_from_market(name: str) -> dict:
+        """从市场安装 Skill"""
+        import json as _json
+        market_path = Path(__file__).parent.parent.parent / "market_index.json"
+        if not market_path.exists():
+            raise HTTPException(status_code=404, detail="市场索引不存在")
+
+        data = _json.loads(market_path.read_text(encoding="utf-8"))
+        skill_entry = None
+        for s in data.get("skills", []):
+            if s["name"] == name:
+                skill_entry = s
+                break
+        if not skill_entry:
+            raise HTTPException(status_code=404, detail=f"市场未找到 Skill: {name}")
+
+        # 已安装则返回
+        if vault_manager.get_skill(name):
+            return {"status": "already_installed", "name": name}
+
+        # 发送安装中事件
+        await event_bus.emit(make_event(
+            EventType.SKILL_INSTALLING,
+            conversation_id="system",
+            payload={"name": name, "version": skill_entry.get("version", "0.1.0")},
+        ))
+
+        try:
+            source = skill_entry.get("source", "builtin")
+            if source and source.startswith("http"):
+                meta = await vault_manager.install(source)
+            else:
+                # builtin skill — 重新从本地 skills 目录加载
+                vault_manager._load_existing_skills()
+                meta = vault_manager.get_skill(name)
+                if meta:
+                    meta.installed_from = "builtin"
+                    meta.installed_at = datetime.now(timezone.utc).isoformat()
+                    vault_manager._persist_skill_meta(name)
+
+            # 注册路由
+            if meta and meta.enabled:
+                router.register_skill(meta)
+
+            await event_bus.emit(make_event(
+                EventType.SKILL_INSTALLED,
+                conversation_id="system",
+                payload={"name": name, "version": meta.version if meta else "unknown"},
+            ))
+
+            return {"status": "installed", "name": name, "version": meta.version if meta else "unknown"}
+        except Exception as e:
+            await event_bus.emit(make_event(
+                EventType.SKILL_INSTALL_FAILED,
+                conversation_id="system",
+                payload={"name": name, "error": str(e)},
+            ))
+            raise HTTPException(status_code=500, detail=f"安装失败: {e}")
+
+    @app.delete("/skills/{name}")
+    async def uninstall_skill(name: str) -> dict:
+        """卸载已安装的 Skill"""
+        if not vault_manager.get_skill(name):
+            raise HTTPException(status_code=404, detail=f"Skill '{name}' not found")
+        # 先取消注册路由
+        meta = vault_manager.get_skill(name)
+        if meta:
+            router.unregister_skill(meta)
+        vault_manager.uninstall(name)
+        return {"status": "uninstalled", "name": name}
+
+    @app.post("/skills/{name}/upgrade")
+    async def upgrade_skill(name: str) -> dict:
+        """升级已安装的 Skill"""
+        try:
+            meta = await vault_manager.upgrade(name)
+            if meta.enabled:
+                router.register_skill(meta)
+            return {"status": "upgraded", "name": name, "version": meta.version}
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"Skill '{name}' not found")
+        except RuntimeError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
     @app.get("/status")
     async def system_status() -> dict:

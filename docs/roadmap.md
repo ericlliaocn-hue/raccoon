@@ -1,6 +1,6 @@
 # Raccoon 产品路线图
 
-> 最后更新：2025-04-23
+> 最后更新：2025-04-24
 
 ## 版本命名规则
 
@@ -33,17 +33,17 @@
 
 ---
 
-## v0.3.2 — 「Skill 市场」：浏览、搜索、一键安装
+## v0.3.2 ✅ — 「Skill 市场」：浏览、搜索、一键安装
 
 > 目标：用户在 Web UI 里看到 Skill 目录，搜索想要的，一键安装。
 
-| # | 任务 | 说明 |
-|---|------|------|
-| 1 | 市场索引 | `market_index.json`（随项目发布或远程 CDN），含官方 Skill 元数据 |
-| 2 | 后端市场 API | `GET /market`（搜索+分类过滤）、`POST /market/{name}/install`、`DELETE /skills/{name}`、`GET /market/{name}/detail` |
-| 3 | 前端市场 UI | 侧边栏「市场」标签页，卡片式布局，搜索框 + 分类筛选，安装进度反馈 |
-| 4 | Skill 版本管理 | `metadata.json` 新增 `installed_from`/`installed_at`，支持 `vault upgrade <name>` |
-| 5 | 安装进度 SSE | 通过 SSE 推送 `skill_installing` / `skill_installed` / `skill_install_failed` |
+| # | 任务 | 说明 | 状态 |
+|---|------|------|------|
+| 1 | 市场索引 | `market_index.json`（随项目发布），含官方 25 个 Skill 元数据 | ✅ |
+| 2 | 后端市场 API | `GET /market`（搜索+分类过滤）、`POST /market/{name}/install`、`DELETE /skills/{name}`、`POST /skills/{name}/upgrade` | ✅ |
+| 3 | 前端市场 UI | 商城弹窗改为从 `/market` 加载，未安装/已安装/排行榜 Tab，安装/卸载按钮，SSE 实时反馈 | ✅ |
+| 4 | Skill 版本管理 | `metadata.json` 新增 `installed_from`/`installed_at`，`VaultManager.upgrade()` 方法 | ✅ |
+| 5 | 安装进度 SSE | `EventType` 新增 `skill_installing` / `skill_installed` / `skill_install_failed`，前端实时监听 | ✅ |
 
 ---
 
@@ -170,11 +170,11 @@
 ```
 v0.3.0 ✅ 数据获取策略层
   │
-v0.3.1 🔜 基础体验（会话稳定 + 模型自由）
+v0.3.1 ✅ 基础体验（会话稳定 + 模型自由）
   │
-v0.3.2 📋 Skill 市场
+v0.3.2 ✅ Skill 市场
   │
-v0.3.3 📋 定时+通知+审批
+v0.3.3 🔜 定时+通知+审批
   │
 v0.3.4 📋 工作流+记忆进化
   │

@@ -45,6 +45,9 @@ class EventType(str, Enum):
     SESSION_STARTED = "session_started"     # Skill 会话开始
     SESSION_STEP = "session_step"           # 会话步骤结果推送
     SESSION_ENDED = "session_ended"         # Skill 会话结束
+    SKILL_INSTALLING = "skill_installing"   # Skill 安装中
+    SKILL_INSTALLED = "skill_installed"     # Skill 安装完成
+    SKILL_INSTALL_FAILED = "skill_install_failed"  # Skill 安装失败
 
 
 # ─── Event ─────────────────────────────────────────────────────
@@ -144,6 +147,8 @@ class SkillMetadata(BaseModel):
     flow: FlowDefinition | None = None  # 流程定义（interactive=True 时必填）
     enabled: bool = True  # 是否启用（默认启用，用户可手动关闭）
     starred: bool = False  # 是否收藏
+    installed_from: str | None = None  # 安装来源（Git URL / "builtin"）
+    installed_at: str | None = None    # 安装时间（ISO 8601）
 
 
 # ─── Memory ────────────────────────────────────────────────────

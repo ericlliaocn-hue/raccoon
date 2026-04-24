@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2.1] - 2025-04-24
+
+### 🏪 Skill 市场完整实现
+
+- **市场索引**：新增 `market_index.json`，包含 25 个官方 Skill 元数据（名称、版本、描述、分类、触发词、风险等级等）
+- **后端市场 API**：
+  - `GET /market` — 列出市场 Skill，支持 `?category=` 分类过滤和 `?q=` 搜索
+  - `POST /market/{name}/install` — 从市场安装 Skill（支持 Git URL 远程安装和 builtin 本地加载）
+  - `DELETE /skills/{name}` — 卸载已安装的 Skill
+  - `POST /skills/{name}/upgrade` — 升级已安装的 Skill（从 `installed_from` 重新拉取）
+- **前端市场 UI**：
+  - 商城弹窗从 `/market` API 加载，合并市场索引与已安装状态
+  - Tab 切换改为「未安装 / 已安装 / 排行榜」
+  - 未安装 Skill 显示「📥 安装」按钮，已安装 Skill 显示启用开关 + 🗑 卸载按钮
+  - 安装中按钮显示「⏳ 安装中...」状态
+  - 版本不一致时显示升级提示 badge
+  - 已安装卡片左侧绿色边框标识
+- **Skill 版本管理**：
+  - `SkillMetadata` 新增 `installed_from`（安装来源 Git URL / "builtin"）和 `installed_at`（ISO 8601 时间戳）
+  - `VaultManager.upgrade(name)` 方法：卸载旧版 → 重新从 `installed_from` 安装
+  - Git 安装时自动记录来源和时间
+- **安装进度 SSE**：
+  - `EventType` 新增 `SKILL_INSTALLING` / `SKILL_INSTALLED` / `SKILL_INSTALL_FAILED`
+  - 前端 SSE 监听安装事件，实时显示安装状态通知
+  - 安装完成/失败自动刷新技能列表
+
 ## [0.3.2] - 2025-04-24
 
 ### 🎨 UI: 技能商城重构 + 收藏功能
