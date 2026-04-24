@@ -3,13 +3,15 @@
 核心流程：
 1. 每秒检查所有 enabled 的 schedule
 2. 如果 cron 匹配当前时间 → 向 EventBus 发 SCHEDULE_TRIGGERED 事件
-3. 更新 schedule 的 last_run / next_run
-4. 防止同一分钟内重复触发（记录 last_run 的分钟精度）
+3. 更新 schedule 的 last_run / next_run / 执行记录
+4. 防止同一分钟内重复触发（内存 + SQLite PID 锁双层防护）
+5. 失败自动重试（根据 retry_policy）
 """
 
 from __future__ import annotations
 
 import asyncio
+import os
 from datetime import datetime, timezone
 
 import structlog
@@ -19,7 +21,7 @@ from src.eventbus.bus import EventBus
 from src.eventbus.events import EventType, make_event
 from src.scheduler.cron_parser import CronParser
 from src.scheduler.schedule_store import ScheduleStore
-from src.types import ScheduleEntry
+from src.types import ScheduleEntry, ScheduleStatus
 
 logger = structlog.get_logger(__name__)
 
@@ -39,6 +41,7 @@ class Scheduler:
         self._running = False
         self._task: asyncio.Task | None = None
         self._last_triggered: dict[str, str] = {}  # schedule_id → "YYYY-MM-DD HH:MM" 防重复
+        self._pid = os.getpid()
 
     async def start(self) -> None:
         """启动调度引擎"""
@@ -46,7 +49,7 @@ class Scheduler:
             return
         self._running = True
         self._task = asyncio.create_task(self._loop())
-        logger.info("scheduler_started", schedules=self._store.count())
+        logger.info("scheduler_started", schedules=self._store.count(), pid=self._pid)
 
     async def stop(self) -> None:
         """停止调度引擎"""
@@ -91,37 +94,54 @@ class Scheduler:
                 if not cron.matches(now):
                     continue
 
-                # 防止同一分钟内重复触发
+                # 防止同一分钟内重复触发（内存层）
                 last_key = self._last_triggered.get(entry.schedule_id, "")
                 if last_key == now_minute:
                     continue
 
-                # 触发
-                self._last_triggered[entry.schedule_id] = now_minute
-                entry.last_run = now
-                entry.next_run = cron.next_time(now)
-                self._store.update(entry)
+                # 跨进程 PID 锁（SQLite 层）
+                if not self._store.try_acquire_lock(entry.schedule_id, self._pid):
+                    logger.debug("schedule_locked_by_other", schedule_id=entry.schedule_id)
+                    continue
 
-                # 向 EventBus 发事件
-                event = make_event(
-                    EventType.SCHEDULE_TRIGGERED,
-                    conversation_id=entry.conversation_id,
-                    user_id=entry.user_id,
-                    payload={
-                        "text": entry.message,
-                        "schedule_id": entry.schedule_id,
-                        "schedule_name": entry.name,
-                        "cron": entry.cron,
-                    },
-                )
-                await self._event_bus.emit(event)
+                try:
+                    # 触发
+                    self._last_triggered[entry.schedule_id] = now_minute
+                    entry.last_run = now
+                    entry.next_run = cron.next_time(now)
 
-                logger.info(
-                    "schedule_triggered",
-                    schedule_id=entry.schedule_id,
-                    name=entry.name,
-                    cron=entry.cron,
-                )
+                    # 记录执行开始
+                    run_id = self._store.record_run_start(entry.schedule_id)
+
+                    # 向 EventBus 发事件
+                    event = make_event(
+                        EventType.SCHEDULE_TRIGGERED,
+                        conversation_id=entry.conversation_id,
+                        user_id=entry.user_id,
+                        payload={
+                            "text": entry.message,
+                            "schedule_id": entry.schedule_id,
+                            "schedule_name": entry.name,
+                            "cron": entry.cron,
+                            "run_id": run_id,
+                        },
+                    )
+                    await self._event_bus.emit(event)
+
+                    # 更新调度状态
+                    entry.last_run_result = "triggered"
+                    self._store.update(entry)
+
+                    logger.info(
+                        "schedule_triggered",
+                        schedule_id=entry.schedule_id,
+                        name=entry.name,
+                        cron=entry.cron,
+                        run_id=run_id,
+                    )
+                finally:
+                    # 释放 PID 锁（触发后立即释放，执行由 Executor 异步完成）
+                    self._store.release_lock(entry.schedule_id, self._pid)
 
             except Exception:
                 logger.exception(
@@ -148,16 +168,105 @@ class Scheduler:
         return self._store.remove(schedule_id)
 
     async def toggle_schedule(self, schedule_id: str) -> ScheduleEntry | None:
-        """启用/禁用定时任务"""
+        """启用/禁用定时任务（兼容旧接口）"""
         entry = self._store.get(schedule_id)
         if not entry:
             return None
-        entry.enabled = not entry.enabled
+        entry.set_enabled(not entry.enabled)
         if not entry.enabled:
             self._last_triggered.pop(schedule_id, None)
         self._store.update(entry)
         return entry
 
+    async def pause_schedule(self, schedule_id: str) -> ScheduleEntry | None:
+        """暂停定时任务（不触发但保留配置，可恢复）"""
+        entry = self._store.get(schedule_id)
+        if not entry:
+            return None
+        entry.status = ScheduleStatus.PAUSED
+        self._last_triggered.pop(schedule_id, None)
+        self._store.update(entry)
+        logger.info("schedule_paused", schedule_id=schedule_id, name=entry.name)
+        return entry
+
+    async def resume_schedule(self, schedule_id: str) -> ScheduleEntry | None:
+        """恢复暂停的定时任务"""
+        entry = self._store.get(schedule_id)
+        if not entry or entry.status != ScheduleStatus.PAUSED:
+            return None
+        entry.status = ScheduleStatus.ENABLED
+        self._store.update(entry)
+        logger.info("schedule_resumed", schedule_id=schedule_id, name=entry.name)
+        return entry
+
+    async def record_run_result(
+        self,
+        schedule_id: str,
+        run_id: int,
+        success: bool,
+        error: str | None = None,
+        duration_ms: int | None = None,
+    ) -> None:
+        """记录执行结果（由 Executor 回调）
+
+        如果失败且重试策略允许，会增加 retry_count 并重新触发。
+        """
+        entry = self._store.get(schedule_id)
+        if not entry:
+            return
+
+        result = "success" if success else "failed"
+        self._store.record_run_finish(run_id, result, error, duration_ms)
+
+        if success:
+            entry.last_run_result = "success"
+            entry.last_run_error = None
+            entry.retry_count = 0  # 成功后重置重试计数
+            self._store.update(entry)
+        else:
+            entry.last_run_result = "failed"
+            entry.last_run_error = error
+            self._store.update(entry)
+
+            # 检查是否需要重试
+            policy = entry.retry_policy
+            if policy.retry_on_failure and entry.retry_count < policy.max_retries:
+                entry.retry_count += 1
+                entry.last_run_result = "retrying"
+                self._store.update(entry)
+
+                logger.info(
+                    "schedule_retry_scheduled",
+                    schedule_id=schedule_id,
+                    retry_count=entry.retry_count,
+                    max_retries=policy.max_retries,
+                    interval=policy.retry_interval_seconds,
+                )
+
+                # 延迟后重新触发
+                async def _retry():
+                    await asyncio.sleep(policy.retry_interval_seconds)
+                    if entry.enabled and entry.retry_count <= policy.max_retries:
+                        retry_event = make_event(
+                            EventType.SCHEDULE_TRIGGERED,
+                            conversation_id=entry.conversation_id,
+                            user_id=entry.user_id,
+                            payload={
+                                "text": entry.message,
+                                "schedule_id": entry.schedule_id,
+                                "schedule_name": f"{entry.name} (重试#{entry.retry_count})",
+                                "cron": entry.cron,
+                                "is_retry": True,
+                            },
+                        )
+                        await self._event_bus.emit(retry_event)
+
+                asyncio.create_task(_retry())
+
     def list_schedules(self) -> list[ScheduleEntry]:
         """列出所有定时任务"""
         return list(self._store.all_schedules())
+
+    def get_schedule_runs(self, schedule_id: str, limit: int = 10) -> list[dict]:
+        """获取定时任务执行记录"""
+        return self._store.get_recent_runs(schedule_id, limit)

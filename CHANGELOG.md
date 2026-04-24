@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.3] - 2025-04-24
+
+### ⏰ 定时 + 通知 + 审批
+
+> 目标：用户设一个定时任务，到点执行，结果推到手机。
+
+#### 调度器加固
+
+- **调度持久化到 SQLite**：`ScheduleStore` 从 JSON 文件迁移到 SQLite（共享 `data/memcore.db`），自动迁移旧 `schedules/` 目录到 `schedules.migrated/`
+- **ScheduleStatus 三态模型**：`ENABLED` / `PAUSED` / `DISABLED` 替代旧的 `enabled: bool`，保留 `enabled` property 兼容旧代码
+- **RetryPolicy 重试策略**：`max_retries`、`retry_interval_seconds`、`retry_on_failure`，失败后自动异步重试
+- **调度执行记录**：`schedule_runs` 表记录 triggered_at / finished_at / result / error / duration_ms
+- **跨进程 PID 锁**：`schedule_pid_lock` 表 + `os.kill(pid, 0)` 检测进程存活，防止多进程重复触发
+- **暂停/恢复 API**：`POST /schedules/{id}/pause`、`POST /schedules/{id}/resume`、`GET /schedules/{id}/runs`
+
+#### 通知网关扩展
+
+- **钉钉 Webhook 通道**：HMAC-SHA256 签名，Markdown 消息格式，高优先级 @all
+- **飞书 Webhook 通道**：HMAC-SHA256 签名，普通 Post / 高优先级交互卡片
+- **Email 通道（SMTP）**：`aiosmtplib` 异步发送，支持 HTML body
+- **通知模板系统**：5 种内置模板（default / brief / alert / approval / schedule_result），`string.Template` 渲染，支持自定义注册
+- **通知去重**：`NotificationDedup` 基于 `time.monotonic()` 的时间窗口去重，默认 5 分钟
+
+#### 审批引擎补全
+
+- **RiskAssessor 风险等级评估**：根据 `SkillMetadata.risk_level` + `permissions` 自动判定（subprocess → high, filesystem → high, network → high, requires_approval → medium）
+- **ApprovalEngine 审批引擎**：`review()` / `approve()` / `reject()` / `get_pending()`，后台超时清理循环
+- **ApprovalStatus 五态模型**：PENDING / APPROVED / REJECTED / EXPIRED / AUTO_APPROVED
+- **审批通知集成**：需要审批时通过 Notifier + NotificationTemplate 推送
+- **审批 HTTP API**：`GET /approvals/pending`、`POST /approvals/{id}/approve`、`POST /approvals/{id}/reject`、`GET /approvals/{id}`
+- **Config 新增**：`approval_timeout_seconds`（默认 300 秒）
+
+#### 测试
+
+- `test_scheduler.py`：33/33 通过（SQLite store、三态模型、重试策略、PID 锁、执行记录）
+- `test_notifier.py`：56/56 通过（7 通道、模板系统、去重机制）
+- `test_approval.py`：38/38 通过（风险评估、审批流程、通知集成、生命周期）
+
 ## [0.3.2.1] - 2025-04-24
 
 ### 🏪 Skill 市场完整实现

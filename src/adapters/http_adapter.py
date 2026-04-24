@@ -36,8 +36,9 @@ from src.scheduler.scheduler import Scheduler
 from src.scheduler.schedule_store import ScheduleStore
 from src.notifier.notifier import Notifier
 from src.skill_vault.vault_manager import VaultManager
+from src.supervisor.approval_engine import ApprovalEngine, ApprovalStatus
 from src.supervisor.audit_logger import AuditLogger
-from src.types import Event, RouteResult, RouteType, ScheduleEntry, WorkflowEntry, WorkflowStep
+from src.types import Event, RouteResult, RouteType, ScheduleEntry, ScheduleStatus, RetryPolicy, WorkflowEntry, WorkflowStep
 from src.workflow.workflow_engine import WorkflowEngine
 from src.workflow.workflow_store import WorkflowStore
 from src.gateway.inbound import GatewayInbound, GatewayAuthError, GatewayRateLimitError
@@ -96,6 +97,9 @@ class ScheduleCreateRequest(APIModel):
     message: str
     conversation_id: str | None = None
     user_id: str = "http_user"
+    max_retries: int = 3
+    retry_interval_seconds: int = 60
+    retry_on_failure: bool = True
 
 
 class ScheduleInfo(APIModel):
@@ -104,9 +108,13 @@ class ScheduleInfo(APIModel):
     cron: str
     message: str
     conversation_id: str
-    enabled: bool
+    status: str = "enabled"       # enabled / paused / disabled
+    enabled: bool = True          # 兼容旧前端
+    retry_count: int = 0
     last_run: str | None = None
     next_run: str | None = None
+    last_run_result: str | None = None
+    last_run_error: str | None = None
 
 
 # ─── App Factory ───────────────────────────────────────────────
@@ -133,6 +141,13 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
     # 通知网关
     notifier = Notifier(event_bus, config)
     notifier.initialize()
+
+    # 审批引擎
+    approval_engine = ApprovalEngine(
+        auto_approve=config.auto_approve,
+        approval_timeout_seconds=config.approval_timeout_seconds,
+        notifier=notifier,
+    )
 
     # L3 学习引擎
     llm_client = LLMFactory.create(config)
@@ -191,6 +206,7 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
     app.state.file_manager = file_manager
     app.state.scheduler = scheduler
     app.state.notifier = notifier
+    app.state.approval_engine = approval_engine
     app.state.workflow_store = workflow_store
     app.state.workflow_engine = workflow_engine
     app.state.gateway = gateway
@@ -213,10 +229,12 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
     async def startup() -> None:
         await event_bus.start()
         await scheduler.start()
+        await approval_engine.start()
         logger.info("http_server_started", port=config.http_port)
 
     @app.on_event("shutdown")
     async def shutdown() -> None:
+        await approval_engine.stop()
         await scheduler.stop()
         await event_bus.stop()
         logger.info("http_server_stopped")
@@ -966,6 +984,23 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
 
     # ─── Schedule Management ────────────────────────────────────
 
+    def _entry_to_info(e: ScheduleEntry) -> ScheduleInfo:
+        """ScheduleEntry → ScheduleInfo 辅助函数"""
+        return ScheduleInfo(
+            schedule_id=e.schedule_id,
+            name=e.name,
+            cron=e.cron,
+            message=e.message,
+            conversation_id=e.conversation_id,
+            status=e.status.value,
+            enabled=e.enabled,
+            retry_count=e.retry_count,
+            last_run=e.last_run.isoformat() if e.last_run else None,
+            next_run=e.next_run.isoformat() if e.next_run else None,
+            last_run_result=e.last_run_result,
+            last_run_error=e.last_run_error,
+        )
+
     # SCHEDULE_TRIGGERED 事件处理：定时触发时走正常 Router → Executor 流程
     async def on_schedule_triggered(event: Event) -> None:
         """定时任务触发：当作 USER_MESSAGE 处理"""
@@ -975,6 +1010,7 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
         route = await router.route(text)
         await executor.handle_route_result(route, event)
 
+        # 记录执行结果（由 Executor 回调 scheduler.record_run_result）
         audit_logger.log(
             action="schedule_triggered",
             actor="scheduler",
@@ -984,6 +1020,7 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
                 "schedule_name": event.payload.get("schedule_name"),
                 "message": text,
                 "route_type": route.route_type.value,
+                "is_retry": event.payload.get("is_retry", False),
             },
         )
 
@@ -993,19 +1030,7 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
     async def list_schedules() -> list[ScheduleInfo]:
         """列出所有定时任务"""
         entries = scheduler.list_schedules()
-        return [
-            ScheduleInfo(
-                schedule_id=e.schedule_id,
-                name=e.name,
-                cron=e.cron,
-                message=e.message,
-                conversation_id=e.conversation_id,
-                enabled=e.enabled,
-                last_run=e.last_run.isoformat() if e.last_run else None,
-                next_run=e.next_run.isoformat() if e.next_run else None,
-            )
-            for e in entries
-        ]
+        return [_entry_to_info(e) for e in entries]
 
     @app.post("/schedules", response_model=ScheduleInfo)
     async def create_schedule(req: ScheduleCreateRequest) -> ScheduleInfo:
@@ -1024,19 +1049,14 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
             message=req.message,
             conversation_id=conv_id,
             user_id=req.user_id,
+            retry_policy={
+                "max_retries": req.max_retries,
+                "retry_interval_seconds": req.retry_interval_seconds,
+                "retry_on_failure": req.retry_on_failure,
+            },
         )
         entry = await scheduler.add_schedule(entry)
-
-        return ScheduleInfo(
-            schedule_id=entry.schedule_id,
-            name=entry.name,
-            cron=entry.cron,
-            message=entry.message,
-            conversation_id=entry.conversation_id,
-            enabled=entry.enabled,
-            last_run=entry.last_run.isoformat() if entry.last_run else None,
-            next_run=entry.next_run.isoformat() if entry.next_run else None,
-        )
+        return _entry_to_info(entry)
 
     @app.delete("/schedules/{schedule_id}")
     async def delete_schedule(schedule_id: str) -> dict:
@@ -1052,16 +1072,28 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
         entry = await scheduler.toggle_schedule(schedule_id)
         if not entry:
             raise HTTPException(status_code=404, detail="定时任务不存在")
-        return ScheduleInfo(
-            schedule_id=entry.schedule_id,
-            name=entry.name,
-            cron=entry.cron,
-            message=entry.message,
-            conversation_id=entry.conversation_id,
-            enabled=entry.enabled,
-            last_run=entry.last_run.isoformat() if entry.last_run else None,
-            next_run=entry.next_run.isoformat() if entry.next_run else None,
-        )
+        return _entry_to_info(entry)
+
+    @app.post("/schedules/{schedule_id}/pause")
+    async def pause_schedule(schedule_id: str) -> ScheduleInfo:
+        """暂停定时任务"""
+        entry = await scheduler.pause_schedule(schedule_id)
+        if not entry:
+            raise HTTPException(status_code=404, detail="定时任务不存在")
+        return _entry_to_info(entry)
+
+    @app.post("/schedules/{schedule_id}/resume")
+    async def resume_schedule(schedule_id: str) -> ScheduleInfo:
+        """恢复暂停的定时任务"""
+        entry = await scheduler.resume_schedule(schedule_id)
+        if not entry:
+            raise HTTPException(status_code=404, detail="定时任务不存在或未暂停")
+        return _entry_to_info(entry)
+
+    @app.get("/schedules/{schedule_id}/runs")
+    async def get_schedule_runs(schedule_id: str, limit: int = 10) -> list[dict]:
+        """获取定时任务执行记录"""
+        return scheduler.get_schedule_runs(schedule_id, limit)
 
     # ─── Notification Management ────────────────────────────────
 
@@ -1083,6 +1115,88 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
             {"name": ch.name, "type": ch.__class__.__name__.replace("Channel", "").lower()}
             for ch in notifier.channels
         ]
+
+    # ─── Approval Management ────────────────────────────────────
+
+    class ApprovalActionRequest(APIModel):
+        reason: str = ""
+
+    @app.get("/approvals/pending")
+    async def list_pending_approvals() -> list[dict]:
+        """列出待审批条目"""
+        entries = approval_engine.get_pending()
+        return [
+            {
+                "approval_id": e.approval_id,
+                "task_id": e.task.task_id,
+                "skill_name": e.task.skill_name,
+                "risk_level": e.risk_level,
+                "status": e.status.value,
+                "created_at": e.created_at.isoformat(),
+                "remaining_seconds": e.remaining_seconds,
+                "origin_message": e.task.origin_message[:200],
+            }
+            for e in entries
+        ]
+
+    @app.post("/approvals/{approval_id}/approve")
+    async def approve_approval(approval_id: str, req: ApprovalActionRequest | None = None) -> dict:
+        """批准审批"""
+        result = await approval_engine.approve(approval_id, approver="http_user")
+        if not result and result.reason == "not_found":
+            raise HTTPException(status_code=404, detail="审批条目不存在")
+        audit_logger.log(
+            action="approval_approved",
+            actor="http_user",
+            target=approval_id,
+            detail={"reason": req.reason if req else ""},
+        )
+        return {
+            "status": result.status.value,
+            "approved": result.approved,
+            "reason": result.reason,
+            "approval_id": approval_id,
+        }
+
+    @app.post("/approvals/{approval_id}/reject")
+    async def reject_approval(approval_id: str, req: ApprovalActionRequest | None = None) -> dict:
+        """拒绝审批"""
+        reason = req.reason if req else ""
+        result = await approval_engine.reject(approval_id, reason=reason, rejector="http_user")
+        if not result and result.reason == "not_found":
+            raise HTTPException(status_code=404, detail="审批条目不存在")
+        audit_logger.log(
+            action="approval_rejected",
+            actor="http_user",
+            target=approval_id,
+            detail={"reason": reason},
+        )
+        return {
+            "status": result.status.value,
+            "approved": result.approved,
+            "reason": result.reason,
+            "approval_id": approval_id,
+        }
+
+    @app.get("/approvals/{approval_id}")
+    async def get_approval(approval_id: str) -> dict:
+        """获取审批条目详情"""
+        entry = approval_engine.get_entry(approval_id)
+        if not entry:
+            raise HTTPException(status_code=404, detail="审批条目不存在")
+        return {
+            "approval_id": entry.approval_id,
+            "task_id": entry.task.task_id,
+            "skill_name": entry.task.skill_name,
+            "risk_level": entry.risk_level,
+            "status": entry.status.value,
+            "created_at": entry.created_at.isoformat(),
+            "resolved_at": entry.resolved_at.isoformat() if entry.resolved_at else None,
+            "resolved_by": entry.resolved_by,
+            "reason": entry.reason,
+            "remaining_seconds": entry.remaining_seconds,
+            "origin_message": entry.task.origin_message[:200],
+        }
 
     # ─── Workflow Management ────────────────────────────────────
 

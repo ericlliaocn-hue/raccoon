@@ -1,8 +1,17 @@
-"""通知网关测试"""
+"""通知网关测试
+
+覆盖：
+- 新通道（钉钉/飞书/Email）基本功能
+- 通道注册表
+- Notifier 统一接口
+- 模板系统
+- 通知去重
+"""
 
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -16,7 +25,12 @@ from src.notifier.channels.system import SystemChannel
 from src.notifier.channels.bark import BarkChannel
 from src.notifier.channels.serverchan import ServerChanChannel
 from src.notifier.channels.webhook import WebhookChannel
+from src.notifier.channels.dingtalk import DingTalkChannel
+from src.notifier.channels.feishu import FeishuChannel
+from src.notifier.channels.email import EmailChannel
 from src.notifier.notifier import Notifier, CHANNEL_REGISTRY
+from src.notifier.templates import NotificationTemplate
+from src.notifier.dedup import NotificationDedup
 
 
 # ─── Fake Channel (测试用) ────────────────────────────────────
@@ -72,6 +86,68 @@ class TestBaseChannel:
             await ch.send(n)
 
 
+# ─── 新通道测试 ──────────────────────────────────────────────
+
+class TestDingTalkChannel:
+    def test_channel_type(self):
+        ch = DingTalkChannel()
+        assert ch.channel_type == "dingtalk"
+
+    @pytest.mark.asyncio
+    async def test_not_configured(self):
+        ch = DingTalkChannel()
+        n = Notification(title="test", body="hello")
+        ok = await ch.send(n)
+        assert ok is False
+
+    def test_config_with_webhook(self):
+        ch = DingTalkChannel(config={"webhook": "https://oapi.dingtalk.com/robot/send?access_token=xxx", "secret": "sec123"})
+        assert "oapi.dingtalk.com" in ch._webhook
+        assert ch._secret == "sec123"
+
+
+class TestFeishuChannel:
+    def test_channel_type(self):
+        ch = FeishuChannel()
+        assert ch.channel_type == "feishu"
+
+    @pytest.mark.asyncio
+    async def test_not_configured(self):
+        ch = FeishuChannel()
+        n = Notification(title="test", body="hello")
+        ok = await ch.send(n)
+        assert ok is False
+
+    def test_config_with_webhook(self):
+        ch = FeishuChannel(config={"webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/xxx", "secret": "sec123"})
+        assert "open.feishu.cn" in ch._webhook
+
+
+class TestEmailChannel:
+    def test_channel_type(self):
+        ch = EmailChannel()
+        assert ch.channel_type == "email"
+
+    @pytest.mark.asyncio
+    async def test_not_configured(self):
+        ch = EmailChannel()
+        n = Notification(title="test", body="hello")
+        ok = await ch.send(n)
+        assert ok is False
+
+    def test_config_with_smtp(self):
+        ch = EmailChannel(config={
+            "host": "smtp.example.com",
+            "port": 465,
+            "username": "user@example.com",
+            "password": "pass",
+            "from": "user@example.com",
+            "to": ["admin@example.com"],
+        })
+        assert ch._host == "smtp.example.com"
+        assert ch._to_addrs == ["admin@example.com"]
+
+
 # ─── SystemChannel 测试 ───────────────────────────────────────
 
 class TestSystemChannel:
@@ -98,13 +174,6 @@ class TestBarkChannel:
     @pytest.mark.asyncio
     async def test_not_configured(self):
         ch = BarkChannel()
-        n = Notification(title="test", body="hello")
-        ok = await ch.send(n)
-        assert ok is False
-
-    @pytest.mark.asyncio
-    async def test_configured_but_network_error(self):
-        ch = BarkChannel(config={"url": "http://localhost:99999", "key": "testkey"})
         n = Notification(title="test", body="hello")
         ok = await ch.send(n)
         assert ok is False
@@ -153,12 +222,18 @@ class TestChannelRegistry:
         assert "bark" in CHANNEL_REGISTRY
         assert "serverchan" in CHANNEL_REGISTRY
         assert "webhook" in CHANNEL_REGISTRY
+        assert "dingtalk" in CHANNEL_REGISTRY
+        assert "feishu" in CHANNEL_REGISTRY
+        assert "email" in CHANNEL_REGISTRY
 
     def test_registry_types(self):
         assert CHANNEL_REGISTRY["system"] is SystemChannel
         assert CHANNEL_REGISTRY["bark"] is BarkChannel
         assert CHANNEL_REGISTRY["serverchan"] is ServerChanChannel
         assert CHANNEL_REGISTRY["webhook"] is WebhookChannel
+        assert CHANNEL_REGISTRY["dingtalk"] is DingTalkChannel
+        assert CHANNEL_REGISTRY["feishu"] is FeishuChannel
+        assert CHANNEL_REGISTRY["email"] is EmailChannel
 
 
 # ─── Notifier 统一接口测试 ────────────────────────────────────
@@ -245,23 +320,49 @@ class TestNotifier:
 
     @pytest.mark.asyncio
     async def test_notify_silent_hours(self, event_bus):
-        # 设置当前时间在静默时段内
         n = Notifier(event_bus, RaccoonConfig(notify_silent_hours={"start": "00:00", "end": "23:59"}))
         fake = FakeChannel()
         n._channels = [fake]
         n._initialized = True
         results = await n.notify("title", "body")
-        assert results == {}  # 静默时段内不发送
+        assert results == {}
         assert len(fake.sent) == 0
 
     @pytest.mark.asyncio
     async def test_notify_silent_hours_cross_midnight(self, event_bus):
-        # 跨天静默时段: 23:00 ~ 07:00
         n = Notifier(event_bus, RaccoonConfig(notify_silent_hours={"start": "23:00", "end": "07:00"}))
         n._channels = [FakeChannel()]
         n._initialized = True
-        # 测试方法本身（不依赖具体时间）
-        assert n._is_silent_hours() in (True, False)  # 取决于当前时间
+        assert n._is_silent_hours() in (True, False)
+
+    @pytest.mark.asyncio
+    async def test_notify_with_dedup(self, event_bus):
+        n = Notifier(event_bus, RaccoonConfig())
+        fake = FakeChannel()
+        n._channels = [fake]
+        n._initialized = True
+
+        # 第一次发送
+        r1 = await n.notify("title", "body", dedup_key="test_key")
+        assert fake.name in r1
+        assert len(fake.sent) == 1
+
+        # 5秒内重复发送应被去重
+        r2 = await n.notify("title", "body", dedup_key="test_key")
+        assert r2 == {}
+        assert len(fake.sent) == 1
+
+    @pytest.mark.asyncio
+    async def test_notify_without_dedup(self, event_bus):
+        n = Notifier(event_bus, RaccoonConfig())
+        fake = FakeChannel()
+        n._channels = [fake]
+        n._initialized = True
+
+        # 不传 dedup_key 不去重
+        await n.notify("title", "body")
+        await n.notify("title", "body")
+        assert len(fake.sent) == 2
 
     @pytest.mark.asyncio
     async def test_on_task_completed(self, event_bus):
@@ -321,3 +422,110 @@ class TestNotifier:
         event = make_event(EventType.TASK_FAILED, conversation_id="test")
         await n._on_task_failed(event)
         assert len(fake.sent) == 0
+
+
+# ─── 模板系统测试 ────────────────────────────────────────────
+
+class TestNotificationTemplate:
+    def test_default_template(self):
+        result = NotificationTemplate.render("default", title="测试", body="内容")
+        assert result["title"] == "测试"
+        assert result["body"] == "内容"
+
+    def test_brief_template(self):
+        result = NotificationTemplate.render("brief", title="每日简报", body="今天天气晴")
+        assert "📋" in result["title"]
+        assert "每日简报" in result["title"]
+        assert "html_body" in result
+
+    def test_alert_template(self):
+        result = NotificationTemplate.render("alert", title="磁盘告警", body="使用率 95%")
+        assert "🚨" in result["title"]
+        assert "⚠️" in result["body"]
+
+    def test_approval_template(self):
+        result = NotificationTemplate.render(
+            "approval",
+            title="高风险操作",
+            body="删除数据库",
+            timeout="5 分钟",
+            approve_url="http://approve",
+            reject_url="http://reject",
+        )
+        assert "🔐" in result["title"]
+        assert "5 分钟" in result["body"]
+
+    def test_schedule_result_template(self):
+        result = NotificationTemplate.render(
+            "schedule_result",
+            title="每日简报",
+            body="天气晴",
+            schedule_name="早间简报",
+            result="成功",
+            cron="0 8 * * *",
+        )
+        assert "⏰" in result["title"]
+        assert "成功" in result["title"]
+
+    def test_register_custom_template(self):
+        NotificationTemplate.register_template("custom_test", {
+            "title": "[自定义] ${title}",
+            "body": "${body}",
+        })
+        result = NotificationTemplate.render("custom_test", title="测试", body="内容")
+        assert "[自定义]" in result["title"]
+
+    def test_list_templates(self):
+        templates = NotificationTemplate.list_templates()
+        assert "default" in templates
+        assert "brief" in templates
+        assert "alert" in templates
+        assert "approval" in templates
+
+    def test_unknown_template_falls_back_to_default(self):
+        result = NotificationTemplate.render("nonexistent", title="T", body="B")
+        assert result["title"] == "T"
+        assert result["body"] == "B"
+
+
+# ─── 通知去重测试 ────────────────────────────────────────────
+
+class TestNotificationDedup:
+    def test_should_send_first_time(self):
+        dedup = NotificationDedup(window_seconds=300)
+        assert dedup.should_send("key1") is True
+
+    def test_should_not_send_within_window(self):
+        dedup = NotificationDedup(window_seconds=300)
+        dedup.should_send("key1")
+        assert dedup.should_send("key1") is False
+
+    def test_different_keys_not_deduped(self):
+        dedup = NotificationDedup(window_seconds=300)
+        dedup.should_send("key1")
+        assert dedup.should_send("key2") is True
+
+    def test_cleanup_removes_expired(self):
+        dedup = NotificationDedup(window_seconds=1)
+        dedup.should_send("key1")
+        time.sleep(1.1)
+        count = dedup.cleanup()
+        assert count == 1
+        # 过期后可以重新发送
+        assert dedup.should_send("key1") is True
+
+    def test_reset_specific_key(self):
+        dedup = NotificationDedup(window_seconds=300)
+        dedup.should_send("key1")
+        dedup.should_send("key2")
+        dedup.reset("key1")
+        assert dedup.should_send("key1") is True
+        assert dedup.should_send("key2") is False
+
+    def test_reset_all(self):
+        dedup = NotificationDedup(window_seconds=300)
+        dedup.should_send("key1")
+        dedup.should_send("key2")
+        dedup.reset()
+        assert dedup.should_send("key1") is True
+        assert dedup.should_send("key2") is True

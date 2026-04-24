@@ -153,6 +153,18 @@ class SkillMetadata(BaseModel):
 
 # ─── Memory ────────────────────────────────────────────────────
 
+class ScheduleStatus(str, Enum):
+    """定时任务状态"""
+    ENABLED = "enabled"       # 正常运行
+    PAUSED = "paused"         # 暂停（不触发，但保留配置）
+    DISABLED = "disabled"     # 禁用
+
+class RetryPolicy(BaseModel):
+    """重试策略"""
+    max_retries: int = 3          # 最大重试次数
+    retry_interval_seconds: int = 60  # 重试间隔（秒）
+    retry_on_failure: bool = True     # 失败时是否重试
+
 class ScheduleEntry(BaseModel):
     """定时任务条目"""
     schedule_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -161,11 +173,24 @@ class ScheduleEntry(BaseModel):
     message: str                           # 触发时发送的消息文本
     conversation_id: str                   # 绑定的对话 ID
     user_id: str = "scheduler"
-    enabled: bool = True
+    status: ScheduleStatus = ScheduleStatus.ENABLED  # 替代 enabled bool
+    retry_policy: RetryPolicy = Field(default_factory=RetryPolicy)
+    retry_count: int = 0                   # 当前重试次数
     last_run: datetime | None = None
     next_run: datetime | None = None
+    last_run_result: str | None = None     # 上次执行结果：success / failed / retrying
+    last_run_error: str | None = None      # 上次执行错误信息
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    @property
+    def enabled(self) -> bool:
+        """兼容旧代码：status == ENABLED 时视为 enabled"""
+        return self.status == ScheduleStatus.ENABLED
+
+    def set_enabled(self, val: bool) -> None:
+        """兼容旧代码：设置 enabled/disabled"""
+        self.status = ScheduleStatus.ENABLED if val else ScheduleStatus.DISABLED
 
 
 class WorkflowStep(BaseModel):

@@ -36,6 +36,7 @@ class RaccoonConfig(BaseSettings):
 
     # ─── Supervisor ───
     auto_approve: bool = True  # MVP: 自动通过
+    approval_timeout_seconds: int = 300  # 审批超时（秒），默认 5 分钟
 
     # ─── Scheduler ───
     schedules_dir: Path = Field(default=PROJECT_ROOT / "schedules")
@@ -45,6 +46,7 @@ class RaccoonConfig(BaseSettings):
     notify_silent_hours: dict = Field(default_factory=dict)     # {"start": "23:00", "end": "07:00"}
     notify_on_success: bool = True
     notify_on_failure: bool = True
+    notify_dedup_window_seconds: int = 300  # 去重时间窗口（秒），默认 5 分钟
 
     # ─── Gateway ───
     gateway_token: str = ""  # 入站网关认证 Token，为空则不启用
