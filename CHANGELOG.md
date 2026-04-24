@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.3] - 2026-04-25
+
+### 🚦 版本先行落地（0.5.3 起）+ 📊 核心场景基线固化
+
+> 目标：从本版本开始，先升版本再开发；把 6 周节奏、样本包和门禁报告基线固定下来。
+
+- **版本先行规则落库**：固定版本同步清单（`pyproject.toml`、`src/__init__.py`、静态资源版本参数、页面版本文案、`CHANGELOG.md`）
+- **doctor 新增版本一致性检查**：启动诊断时会核对 package/runtime/static/changelog 的版本是否一致，避免“代码变了但版本没同步”
+- **版本一致性单测**：新增 `tests/test_version_sync.py`，在测试阶段提前拦截版本不一致
+- **核心场景基线样本包**：新增 `benchmarks/core/offline_sample_pack.json` 与 `benchmarks/core/real_task_sample_pack.json`
+- **发布报告模板**：新增 `benchmarks/core/baseline_report_template.md`，统一记录场景命中率、failure_code TopN、候选池变化
+- **路线图重排**：`docs/roadmap.md` 更新为 `0.5.3 -> 0.5.8` 周更节奏，发布门槛保持不变（首轮命中率 `>=70%`、最终成功率 `>=85%`、浏览器关键链路 `>=90%`、卡死率 `<=1%`）
+- **学习命中率补丁**：LearningEngine 新增学习前 preflight，优先复用 Scheduler、shell_exec、内容热榜 Skill 包，不再默认造新 Skill
+- **缺参数追问**：价格监控缺商品链接/SKU、登录表单缺真实 URL/字段、远程执行缺具体命令时，标记为 clarification_required 并停止生成
+- **假入口拦截**：阻止 `example.com`、`oa.internal`、`{SKU_ID}` 等占位/假地址进入生成、验证和安装
+- **生成代码清洗**：统一提取 Python 代码块，避免 LLM 把 Markdown 围栏写进 `main.py` 导致编译失败
+- **shell_exec 保护**：直接命中 `shell_exec` 但缺具体命令时先追问，不进入审批/执行链路
+
 ## [0.5.2] - 2026-04-25
 
 ### 🔧 场景补强收口 + 浏览器断点续跑

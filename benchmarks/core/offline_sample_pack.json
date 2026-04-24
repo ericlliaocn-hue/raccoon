@@ -1,0 +1,79 @@
+{
+  "pack_id": "core-offline-v1",
+  "type": "offline",
+  "generated_at": "2026-04-25T00:00:00Z",
+  "cases": [
+    {
+      "case_id": "offline-daily-001",
+      "scenario_id": "daily_brief",
+      "prompt": "帮我整理今天的 AI 资讯简报，按要点输出。",
+      "expected": "结构化摘要，包含来源说明"
+    },
+    {
+      "case_id": "offline-daily-002",
+      "scenario_id": "daily_brief",
+      "prompt": "生成一份今早技术热点快报。",
+      "expected": "结构化摘要，包含时间或日期"
+    },
+    {
+      "case_id": "offline-price-001",
+      "scenario_id": "price_monitor",
+      "prompt": "监控 iPhone 价格，有变化就提醒我。",
+      "expected": "创建或复用价格监控链路"
+    },
+    {
+      "case_id": "offline-price-002",
+      "scenario_id": "price_monitor",
+      "prompt": "帮我盯一下这款显卡的降价信息。",
+      "expected": "识别监控意图，不误判闲聊"
+    },
+    {
+      "case_id": "offline-login-001",
+      "scenario_id": "login_form_chain",
+      "prompt": "登录后台后提交这份表单，失败要能继续。",
+      "expected": "长链路动作，包含 checkpoint"
+    },
+    {
+      "case_id": "offline-login-002",
+      "scenario_id": "login_form_chain",
+      "prompt": "帮我在站点里登录后把资料填好并提交。",
+      "expected": "登录态与表单提交链路稳定"
+    },
+    {
+      "case_id": "offline-material-001",
+      "scenario_id": "material_collection",
+      "prompt": "从多个来源抓取本周 AI 海报素材并去重。",
+      "expected": "多源采集 + 去重结果"
+    },
+    {
+      "case_id": "offline-material-002",
+      "scenario_id": "material_collection",
+      "prompt": "给我采集 10 条短视频选题素材并按主题归类。",
+      "expected": "字段完整，输出可解释"
+    },
+    {
+      "case_id": "offline-reminder-001",
+      "scenario_id": "reminder_schedule",
+      "prompt": "每天早上 8 点提醒我看市场盘前信息。",
+      "expected": "创建调度并可追踪"
+    },
+    {
+      "case_id": "offline-reminder-002",
+      "scenario_id": "reminder_schedule",
+      "prompt": "每周一上午提醒我复盘上周数据。",
+      "expected": "cron 调度链路闭环"
+    },
+    {
+      "case_id": "offline-remote-001",
+      "scenario_id": "remote_exec",
+      "prompt": "帮我远程执行磁盘检查命令，先走审批。",
+      "expected": "审批后执行并返回结果"
+    },
+    {
+      "case_id": "offline-remote-002",
+      "scenario_id": "remote_exec",
+      "prompt": "执行这个脚本前先确认风险，再给我输出日志。",
+      "expected": "审批、执行、追踪完整"
+    }
+  ]
+}

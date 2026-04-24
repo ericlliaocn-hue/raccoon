@@ -154,6 +154,13 @@ raccoon logs -f         # 持续跟踪
 raccoon logs --audit    # 审计日志
 ```
 
+### 0.5.x 发布节奏与基线
+
+- 路线图：`docs/roadmap.md`（`0.5.3 -> 0.5.8` 周更）
+- 核心场景离线样本包：`benchmarks/core/offline_sample_pack.json`
+- 核心场景真实任务样本包：`benchmarks/core/real_task_sample_pack.json`
+- 发布报告模板：`benchmarks/core/baseline_report_template.md`
+
 ### 定时任务
 
 ```bash

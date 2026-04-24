@@ -149,6 +149,10 @@ class LearningEngine:
         )
 
         try:
+            preflight = await self._preflight_learning_request(task, user_message, run)
+            if preflight:
+                return preflight
+
             experience = await self._search_experience(user_message)
             if experience:
                 reused = await self._try_reuse_experience(task, user_message, run, experience)
@@ -162,8 +166,14 @@ class LearningEngine:
                     "🤔 无法分析需求，请更具体地描述你想做什么",
                     "analysis_failed",
                 )
+            blocker = await self._block_invalid_or_incomplete_plan(run, user_message, analysis)
+            if blocker:
+                return blocker
 
             analysis = await self._decide_data_strategy(analysis)
+            blocker = await self._block_invalid_or_incomplete_plan(run, user_message, analysis)
+            if blocker:
+                return blocker
             skill_name = analysis.get("skill_name", f"learned_{task.task_id[:8]}")
             run.skill_name = skill_name
             run.analysis = analysis
@@ -262,8 +272,22 @@ class LearningEngine:
                         debug_info=validation.get("debug_info"),
                     )
                     if new_analysis:
+                        blocker = await self._block_invalid_or_incomplete_plan(
+                            run,
+                            user_message,
+                            new_analysis,
+                        )
+                        if blocker:
+                            return blocker
                         replan_used = True
                         current_analysis = await self._decide_data_strategy(new_analysis)
+                        blocker = await self._block_invalid_or_incomplete_plan(
+                            run,
+                            user_message,
+                            current_analysis,
+                        )
+                        if blocker:
+                            return blocker
                         skill_name = current_analysis.get("skill_name", skill_name)
                         run.skill_name = skill_name
                         run.analysis = current_analysis
@@ -427,6 +451,277 @@ class LearningEngine:
             "skill_name": run.skill_name,
             "learning_run_id": run.run_id,
         }
+
+    async def _succeed_without_learning(
+        self,
+        run: LearningRun,
+        reply: str,
+        *,
+        skill_name: str | None = None,
+        artifacts: dict[str, Any] | None = None,
+        schedule_created: str | None = None,
+    ) -> dict[str, Any]:
+        """Mark the learning run as handled without generating a new Skill."""
+        run.skill_name = skill_name or run.skill_name
+        run.first_pass = True
+        run.final_success = True
+        run.failure_code = None
+        run.quality_score = max(run.quality_score, 0.9)
+        run.schedule_created = schedule_created
+        if artifacts:
+            run.artifacts.update(artifacts)
+        self._save_run(run, status=LearningRunStatus.SUCCEEDED, reply=reply, error=None)
+        return {
+            "reply": reply,
+            "files": [],
+            "learned": False,
+            "skill_name": run.skill_name,
+            "learning_run_id": run.run_id,
+            "schedule_created": schedule_created,
+        }
+
+    async def _preflight_learning_request(
+        self,
+        task: Task,
+        user_message: str,
+        run: LearningRun,
+    ) -> dict[str, Any] | None:
+        scenario_id = self._infer_scenario_id(run, user_message)
+        text = normalize_intent_phrase(user_message)
+
+        if scenario_id == "reminder_schedule":
+            if self._scheduler:
+                schedule_info = await self._try_create_schedule(user_message, "scheduler", task.conversation_id)
+                if schedule_info:
+                    return await self._succeed_without_learning(
+                        run,
+                        f"这个需求不需要新 Skill，已直接创建定时任务：{schedule_info}",
+                        skill_name="scheduler",
+                        artifacts={"reused_capability": "scheduler"},
+                        schedule_created=schedule_info,
+                    )
+            return await self._clarify_run(
+                run,
+                "这个是提醒/定时需求，应复用系统 Scheduler，不需要新建 Skill。请补充提醒内容和时间，例如「每个工作日 09:30 提醒我检查客户回复」。",
+                reason="scheduler_unavailable_or_incomplete",
+                capability="scheduler",
+            )
+
+        if scenario_id == "daily_brief" and self._available_content_skills():
+            return await self._succeed_without_learning(
+                run,
+                "这个简报需求优先复用已有日报/热榜 Skill，再由对话层汇总，不直接新造爬虫 Skill。",
+                skill_name="content_skill_bundle",
+                artifacts={
+                    "reused_capability": "skill_bundle",
+                    "skills": self._available_content_skills(),
+                },
+            )
+
+        if scenario_id == "remote_exec":
+            if self._has_concrete_shell_command(user_message):
+                return await self._succeed_without_learning(
+                    run,
+                    "这个需求应复用已有高风险技能「shell_exec」并走审批，不需要新建 Skill。请直接发送具体命令，例如「执行 du -sh ~/Downloads」。",
+                    skill_name="shell_exec",
+                    artifacts={"reused_capability": "shell_exec", "requires_approval": True},
+                )
+            return await self._clarify_run(
+                run,
+                "要执行命令/脚本前，需要先给出具体命令或脚本路径。我不会根据「磁盘检查」「日志归档」这类描述自行编命令。",
+                reason="missing_shell_command",
+                capability="shell_exec",
+            )
+
+        if scenario_id == "price_monitor" and not self._has_monitor_target(user_message):
+            return await self._clarify_run(
+                run,
+                "价格监控需要商品链接、SKU 或明确平台+商品标识。请补充目标，例如「监控 https://... 降到 4299 提醒我」。",
+                reason="missing_price_target",
+                capability="change_detector",
+            )
+
+        if scenario_id == "login_form_chain" and not self._has_form_target(user_message):
+            return await self._clarify_run(
+                run,
+                "登录/表单长链路需要真实网址、登录方式和要填写的字段。我不会生成 oa.example.com 这类假入口。",
+                reason="missing_form_target",
+                capability="web_automate",
+            )
+
+        if scenario_id == "material_collection" and self._can_reuse_content_skills(user_message):
+            return await self._succeed_without_learning(
+                run,
+                "这个素材采集需求优先复用已有热榜/日报类 Skill，再汇总去重；当前不直接生成新爬虫 Skill，避免被动态站点和反爬拖垮。",
+                skill_name="content_skill_bundle",
+                artifacts={
+                    "reused_capability": "skill_bundle",
+                    "skills": self._available_content_skills(),
+                },
+            )
+
+        if "example.com" in text or "oa.internal" in text:
+            return await self._clarify_run(
+                run,
+                "检测到占位或内部示例地址。请提供真实可访问地址后再继续，我不会把假入口写进 Skill。",
+                reason="placeholder_endpoint",
+            )
+
+        return None
+
+    async def _block_invalid_or_incomplete_plan(
+        self,
+        run: LearningRun,
+        user_message: str,
+        analysis: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if self._analysis_has_fake_endpoint(analysis):
+            return await self._clarify_run(
+                run,
+                "学习方案里出现了占位地址、假 API 或模板变量。请提供真实 URL、SKU、账号流程或脚本路径后再继续。",
+                reason="placeholder_endpoint",
+                analysis=analysis,
+            )
+
+        scenario_id = self._infer_scenario_id(run, user_message)
+        if scenario_id == "price_monitor" and not self._has_monitor_target(user_message):
+            return await self._clarify_run(
+                run,
+                "价格监控缺少商品链接/SKU，当前只做追问，不生成不可执行的监控 Skill。",
+                reason="missing_price_target",
+                analysis=analysis,
+            )
+        if scenario_id == "login_form_chain" and not self._has_form_target(user_message):
+            return await self._clarify_run(
+                run,
+                "登录表单链路缺少真实网址、账号状态和表单字段，当前只做追问，不生成占位自动化 Skill。",
+                reason="missing_form_target",
+                analysis=analysis,
+            )
+        if scenario_id == "remote_exec" and not self._has_concrete_shell_command(user_message):
+            return await self._clarify_run(
+                run,
+                "远程/命令执行缺少具体命令或脚本路径，当前只做追问，不生成审批系统占位 Skill。",
+                reason="missing_shell_command",
+                analysis=analysis,
+            )
+        return None
+
+    async def _clarify_run(
+        self,
+        run: LearningRun,
+        reply: str,
+        *,
+        reason: str,
+        capability: str | None = None,
+        analysis: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        artifacts = {
+            "clarification_required": True,
+            "reason": reason,
+        }
+        if capability:
+            artifacts["reused_capability"] = capability
+        if analysis:
+            artifacts["blocked_analysis"] = analysis
+            run.analysis = analysis
+        return await self._succeed_without_learning(
+            run,
+            f"需要补充信息：{reply}",
+            skill_name=capability,
+            artifacts=artifacts,
+        )
+
+    def _infer_scenario_id(self, run: LearningRun, user_message: str) -> str | None:
+        scenario_id = run.scenario_id or detect_core_scenario_id(user_message)
+        text = normalize_intent_phrase(user_message)
+        if any(token in text for token in ("价格", "降到", "降价", "商品", "库存")) and any(
+            token in text for token in ("监控", "盯", "提醒", "通知")
+        ):
+            scenario_id = "price_monitor"
+        elif any(token in text for token in ("登录", "表单", "提交", "oa", "后台")):
+            scenario_id = "login_form_chain"
+        elif any(token in text for token in ("执行", "命令", "脚本", "shell", "审批")):
+            scenario_id = "remote_exec"
+        elif any(token in text for token in ("素材", "爆款", "热搜", "热门", "采集", "去重")):
+            scenario_id = "material_collection"
+        elif any(token in text for token in ("提醒", "每天", "每周", "每个工作日", "定时")):
+            scenario_id = "reminder_schedule"
+        if scenario_id and run.scenario_id != scenario_id:
+            run.scenario_id = scenario_id
+            self._save_run(run)
+        return scenario_id
+
+    def _has_monitor_target(self, text: str) -> bool:
+        value = str(text or "")
+        if re.search(r"https?://|sku\s*[:：=]?\s*\w+|\b\d{6,}\b", value, re.IGNORECASE):
+            return True
+        if any(platform in value.lower() for platform in ("jd.com", "taobao", "tmall", "amazon", "pdd")):
+            return True
+        return False
+
+    def _has_form_target(self, text: str) -> bool:
+        value = str(text or "").lower()
+        if re.search(r"https?://", value):
+            return True
+        if any(token in value for token in ("oa.example", "example.com", "oa.internal")):
+            return False
+        return False
+
+    def _has_concrete_shell_command(self, text: str) -> bool:
+        value = str(text or "").strip()
+        concrete_patterns = (
+            r"\b(ls|pwd|df|du|cat|tail|grep|find|python|python3|bash|sh|git|npm|pnpm|uv|pytest|ruff)\b",
+            r"\.sh\b",
+            r"/[\w./-]+",
+            r"`[^`]+`",
+        )
+        return any(re.search(pattern, value, re.IGNORECASE) for pattern in concrete_patterns)
+
+    def _can_reuse_content_skills(self, text: str) -> bool:
+        value = normalize_intent_phrase(text)
+        if not any(token in value for token in ("素材", "爆款", "热门", "热搜", "日报", "采集")):
+            return False
+        return bool(self._available_content_skills())
+
+    def _available_content_skills(self) -> list[str]:
+        if not self._vault:
+            return []
+        preferred = {
+            "weibo_hot",
+            "bilibili_hot",
+            "baidu_hot",
+            "36kr_hot",
+            "ai_daily_report",
+            "xiaohongshu_daily_report",
+            "juejin_hot",
+            "csdn_hot",
+            "cnblogs_hot",
+        }
+        return sorted(
+            skill.name
+            for skill in self._vault.list_skills()
+            if getattr(skill, "name", "") in preferred
+        )
+
+    def _analysis_has_fake_endpoint(self, analysis: dict[str, Any]) -> bool:
+        haystack = json.dumps(analysis, ensure_ascii=False).lower()
+        fake_tokens = (
+            "example.com",
+            "oa.internal",
+            "internal.company",
+            "internal.corp",
+            "your_",
+            "todo",
+            "{sku_id}",
+            "{sku}",
+            "{商品",
+            "<url",
+            "<your",
+            "替换为",
+            "示例",
+        )
+        return any(token in haystack for token in fake_tokens)
 
     def _prepare_stage_dir(self, run_id: str, skill_name: str) -> Path:
         safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", skill_name or "learned_skill").strip("_") or "learned_skill"
@@ -1485,17 +1780,27 @@ Skill 名称：{skill_name}
                 max_tokens=2000,
             )
             text = response if isinstance(response, str) else str(response)
-            # 提取代码块
-            match = re.search(r"```python\s*\n([\s\S]*?)```", text)
-            if match:
-                return match.group(1).strip()
-            # 尝试直接作为代码
-            if "def main" in text:
-                return text.strip()
+            code = self._extract_python_code(text)
+            if code:
+                return code
         except Exception as e:
             logger.warning("skill_generation_failed", error=str(e))
 
         return self._template_skill(analysis)
+
+    @staticmethod
+    def _extract_python_code(text: str) -> str | None:
+        value = str(text or "").strip()
+        if not value:
+            return None
+        match = re.search(r"```(?:python|py)?\s*\n([\s\S]*?)```", value, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+        value = re.sub(r"^```(?:python|py)?\s*", "", value, flags=re.IGNORECASE).strip()
+        value = re.sub(r"\s*```$", "", value).strip()
+        if "def main" in value or "if __name__" in value or value.startswith("import "):
+            return value
+        return None
 
     def _template_skill(self, analysis: dict) -> str:
         """基于模板生成简单 Skill 代码"""
@@ -1805,11 +2110,9 @@ Skill 名称：{skill_name}
                 max_tokens=2000,
             )
             text = response if isinstance(response, str) else str(response)
-            match = re.search(r"```python\s*\n([\s\S]*?)```", text)
-            if match:
-                return match.group(1).strip()
-            if "def main" in text or "import " in text:
-                return text.strip()
+            code = self._extract_python_code(text)
+            if code:
+                return code
         except Exception as e:
             logger.warning("skill_repair_llm_failed", error=str(e))
 

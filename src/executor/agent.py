@@ -216,6 +216,14 @@ class Executor:
         if not skill_name:
             return "错误：路由结果缺少 skill_name"
 
+        if skill_name == "shell_exec" and not self._has_concrete_shell_command(
+            event.payload.get("text", "")
+        ):
+            return (
+                "需要补充具体命令或脚本路径，我不会根据模糊描述自行编命令。\n\n"
+                "例如：`执行 df -h`、`执行 du -sh ~/Downloads`、`执行 bash /path/to/archive.sh`。"
+            )
+
         # 检查是否为 interactive Skill → 走 FlowEngine
         skill_meta = self._vault_manager.get_skill(skill_name)
         if skill_meta and skill_meta.interactive and skill_meta.flow:
@@ -876,6 +884,16 @@ confidence 是 0.0-1.0 的小数；只有非常确定时才高于 0.7。"""
             signal in text_norm or self._compact_match_text(signal) in text_compact
             for signal in self._STRONG_ACTION_SIGNALS
         )
+
+    def _has_concrete_shell_command(self, text: str) -> bool:
+        value = str(text or "").strip()
+        concrete_patterns = (
+            r"\b(ls|pwd|df|du|cat|tail|grep|find|python|python3|bash|sh|git|npm|pnpm|uv|pytest|ruff)\b",
+            r"\.sh\b",
+            r"/[\w./-]+",
+            r"`[^`]+`",
+        )
+        return any(re.search(pattern, value, re.IGNORECASE) for pattern in concrete_patterns)
 
     def _normalize_match_text(self, text: str) -> str:
         return normalize_intent_phrase(text)

@@ -1,0 +1,79 @@
+{
+  "pack_id": "core-real-task-v1",
+  "type": "real_task",
+  "generated_at": "2026-04-25T00:00:00Z",
+  "cases": [
+    {
+      "case_id": "real-daily-001",
+      "scenario_id": "daily_brief",
+      "prompt": "今天开盘前帮我做个 AI+半导体双主题简报。",
+      "session_hint": "weekday_morning"
+    },
+    {
+      "case_id": "real-daily-002",
+      "scenario_id": "daily_brief",
+      "prompt": "把今天最重要的 5 条技术新闻整理给我。",
+      "session_hint": "weekday_evening"
+    },
+    {
+      "case_id": "real-price-001",
+      "scenario_id": "price_monitor",
+      "prompt": "帮我持续盯这个商品，降到 4299 直接提醒。",
+      "session_hint": "ecommerce"
+    },
+    {
+      "case_id": "real-price-002",
+      "scenario_id": "price_monitor",
+      "prompt": "监控这款显示器库存恢复并通知我。",
+      "session_hint": "ecommerce"
+    },
+    {
+      "case_id": "real-login-001",
+      "scenario_id": "login_form_chain",
+      "prompt": "登录 OA 后提交流程单，中断了就从上一步继续。",
+      "session_hint": "form_workflow"
+    },
+    {
+      "case_id": "real-login-002",
+      "scenario_id": "login_form_chain",
+      "prompt": "打开后台，登录并上传文件后完成提交。",
+      "session_hint": "form_workflow"
+    },
+    {
+      "case_id": "real-material-001",
+      "scenario_id": "material_collection",
+      "prompt": "收集本周爆款内容素材，按平台去重后输出。",
+      "session_hint": "content_ops"
+    },
+    {
+      "case_id": "real-material-002",
+      "scenario_id": "material_collection",
+      "prompt": "抓 20 条 AIGC 相关热点案例并标注来源。",
+      "session_hint": "content_ops"
+    },
+    {
+      "case_id": "real-reminder-001",
+      "scenario_id": "reminder_schedule",
+      "prompt": "每个工作日 09:30 提醒我检查客户回复。",
+      "session_hint": "ops_schedule"
+    },
+    {
+      "case_id": "real-reminder-002",
+      "scenario_id": "reminder_schedule",
+      "prompt": "每周五下午提醒我汇总本周学习失败案例。",
+      "session_hint": "ops_schedule"
+    },
+    {
+      "case_id": "real-remote-001",
+      "scenario_id": "remote_exec",
+      "prompt": "先审批，再帮我执行日志归档脚本。",
+      "session_hint": "safe_exec"
+    },
+    {
+      "case_id": "real-remote-002",
+      "scenario_id": "remote_exec",
+      "prompt": "执行这个 shell 任务并把结果发我，风险高要确认。",
+      "session_hint": "safe_exec"
+    }
+  ]
+}

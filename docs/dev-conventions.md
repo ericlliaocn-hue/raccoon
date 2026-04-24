@@ -4,6 +4,7 @@
 
 1. **每次大改动必须先做真实集成测试**，通过后才算完成
 2. **不自动 git commit/push**，等用户明确要求
+3. **版本先行（0.5.3 起）**：每轮先同步版本号（`pyproject.toml`、`src/__init__.py`、`static/index.html`、`CHANGELOG.md`），再开始功能开发
 
 ## 大改动集成测试规范
 

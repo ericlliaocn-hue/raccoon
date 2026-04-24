@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -14,7 +15,7 @@ from src.config import RaccoonConfig
 from src.eventbus.events import EventType
 from src.executor.agent import Executor, SkillCandidate
 from src.memcore.writer import MemCoreWriter
-from src.types import Event, LearningRun, LearningRunStatus, Task
+from src.types import Event, LearningRun, LearningRunStatus, RouteResult, RouteType, Task
 
 
 def _make_config(tmp_path: Path) -> RaccoonConfig:
@@ -158,3 +159,116 @@ async def test_try_existing_skill_before_learning_reuses_candidate():
     assert reply is not None
     assert "复用已有技能" in reply
     executor._handle_skill.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_learning_preflight_price_monitor_requires_target(tmp_path: Path):
+    config = _make_config(tmp_path)
+    store = LearningRunStore(config)
+    engine = LearningEngine(config=config, learning_store=store)
+
+    result = await engine.learn(
+        Task(
+            conversation_id="c1",
+            user_id="u1",
+            origin_message="帮我持续盯这个商品，降到 4299 直接提醒。",
+            skill_name="learning",
+        ),
+        "帮我持续盯这个商品，降到 4299 直接提醒。",
+    )
+
+    run = store.get(result["learning_run_id"])
+    assert run is not None
+    assert run.status == LearningRunStatus.SUCCEEDED
+    assert run.final_success is True
+    assert run.artifacts["clarification_required"] is True
+    assert run.artifacts["reason"] == "missing_price_target"
+    assert "商品链接" in result["reply"]
+
+
+@pytest.mark.asyncio
+async def test_learning_preflight_remote_exec_requires_concrete_command(tmp_path: Path):
+    config = _make_config(tmp_path)
+    store = LearningRunStore(config)
+    engine = LearningEngine(config=config, learning_store=store)
+
+    result = await engine.learn(
+        Task(
+            conversation_id="c1",
+            user_id="u1",
+            origin_message="先审批，再帮我执行日志归档脚本。",
+            skill_name="learning",
+        ),
+        "先审批，再帮我执行日志归档脚本。",
+    )
+
+    run = store.get(result["learning_run_id"])
+    assert run is not None
+    assert run.status == LearningRunStatus.SUCCEEDED
+    assert run.final_success is True
+    assert run.artifacts["reason"] == "missing_shell_command"
+    assert result["skill_name"] == "shell_exec"
+
+
+@pytest.mark.asyncio
+async def test_learning_preflight_reuses_content_skill_bundle(tmp_path: Path):
+    config = _make_config(tmp_path)
+    store = LearningRunStore(config)
+    vault = MagicMock()
+    vault.list_skills.return_value = [
+        SimpleNamespace(name="weibo_hot"),
+        SimpleNamespace(name="bilibili_hot"),
+        SimpleNamespace(name="ai_daily_report"),
+    ]
+    engine = LearningEngine(config=config, vault_manager=vault, learning_store=store)
+
+    result = await engine.learn(
+        Task(
+            conversation_id="c1",
+            user_id="u1",
+            origin_message="收集本周爆款内容素材，按平台去重后输出。",
+            skill_name="learning",
+        ),
+        "收集本周爆款内容素材，按平台去重后输出。",
+    )
+
+    run = store.get(result["learning_run_id"])
+    assert run is not None
+    assert run.status == LearningRunStatus.SUCCEEDED
+    assert run.final_success is True
+    assert run.artifacts["reused_capability"] == "skill_bundle"
+    assert "weibo_hot" in run.artifacts["skills"]
+
+
+def test_learning_blocks_fake_endpoint_and_extracts_fenced_code(tmp_path: Path):
+    engine = LearningEngine(config=_make_config(tmp_path))
+    assert engine._analysis_has_fake_endpoint(
+        {"data_sources": [{"url": "https://oa.example.com/api/flow/submit"}]}
+    )
+
+    code = LearningEngine._extract_python_code(
+        "这里是代码：\n```python\nimport json\n\ndef main():\n    pass\n```"
+    )
+    assert code is not None
+    assert code.startswith("import json")
+    assert "```" not in code
+
+
+@pytest.mark.asyncio
+async def test_shell_exec_requires_concrete_command_before_approval():
+    executor = Executor.__new__(Executor)
+    executor._vault_manager = MagicMock()
+    executor._vault_manager.get_skill = MagicMock(return_value=MagicMock(interactive=False, flow=None))
+
+    reply = await Executor._handle_skill(
+        executor,
+        RouteResult(route_type=RouteType.SKILL, skill_name="shell_exec"),
+        Event(
+            event=EventType.USER_MESSAGE,
+            conversation_id="c1",
+            user_id="u1",
+            payload={"text": "先审批，再帮我执行日志归档脚本。"},
+        ),
+    )
+
+    assert "具体命令" in reply

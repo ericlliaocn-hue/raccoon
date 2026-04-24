@@ -21,8 +21,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 # 确保项目根目录在 sys.path
@@ -408,6 +410,16 @@ def _cmd_doctor() -> None:
     else:
         print("  ⚠️  config.json 不存在（将使用默认配置）")
 
+    # 3.5 版本同步检查
+    version_sync = _collect_version_sync_state()
+    if version_sync["ok"]:
+        print(f"  ✅ 版本同步一致 ({version_sync['version']})")
+    else:
+        print("  ❌ 版本同步不一致")
+        for detail in version_sync["details"]:
+            print(f"     - {detail}")
+        issues.append("版本号未同步")
+
     # 4. Skills 目录
     skills_dir = PROJECT_ROOT / "skills"
     if skills_dir.exists():
@@ -694,6 +706,61 @@ def _cmd_schedule(args) -> None:
 # ═══════════════════════════════════════════════════════════════
 # 辅助函数
 # ═══════════════════════════════════════════════════════════════
+
+
+def _first_match(text: str, pattern: str) -> str:
+    match = re.search(pattern, text, flags=re.MULTILINE)
+    return match.group(1).strip() if match else ""
+
+
+def _collect_version_sync_state() -> dict[str, object]:
+    versions: dict[str, str] = {}
+    details: list[str] = []
+
+    pyproject_path = PROJECT_ROOT / "pyproject.toml"
+    init_path = PROJECT_ROOT / "src" / "__init__.py"
+    index_path = PROJECT_ROOT / "src" / "adapters" / "static" / "index.html"
+    changelog_path = PROJECT_ROOT / "CHANGELOG.md"
+
+    try:
+        with pyproject_path.open("rb") as f:
+            data = tomllib.load(f)
+        versions["pyproject"] = str(data.get("project", {}).get("version", "")).strip()
+    except Exception as e:
+        details.append(f"读取 pyproject.toml 失败: {e}")
+
+    try:
+        text = init_path.read_text(encoding="utf-8")
+        versions["src_init"] = _first_match(text, r'__version__\s*=\s*"([^"]+)"')
+    except Exception as e:
+        details.append(f"读取 src/__init__.py 失败: {e}")
+
+    try:
+        text = index_path.read_text(encoding="utf-8")
+        versions["static_css"] = _first_match(text, r"/static/style\.css\?v=([0-9A-Za-z_.-]+)")
+        versions["static_js"] = _first_match(text, r"/static/app\.js\?v=([0-9A-Za-z_.-]+)")
+        versions["ui_badge"] = _first_match(text, r"Project Raccoon v([0-9A-Za-z_.-]+)")
+    except Exception as e:
+        details.append(f"读取 static/index.html 失败: {e}")
+
+    try:
+        text = changelog_path.read_text(encoding="utf-8")
+        versions["changelog_latest"] = _first_match(text, r"^## \[([^\]]+)\] - ")
+    except Exception as e:
+        details.append(f"读取 CHANGELOG.md 失败: {e}")
+
+    missing = [name for name, value in versions.items() if not value]
+    if missing:
+        details.append(f"缺少版本值: {', '.join(missing)}")
+
+    unique_versions = sorted({value for value in versions.values() if value})
+    if len(unique_versions) > 1:
+        ordered = ", ".join(f"{name}={value}" for name, value in versions.items())
+        details.append(f"检测到多个版本值: {ordered}")
+
+    version = unique_versions[0] if len(unique_versions) == 1 else "unknown"
+    return {"ok": not details, "version": version, "details": details, "versions": versions}
+
 
 def _get_version() -> str:
     """获取当前版本"""
