@@ -29,6 +29,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel as APIModel
 
 from src import __version__
+from src.brain.core_benchmark import build_core_scenario_report
 from src.adapters.auth import is_protected_http_endpoint, request_has_auth_token
 from src.config import load_config, RaccoonConfig, LLM_PRESETS
 from src.conversation_store import ConversationStore
@@ -783,9 +784,19 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
         }
 
     @app.get("/learning/runs")
-    async def list_learning_runs(limit: int = 50) -> list[dict]:
+    async def list_learning_runs(
+        limit: int = 50,
+        scenario_id: str | None = None,
+        failure_code: str | None = None,
+        first_pass: bool | None = None,
+    ) -> list[dict]:
         """列出最近学习运行记录。"""
-        runs = learning_store.list_recent(limit=min(max(limit, 1), 200))
+        runs = learning_store.list_recent(
+            limit=min(max(limit, 1), 200),
+            scenario_id=scenario_id,
+            failure_code=failure_code,
+            first_pass=first_pass,
+        )
         return [run.model_dump(mode="json") for run in runs]
 
     @app.get("/learning/runs/{run_id}")
@@ -795,6 +806,13 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
         if not run:
             raise HTTPException(status_code=404, detail="学习运行不存在")
         return run.model_dump(mode="json")
+
+    @app.get("/benchmarks/core-scenarios/latest")
+    async def get_core_scenarios_benchmark() -> dict:
+        """核心场景基准聚合（只读）。"""
+        report = build_core_scenario_report(learning_store.aggregate_core_scenarios())
+        report["generated_at"] = datetime.now(timezone.utc).isoformat()
+        return report
 
     # ─── File Streaming ────────────────────────────────────────────
 

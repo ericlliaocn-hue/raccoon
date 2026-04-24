@@ -39,6 +39,7 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from src.brain.core_benchmark import detect_core_scenario_id, evaluate_quality, normalize_intent_phrase
 from src.config import RaccoonConfig
 from src.eventbus.events import EventType, make_event
 from src.memcore.reader import MemCoreReader
@@ -199,25 +200,47 @@ class LearningEngine:
                     metadata,
                     dependencies=run.dependencies,
                 )
+                quality_score, quality_detail = evaluate_quality(
+                    run.scenario_id,
+                    analysis=current_analysis,
+                    validation=validation,
+                    execution_result={"reply": validation.get("reply", "")},
+                )
+                validation["quality"] = quality_detail
+                validation["quality_score"] = quality_score
+                run.quality_score = quality_score
+                quality_threshold = self._quality_threshold(run.scenario_id, stage="validating")
+                if validation.get("success") and quality_score < quality_threshold:
+                    validation["success"] = False
+                    validation["error"] = (
+                        f"quality_gate_failed: score={quality_score:.2f} < threshold={quality_threshold:.2f}"
+                    )
                 run.validation = validation
+                if validation.get("debug_info"):
+                    run.artifacts["validation_debug"] = validation.get("debug_info")
+                if validation.get("result_preview"):
+                    run.artifacts["validation_preview"] = validation.get("result_preview")
                 self._save_run(run)
 
                 if validation.get("success"):
                     break
 
                 error_msg = str(validation.get("error") or "validation_failed")
+                run.failure_code = self._classify_failure_code(error_msg)
                 error_history.append(error_msg)
                 run.attempt_log.append({
                     "phase": "validation",
                     "attempt": run.repair_count + 1,
                     "approach": current_analysis.get("approach", ""),
                     "error": error_msg,
+                    "failure_code": run.failure_code,
                 })
 
                 if run.repair_count < max_repairs:
+                    repair_hint = self._repair_hint_for_failure(run.failure_code)
                     fixed_code = await self._repair_skill(
                         skill_name,
-                        error_msg,
+                        f"[{run.failure_code}] {error_msg}\n{repair_hint}".strip(),
                         user_message,
                         current_analysis,
                         actual_reply=validation.get("reply", ""),
@@ -306,11 +329,16 @@ class LearningEngine:
             )
 
     def _create_run(self, task: Task, user_message: str) -> LearningRun:
+        scenario_id = (
+            str(task.context.get("scenario_id")) if isinstance(task.context, dict) and task.context.get("scenario_id")
+            else detect_core_scenario_id(user_message)
+        )
         run = LearningRun(
             conversation_id=task.conversation_id,
             user_id=task.user_id,
             request_text=user_message,
             source_task_id=task.task_id,
+            scenario_id=scenario_id,
         )
         store = getattr(self, "_learning_store", None)
         if store:
@@ -349,6 +377,12 @@ class LearningEngine:
             "learning_run_id": run.run_id,
             "status": run.status.value,
             "skill_name": run.skill_name,
+            "scenario_id": run.scenario_id,
+            "first_pass": run.first_pass,
+            "final_success": run.final_success,
+            "failure_code": run.failure_code,
+            "quality_score": run.quality_score,
+            "artifacts": run.artifacts,
         }
         if payload:
             data.update(payload)
@@ -364,16 +398,27 @@ class LearningEngine:
         )
 
     async def _fail_run(self, run: LearningRun, reply: str, error: str) -> dict[str, Any]:
+        failure_code = self._classify_failure_code(error)
+        run.final_success = False
+        run.failure_code = failure_code
+        candidate = self._maybe_mark_new_skill_candidate(run, failure_code)
+        if candidate:
+            run.artifacts["new_skill_candidate"] = candidate
+            if "可以考虑新增通用 Skill" not in reply:
+                reply = (
+                    f"{reply}\n\n📌 失败聚类提示：最近 7 天同类失败达到阈值，"
+                    f"可考虑新增通用 Skill（failure_code={failure_code}）。"
+                )
         self._save_run(
             run,
             status=LearningRunStatus.FAILED,
             reply=reply,
-            error=error,
+            error=str(error),
         )
         await self._emit_learning_event(
             EventType.LEARNING_FAILED,
             run,
-            {"error": error, "reply": reply},
+            {"error": str(error), "reply": reply, "failure_code": failure_code},
         )
         return {
             "reply": reply,
@@ -654,7 +699,24 @@ class LearningEngine:
             dependencies=run.dependencies,
             strict_smoke=True,
         )
+        quality_score, quality_detail = evaluate_quality(
+            run.scenario_id,
+            analysis=run.analysis,
+            validation=validation,
+            execution_result={"reply": validation.get("reply", "")},
+        )
+        validation["quality"] = quality_detail
+        validation["quality_score"] = quality_score
+        run.quality_score = quality_score
+        threshold = self._quality_threshold(run.scenario_id, stage="validating")
+        if validation.get("success") and quality_score < threshold:
+            validation["success"] = False
+            validation["error"] = f"quality_gate_failed: score={quality_score:.2f} < threshold={threshold:.2f}"
         run.validation = validation
+        if validation.get("debug_info"):
+            run.artifacts["validation_debug"] = validation.get("debug_info")
+        if validation.get("result_preview"):
+            run.artifacts["validation_preview"] = validation.get("result_preview")
         if not validation.get("success"):
             return await self._fail_run(
                 run,
@@ -680,6 +742,28 @@ class LearningEngine:
                 self._build_failure_report(user_message, run.attempt_log, exec_result),
                 str(exec_result.get("error") or "execute_failed"),
             )
+        final_quality, final_detail = evaluate_quality(
+            run.scenario_id,
+            analysis=run.analysis,
+            validation=run.validation,
+            execution_result=exec_result,
+        )
+        run.quality_score = max(run.quality_score, final_quality)
+        run.artifacts["quality"] = final_detail
+        exec_threshold = self._quality_threshold(run.scenario_id, stage="executing")
+        if final_quality < exec_threshold:
+            return await self._fail_run(
+                run,
+                self._build_failure_report(
+                    user_message,
+                    run.attempt_log,
+                    {
+                        "error": f"quality_gate_failed: score={final_quality:.2f} < threshold={exec_threshold:.2f}",
+                        "reply": exec_result.get("reply", ""),
+                    },
+                ),
+                "quality_gate_failed",
+            )
 
         await self._write_experience(
             key=user_message[:100],
@@ -687,8 +771,11 @@ class LearningEngine:
                 {
                     **run.analysis,
                     "skill_name": skill_name,
+                    "scenario_id": run.scenario_id,
+                    "request_text": user_message,
                     "dependencies": run.dependencies,
                     "repair_count": run.repair_count,
+                    "attempt_log": run.attempt_log,
                     "validation": run.validation,
                 },
                 ensure_ascii=False,
@@ -714,6 +801,13 @@ class LearningEngine:
             reply += f"\n⏰ 已创建定时任务：{run.schedule_created}"
 
         run.execution_result = exec_result
+        run.first_pass = run.repair_count == 0
+        run.final_success = True
+        run.failure_code = None
+        run.artifacts["files"] = exec_result.get("files", [])
+        run.artifacts["debug_info"] = exec_result.get("debug_info", {})
+        if exec_result.get("artifacts") is not None:
+            run.artifacts["execution_artifacts"] = exec_result.get("artifacts")
         self._save_run(
             run,
             status=LearningRunStatus.SUCCEEDED,
@@ -791,10 +885,22 @@ class LearningEngine:
         self._save_run(run, status=LearningRunStatus.EXECUTING)
         exec_result = await self._execute_learned_skill(task, skill_name, user_message)
         if not exec_result.get("success"):
+            run.failure_code = self._classify_failure_code(str(exec_result.get("error") or "experience_execute_failed"))
             return None
 
         reply = f"📋 复用已有学习经验，直接使用技能「{skill_name}」。\n\n{exec_result.get('reply', '')}"
         run.execution_result = exec_result
+        score, detail = evaluate_quality(
+            run.scenario_id,
+            analysis=run.analysis,
+            validation=run.validation,
+            execution_result=exec_result,
+        )
+        run.quality_score = score
+        run.artifacts["quality"] = detail
+        run.first_pass = True
+        run.final_success = True
+        run.failure_code = None
         self._save_run(run, status=LearningRunStatus.SUCCEEDED, reply=reply, error=None)
         return {
             "reply": reply,
@@ -837,11 +943,12 @@ class LearningEngine:
         """从 MemCore 检索相关经验"""
         if not self._memcore_writer:
             return None
+        normalized = normalize_intent_phrase(message)
         reader: MemCoreReader | None = None
         try:
             reader = MemCoreReader(self._config)
             await reader.init()
-            results = await reader.search("learning_engine", message)
+            results = await reader.search("learning_engine", normalized or message)
             if results:
                 top = results[0]
                 payload = top.value
@@ -1517,6 +1624,7 @@ if __name__ == "__main__":
             files = result.get("files", [])
             # 提取 _debug 诊断信息（Skill 代码在失败时应写入此字段）
             debug_info = result.get("_debug", {})
+            artifacts = result.get("artifacts", {})
 
             # 语义验证：即使没抛异常，也检查 reply 是否表示失败
             validation = self._validate_result(reply, result)
@@ -1534,9 +1642,16 @@ if __name__ == "__main__":
                     "reply": reply,
                     "files": files,
                     "debug_info": debug_info,
+                    "artifacts": artifacts,
                 }
 
-            return {"success": True, "reply": reply, "files": files, "debug_info": debug_info}
+            return {
+                "success": True,
+                "reply": reply,
+                "files": files,
+                "debug_info": debug_info,
+                "artifacts": artifacts,
+            }
 
         except Exception as e:
             logger.error("learned_skill_exec_failed", skill=skill_name, error=str(e))
@@ -1906,10 +2021,11 @@ Skill 名称：{skill_name}
             return
 
         try:
+            normalized_key = normalize_intent_phrase(key) or key
             await self._memcore_writer.write(
                 MemoryEntry(
                     user_id="learning_engine",
-                    key=f"learned:{skill_name}:{key}",
+                    key=f"learned:{skill_name}:{normalized_key}",
                     value=value,
                     confidence=0.8,
                     source="learning_engine",
@@ -1998,6 +2114,73 @@ cron 示例：
         except Exception as e:
             logger.warning("schedule_creation_failed", error=str(e))
             return None
+
+    def _quality_threshold(self, scenario_id: str | None, *, stage: str) -> float:
+        base = 0.55 if stage == "validating" else 0.60
+        if scenario_id == "login_form_chain":
+            return base + 0.08
+        if scenario_id == "remote_exec":
+            return base + 0.05
+        return base
+
+    def _classify_failure_code(self, error: str) -> str:
+        msg = str(error or "").lower()
+        if not msg:
+            return "unknown_error"
+        if "quality_gate_failed" in msg:
+            return "quality_gate_failed"
+        if "metadata_invalid" in msg:
+            return "metadata_invalid"
+        if "compile_failed" in msg or "syntaxerror" in msg:
+            return "compile_failed"
+        if "no module named" in msg or "dependency" in msg or "pip" in msg:
+            return "dependency_missing"
+        if "timeout" in msg or "timed out" in msg:
+            return "timeout"
+        if any(tag in msg for tag in ("401", "403", "unauthorized", "forbidden", "鉴权", "登录")):
+            return "auth_failed"
+        if any(tag in msg for tag in ("空壳输出", "暂无数据", "未获取到", "hollow")):
+            return "data_hollow"
+        if any(tag in msg for tag in ("protocol_smoke_failed", "json", "parse", "解析")):
+            return "parse_failed"
+        if any(tag in msg for tag in ("network", "connect", "dns", "connection")):
+            return "network_failed"
+        if "approval" in msg or "审批" in msg:
+            return "approval_rejected"
+        return "unknown_error"
+
+    def _repair_hint_for_failure(self, failure_code: str | None) -> str:
+        hints = {
+            "parse_failed": "修复方向：确保 stdout 只输出 JSON 且包含 reply 字段，避免混入日志文本。",
+            "auth_failed": "修复方向：目标站点可能需要登录态/鉴权，优先改成 CDP 登录态或可公开访问数据源。",
+            "data_hollow": "修复方向：当前解析逻辑只拿到默认值，检查选择器/API 字段并增加空数据兜底。",
+            "dependency_missing": "修复方向：尽量使用项目已有依赖（httpx、bs4 等），并在代码注释里声明 # requires。",
+            "network_failed": "修复方向：增加重试和超时保护，失败时返回可解释错误而不是空结果。",
+            "timeout": "修复方向：降低单次请求耗时、拆分步骤、必要时调整等待策略。",
+            "quality_gate_failed": "修复方向：补齐结构化字段、来源说明、数据新鲜度信息，确保结果可解释。",
+        }
+        return hints.get(str(failure_code or ""), "")
+
+    def _maybe_mark_new_skill_candidate(self, run: LearningRun, failure_code: str | None) -> dict[str, Any] | None:
+        store = getattr(self, "_learning_store", None)
+        if not store or not failure_code:
+            return None
+        clusters = store.top_failure_clusters(days=7, limit=20)
+        hit = next((item for item in clusters if item.get("failure_code") == failure_code), None)
+        if not hit:
+            return None
+        failures = int(hit.get("failures", 0)) + 1  # + 当前 run
+        conversations = int(hit.get("conversations", 0))
+        if failures < 5 or conversations < 2:
+            return None
+        return {
+            "failure_code": failure_code,
+            "failures_7d": failures,
+            "conversations_7d": conversations,
+            "triggered": True,
+            "reason": "同类失败在 7 天内达到新增 Skill 候选阈值（>=5 且跨>=2会话）",
+            "suggested_skill_name": run.skill_name or f"candidate_{failure_code}",
+        }
 
     # ─── 辅助 ──────────────────────────────────────────────────
 

@@ -273,13 +273,19 @@ class LearningRun(BaseModel):
     user_id: str = "anonymous"
     request_text: str
     source_task_id: str | None = None
+    scenario_id: str | None = None
     status: LearningRunStatus = LearningRunStatus.ANALYZING
+    first_pass: bool = False
+    final_success: bool = False
+    failure_code: str | None = None
+    quality_score: float = 0.0
     skill_name: str | None = None
     candidate_skill_name: str | None = None
     candidate_confidence: float = 0.0
     staging_dir: str = ""
     analysis: dict[str, Any] = Field(default_factory=dict)
     validation: dict[str, Any] = Field(default_factory=dict)
+    artifacts: dict[str, Any] = Field(default_factory=dict)
     dependencies: list[str] = Field(default_factory=list)
     repair_count: int = 0
     approval_id: str | None = None

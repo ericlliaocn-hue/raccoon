@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from src.brain.core_benchmark import normalize_intent_phrase
 from src.config import RaccoonConfig
 from src.eventbus.bus import EventBus
 from src.executor.task_queue import TaskQueue
@@ -877,7 +878,7 @@ confidence 是 0.0-1.0 的小数；只有非常确定时才高于 0.7。"""
         )
 
     def _normalize_match_text(self, text: str) -> str:
-        return str(text or "").lower().strip()
+        return normalize_intent_phrase(text)
 
     def _compact_match_text(self, text: str) -> str:
         return re.sub(r"\s+", "", self._normalize_match_text(text))
@@ -1016,15 +1017,27 @@ confidence 是 0.0-1.0 的小数；只有非常确定时才高于 0.7。"""
         # 判断用户是否确认
         confirm_words = {"要", "好", "可以", "行", "是的", "是的", "创建", "学习", "帮我创建", "yes", "y", "ok", "确定", "确认"}
         reject_words = {"不要", "不用", "算了", "取消", "no", "n", "否", "不了", "别"}
+        confirm_phrases = ("继续学习", "继续创建", "继续", "学习吧")
+        reject_phrases = ("先别学", "别学了", "不学", "不用学", "先不要")
+        use_existing_phrases = ("用这个技能", "就用这个", "先用这个", "用它")
+        force_use_existing = any(p in user_text for p in use_existing_phrases)
 
-        if user_text in reject_words:
+        if user_text in reject_words or any(p in user_text for p in reject_phrases):
             return await self._chat_fallback(event.payload.get("text", ""))
 
-        if user_text not in confirm_words:
+        if (
+            user_text not in confirm_words
+            and not any(p in user_text for p in confirm_phrases)
+            and not force_use_existing
+        ):
             # 模糊回复，当作拒绝，走闲聊
             return await self._chat_fallback(event.payload.get("text", ""))
 
-        existing_skill_reply = await self._try_existing_skill_before_learning(original_request, event)
+        existing_skill_reply = await self._try_existing_skill_before_learning(
+            original_request,
+            event,
+            force_use=force_use_existing,
+        )
         if existing_skill_reply is not None:
             return existing_skill_reply
 
@@ -1055,7 +1068,13 @@ confidence 是 0.0-1.0 的小数；只有非常确定时才高于 0.7。"""
             logger.error("learn_confirm_failed", error=str(e))
             return f"❌ 学习过程出错：{e}"
 
-    async def _try_existing_skill_before_learning(self, text: str, event: Event) -> str | None:
+    async def _try_existing_skill_before_learning(
+        self,
+        text: str,
+        event: Event,
+        *,
+        force_use: bool = False,
+    ) -> str | None:
         """学习前再做一次本地 Skill 候选复用，避免重复造轮子。"""
         skills = self._vault_manager.list_skills()
         if not skills:
@@ -1071,7 +1090,21 @@ confidence 是 0.0-1.0 的小数；只有非常确定时才高于 0.7。"""
             threshold = max(float(raw_threshold), 0.78)
         except (TypeError, ValueError):
             threshold = 0.78
-        if candidate.confidence < threshold:
+        review_threshold = min(0.68, threshold - 0.08)
+        if review_threshold < 0.55:
+            review_threshold = 0.55
+
+        if review_threshold <= candidate.confidence < threshold and not force_use:
+            self._pending_learn_requests[event.conversation_id] = text
+            return (
+                f"我找到一个可能可复用的技能「{candidate.skill_name}」"
+                f"（置信度 {candidate.confidence:.2f}）。\n\n"
+                "回复「用这个技能」先执行它；回复「继续学习」再创建新技能。"
+            )
+
+        if candidate.confidence < threshold and not force_use:
+            return None
+        if force_use and candidate.confidence < review_threshold:
             return None
 
         logger.info(

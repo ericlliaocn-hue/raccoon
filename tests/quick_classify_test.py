@@ -122,4 +122,5 @@ async def main():
     print(f"总计: {total_pass}/{total} 通过 ({total_pass/total*100:.0f}%)")
     print(f"{'='*60}")
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())

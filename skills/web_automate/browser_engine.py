@@ -15,8 +15,10 @@ import json
 import logging
 import platform
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 try:
     from .actions import Actions, ActionResult
@@ -159,6 +161,9 @@ class BrowserEngine:
         self._page = None
         self._actions: Actions | None = None
         self._chrome_process: subprocess.Popen | None = None
+        self._checkpoints: list[dict[str, Any]] = []
+        self._artifacts: list[dict[str, Any]] = []
+        self._domain_health: dict[str, str] = {}
 
     @property
     def actions(self) -> Actions:
@@ -420,21 +425,214 @@ class BrowserEngine:
             self._context = await self._browser.new_context()
             self._page = await self._context.new_page()
 
+    def _current_domain(self) -> str:
+        if not self._page:
+            return ""
+        try:
+            return urlparse(self._page.url).netloc.lower()
+        except Exception:
+            return ""
+
+    def _record_checkpoint(self, index: int, action_type: str, stage: str, result: ActionResult | None = None) -> dict[str, Any]:
+        checkpoint = {
+            "step_index": index,
+            "action": action_type,
+            "stage": stage,
+            "timestamp": time.time(),
+            "url": self._page.url if self._page else "",
+            "domain": self._current_domain(),
+        }
+        if result is not None:
+            checkpoint["success"] = result.success
+            checkpoint["message"] = result.message
+        self._checkpoints.append(checkpoint)
+        return checkpoint
+
+    def _update_domain_health(self, action_type: str, result: ActionResult) -> None:
+        domain = self._current_domain()
+        if not domain:
+            return
+
+        state = self._domain_health.get(domain, "valid")
+        message = str(result.message or "").lower()
+        if any(tag in message for tag in ("登录", "signin", "expired", "unauthorized", "forbidden")):
+            self._domain_health[domain] = "invalid"
+            return
+        if action_type in {"open", "type", "click", "press_key"} and result.success:
+            if state in {"invalid", "suspected_expired"}:
+                self._domain_health[domain] = "suspected_expired"
+            else:
+                self._domain_health[domain] = "valid"
+
+    async def _wait_visible_and_stable(self, action_type: str, act: dict[str, Any], timeout_ms: int) -> None:
+        if not self._page:
+            return
+        selector = str(act.get("selector", "") or "").strip()
+        if selector and action_type in {
+            "click",
+            "type",
+            "check",
+            "double_click",
+            "hover",
+            "read",
+            "upload_file",
+            "select_option",
+            "wait_for_selector",
+            "drag_and_drop",
+        }:
+            await self._page.wait_for_selector(selector, timeout=timeout_ms, state="visible")
+        if action_type in {"open", "click", "press_key"}:
+            await self._page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+        # wait-stable
+        await self._page.wait_for_timeout(min(500, max(120, timeout_ms // 40)))
+
+    async def _should_block_for_login(self, action_type: str) -> tuple[bool, str]:
+        if not self._page:
+            return False, ""
+        domain = self._current_domain()
+        state = self._domain_health.get(domain, "valid")
+        if state == "invalid" and action_type not in {"open", "type", "click", "press_key"}:
+            return True, "登录态失效，需先执行补登流程"
+
+        url_lower = str(self._page.url or "").lower()
+        if any(token in url_lower for token in ("/login", "signin", "passport", "auth")):
+            if action_type not in {"open", "type", "click", "press_key"}:
+                self._domain_health[domain] = "suspected_expired"
+                return True, "当前页面在登录入口，建议先完成登录后再继续"
+        return False, ""
+
+    async def _collect_failure_artifacts(self, index: int, action_type: str, reason: str) -> dict[str, Any]:
+        artifact: dict[str, Any] = {
+            "step_index": index,
+            "action": action_type,
+            "reason": reason,
+            "url": self._page.url if self._page else "",
+            "domain": self._current_domain(),
+        }
+        if not self._page:
+            return artifact
+
+        ts = int(time.time() * 1000)
+        screenshot_path = OUTPUT_DIR / f"web_automate_fail_{index}_{ts}.png"
+        dom_path = OUTPUT_DIR / f"web_automate_fail_{index}_{ts}.html"
+        try:
+            await self._page.screenshot(path=str(screenshot_path), full_page=True, timeout=5000)
+            artifact["screenshot"] = str(screenshot_path)
+        except Exception:
+            pass
+        try:
+            html = await self._page.content()
+            dom_path.write_text(html, encoding="utf-8")
+            artifact["dom_snapshot"] = str(dom_path)
+        except Exception:
+            pass
+        try:
+            req_stats = await self._page.evaluate(
+                """() => {
+                    const list = performance.getEntriesByType('resource') || [];
+                    return list.slice(-15).map(it => ({
+                        name: it.name,
+                        initiatorType: it.initiatorType,
+                        duration: Math.round(it.duration || 0),
+                    }));
+                }"""
+            )
+            artifact["network_summary"] = req_stats
+        except Exception:
+            artifact["network_summary"] = []
+        return artifact
+
+    async def _execute_action_reliable(self, index: int, act: dict[str, Any], action_type: str) -> ActionResult:
+        retries = max(0, int(act.get("retries", 2)))
+        timeout_ms = max(500, int(act.get("timeout_ms", act.get("timeout", 12000))))
+        last_reason = "action_failed"
+
+        blocked, block_reason = await self._should_block_for_login(action_type)
+        if blocked:
+            artifact = await self._collect_failure_artifacts(index, action_type, block_reason)
+            self._artifacts.append(artifact)
+            return ActionResult(
+                success=False,
+                message=f"❌ {block_reason}",
+                data={"failure_code": "login_state_invalid", "artifacts": artifact},
+            )
+
+        for attempt in range(retries + 1):
+            try:
+                await self._wait_visible_and_stable(action_type, act, timeout_ms)
+            except Exception as e:
+                last_reason = f"wait_visible_or_stable_failed: {e}"
+                if attempt >= retries:
+                    break
+                await asyncio.sleep(0.25 * (attempt + 1))
+                continue
+
+            try:
+                result = await asyncio.wait_for(self._do_action(act, action_type), timeout=timeout_ms / 1000)
+            except Exception as e:
+                last_reason = f"action_timeout_or_error: {e}"
+                if attempt >= retries:
+                    break
+                await asyncio.sleep(0.25 * (attempt + 1))
+                continue
+
+            self._update_domain_health(action_type, result)
+            assert_ok, assert_reason = self._assert_action_result(action_type, result)
+            if result.success and assert_ok:
+                return result
+
+            last_reason = assert_reason if result.success else result.message
+            if attempt < retries:
+                await asyncio.sleep(0.25 * (attempt + 1))
+
+        artifact = await self._collect_failure_artifacts(index, action_type, last_reason)
+        self._artifacts.append(artifact)
+        return ActionResult(
+            success=False,
+            message=f"❌ {action_type} 失败（重试{retries}次后）: {last_reason}",
+            data={"failure_code": "browser_action_failed", "artifacts": artifact},
+        )
+
+    def _assert_action_result(self, action_type: str, result: ActionResult) -> tuple[bool, str]:
+        if not result.success:
+            return False, result.message
+        data = result.data or {}
+        if action_type == "screenshot":
+            screenshot = data.get("path")
+            if not screenshot or not Path(str(screenshot)).exists():
+                return False, "screenshot_file_missing"
+        if action_type in {"open", "click", "press_key"} and self._page:
+            if str(self._page.url).startswith("about:blank"):
+                return False, "page_not_navigated"
+        return True, ""
+
+    def get_runtime_artifacts(self) -> dict[str, Any]:
+        return {
+            "checkpoints": list(self._checkpoints),
+            "artifacts": list(self._artifacts),
+            "domain_health": dict(self._domain_health),
+        }
+
     # ── 执行动作序列 ─────────────────────────────────
 
     async def execute(self, action_list: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """执行动作序列，返回每个动作的结果"""
         results = []
-        for act in action_list:
+        self._checkpoints = []
+        self._artifacts = []
+        for index, act in enumerate(action_list):
             action_type = act.get("action", "")
-            result = await self._do_action(act, action_type)
+            self._record_checkpoint(index, action_type, "before")
+            result = await self._execute_action_reliable(index, act, action_type)
+            checkpoint = self._record_checkpoint(index, action_type, "after", result)
             results.append({
                 "action": action_type,
                 "success": result.success,
                 "message": result.message,
                 "data": result.data,
+                "step_checkpoint": checkpoint,
             })
-            # 如果动作失败，继续执行下一个（不中断）
+            # 如果动作失败，继续执行下一个（不中断），由调用方决定是否中止链路
         return results
 
     async def _do_action(self, act: dict[str, Any], action_type: str) -> ActionResult:

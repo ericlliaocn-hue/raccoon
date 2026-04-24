@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-04-24
+
+### 🎯 场景驱动补强（0.5.x）
+
+> 目标：围绕 6 个核心场景把“该中 Skill 就中、该学习就学、学出来要稳定”做成可观测可验收。
+
+- **LearningRun 场景指标补全**：新增 `scenario_id`、`first_pass`、`final_success`、`failure_code`、`quality_score`、`artifacts` 字段并落库；`/learning/runs` 支持 `scenario_id/failure_code/first_pass` 过滤
+- **质量门升级**：学习验证阶段增加场景质量评分（字段完整性、来源可解释性、数据新鲜度）；低于阈值会被 `quality_gate_failed` 拦下，不进入安装
+- **失败码驱动修复**：学习失败从“纯字符串重试”升级为 `failure_code` 分类（parse/auth/dependency/data_hollow/timeout 等）+ 定向修复提示
+- **失败聚类触发新增 Skill 候选**：同类失败 7 天内达到阈值（`>=5` 且跨 `>=2` 会话）会在 run artifacts 标记“可新增通用 Skill”候选
+- **核心场景看板接口**：新增 `GET /benchmarks/core-scenarios/latest`，按 6 场景返回首轮命中率、最终成功率、平均修复次数、质量分和发布门禁
+- **CLI 基准入口**：新增 `raccoon benchmark core`（支持 `--json`），可作为发布前门禁命令
+- **学习前复用更稳**：候选召回接入意图短语归一化；中低置信候选增加二次确认，不再直接误学
+- **浏览器链路稳定性补丁**：`web_automate` 新增可靠性执行层（`wait-visible -> wait-stable -> action -> assert` + 重试 + 超时原因）；失败自动采集截图/DOM/请求摘要并写入 artifacts；动作返回 `step_checkpoint` 支持长链路恢复
+- **doctor 运营检查补充**：新增 LearningRun 卡死、失败码集中度、浏览器会话回收异常检查
+
 ## [0.5.0] - 2026-04-24
 
 ### 🧠 自学习闭环补强

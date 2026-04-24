@@ -14,7 +14,7 @@ from src.eventbus.events import EventType, make_event
 from src.executor.agent import Executor
 from src.skill_vault.sandbox_runner import SkillRunner
 from src.supervisor.approval_engine import ApprovalEngine
-from src.types import RouteResult, RouteType, SkillMetadata, Task, TaskStatus
+from src.types import LearningRun, LearningRunStatus, RouteResult, RouteType, SkillMetadata, Task, TaskStatus
 
 
 def _test_config(tmp_path, **overrides) -> RaccoonConfig:
@@ -93,6 +93,39 @@ def test_sse_query_token_auth_and_rejects_missing_token(tmp_path):
         }
     )
     assert request_has_auth_token(request, "secret") is True
+
+
+def test_learning_runs_filter_and_core_benchmark_endpoint(tmp_path):
+    app = create_app(_test_config(tmp_path, http_auth_token="secret"))
+    headers = {"Authorization": "Bearer secret"}
+
+    run = LearningRun(
+        conversation_id="c1",
+        user_id="u1",
+        request_text="生成简报",
+        scenario_id="daily_brief",
+        status=LearningRunStatus.SUCCEEDED,
+        first_pass=True,
+        final_success=True,
+        quality_score=0.9,
+    )
+    app.state.learning_store.add(run)
+
+    with TestClient(app) as client:
+        unauth = client.get("/benchmarks/core-scenarios/latest")
+        assert unauth.status_code == 401
+
+        res = client.get("/learning/runs?scenario_id=daily_brief&first_pass=true", headers=headers)
+        assert res.status_code == 200
+        data = res.json()
+        assert len(data) >= 1
+        assert data[0]["scenario_id"] == "daily_brief"
+
+        bench = client.get("/benchmarks/core-scenarios/latest", headers=headers)
+        assert bench.status_code == 200
+        payload = bench.json()
+        assert "overall" in payload
+        assert "scenarios" in payload
 
 
 @pytest.mark.asyncio

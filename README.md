@@ -144,6 +144,10 @@ raccoon status
 # 诊断检查
 raccoon doctor
 
+# 核心场景基准（发布门禁）
+raccoon benchmark core
+raccoon benchmark core --json
+
 # 查看日志
 raccoon logs
 raccoon logs -f         # 持续跟踪

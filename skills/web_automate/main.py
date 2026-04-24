@@ -171,7 +171,11 @@ def _parse_actions(text: str, url: str | None) -> list[dict]:
     return actions
 
 
-def _build_result(mode: str, details: list[dict[str, Any]]) -> dict[str, Any]:
+def _build_result(
+    mode: str,
+    details: list[dict[str, Any]],
+    runtime_artifacts: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """把动作结果整理成 Skill 协议输出。"""
     files = []
     for detail in details:
@@ -190,6 +194,7 @@ def _build_result(mode: str, details: list[dict[str, Any]]) -> dict[str, Any]:
         "reply": "\n".join(summary_lines),
         "files": files,
         "details": details,
+        "artifacts": runtime_artifacts or {},
     }
 
 
@@ -197,11 +202,15 @@ async def run_browser_skill(data: dict[str, Any]) -> dict[str, Any]:
     """默认运行路径：通过 BrowserSessionManager 获取/释放浏览器会话。"""
     task_id = data.get("task_id", "")
     origin = data.get("origin_message", "")
+    params = data.get("params", {}) or {}
 
     mode = _detect_mode(origin)
-    raw = origin.strip()
+    raw = str(params.get("prompt") or origin).strip()
     url = _extract_url(raw)
-    action_list = _parse_actions(raw, url)
+    action_list = params.get("actions") if isinstance(params.get("actions"), list) else _parse_actions(raw, url)
+    resume_from = params.get("resume_from_step")
+    if isinstance(resume_from, int) and resume_from > 0:
+        action_list = action_list[resume_from:]
 
     try:
         from .session_manager import get_session_manager
@@ -213,7 +222,7 @@ async def run_browser_skill(data: dict[str, Any]) -> dict[str, Any]:
     try:
         session = await manager.acquire(mode, owner=task_id or "web_automate", reuse_url=url or "")
         details = await session.engine.execute(action_list)
-        result = _build_result(mode, details)
+        result = _build_result(mode, details, session.engine.get_runtime_artifacts())
     finally:
         if session is not None:
             await manager.release(session.id)

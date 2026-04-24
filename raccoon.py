@@ -13,6 +13,7 @@
   raccoon skills [list|install|uninstall|info]  # Skill 管理
   raccoon logs                     # 查看日志
   raccoon doctor                   # 诊断检查
+  raccoon benchmark core           # 核心场景基准报告
 """
 
 from __future__ import annotations
@@ -82,6 +83,11 @@ def main() -> None:
     # ─── doctor ───────────────────────────────────────────────
     sub.add_parser("doctor", help="诊断检查")
 
+    # ─── benchmark ────────────────────────────────────────────
+    p_benchmark = sub.add_parser("benchmark", help="基准测试与报告")
+    p_benchmark.add_argument("suite", nargs="?", default="core", choices=["core"], help="基准套件")
+    p_benchmark.add_argument("--json", action="store_true", help="输出 JSON")
+
     # ─── schedule ─────────────────────────────────────────────
     p_schedule = sub.add_parser("schedule", help="定时任务管理")
     p_schedule.add_argument("action", nargs="?", default="list", choices=["list", "add", "remove", "toggle"], help="操作")
@@ -108,6 +114,7 @@ def main() -> None:
         "skills": lambda: _cmd_skills(args),
         "logs": lambda: _cmd_logs(args),
         "doctor": _cmd_doctor,
+        "benchmark": lambda: _cmd_benchmark(args),
         "schedule": lambda: _cmd_schedule(args),
     }
 
@@ -454,6 +461,50 @@ def _cmd_doctor() -> None:
     except Exception as e:
         print(f"  ⚠️  learning staging 检查失败: {e}")
 
+    # 5d. LearningRun 运行质量
+    try:
+        from datetime import datetime, timezone, timedelta
+        from src.brain.learning_store import LearningRunStore
+        from src.types import LearningRunStatus
+
+        store = LearningRunStore(config)
+        recent_runs = store.list_recent(limit=200)
+        active_status = {
+            LearningRunStatus.ANALYZING,
+            LearningRunStatus.GENERATING,
+            LearningRunStatus.VALIDATING,
+            LearningRunStatus.PENDING_APPROVAL,
+            LearningRunStatus.INSTALLING,
+            LearningRunStatus.EXECUTING,
+        }
+        now = datetime.now(timezone.utc)
+        stale = [
+            run for run in recent_runs
+            if run.status in active_status and (now - run.updated_at) > timedelta(minutes=30)
+        ]
+        if stale:
+            print(f"  ⚠️  LearningRun 存在疑似卡死记录: {len(stale)}")
+            issues.append("LearningRun 存在卡死记录")
+        else:
+            print("  ✅ LearningRun 无卡死记录")
+
+        failures = [r for r in recent_runs if not r.final_success and r.failure_code]
+        if failures:
+            counts: dict[str, int] = {}
+            for run in failures:
+                counts[run.failure_code or "unknown_error"] = counts.get(run.failure_code or "unknown_error", 0) + 1
+            code, count = max(counts.items(), key=lambda item: item[1])
+            ratio = count / len(failures)
+            if ratio >= 0.4 and count >= 5:
+                print(f"  ⚠️  失败码集中: {code} 占比 {ratio * 100:.1f}% ({count}/{len(failures)})")
+                issues.append("失败码分布过于集中")
+            else:
+                print("  ✅ 失败码分布正常")
+        else:
+            print("  ✅ 最近无集中失败码")
+    except Exception as e:
+        print(f"  ⚠️  LearningRun 质量检查失败: {e}")
+
     # 5c. MemCore 可读写
     try:
         from src.memcore.writer import MemCoreWriter
@@ -467,6 +518,22 @@ def _cmd_doctor() -> None:
     except Exception as e:
         print(f"  ❌ MemCore 初始化失败: {e}")
         issues.append("MemCore 初始化失败")
+
+    # 5d. 浏览器会话池健康（仅检查统计，不触发启动）
+    try:
+        from skills.web_automate.session_manager import get_session_manager
+
+        stats = get_session_manager().get_stats()
+        idle = int(stats.get("idle", 0))
+        total = int(stats.get("total", 0))
+        max_per_mode = int(stats.get("max_sessions_per_mode", 3))
+        if total > max_per_mode * 3:
+            print(f"  ⚠️  浏览器会话偏多: total={total}, idle={idle}")
+            issues.append("浏览器会话回收异常")
+        else:
+            print(f"  ✅ 浏览器会话池正常 (total={total}, idle={idle})")
+    except Exception as e:
+        print(f"  ⚠️  浏览器会话检查失败: {e}")
 
     # 6. 端口检查
     import socket
@@ -495,6 +562,47 @@ def _cmd_doctor() -> None:
             print(f"   {i}. {issue}")
     else:
         print("✅ 一切正常！")
+
+
+def _cmd_benchmark(args) -> None:
+    """核心场景基准报告（基于 LearningRun 聚合）。"""
+    if args.suite != "core":
+        print(f"❌ 不支持的基准套件: {args.suite}")
+        sys.exit(1)
+
+    from src.brain.core_benchmark import build_core_scenario_report
+    from src.brain.learning_store import LearningRunStore
+    from src.config import load_config
+
+    config = load_config()
+    store = LearningRunStore(config)
+    report = build_core_scenario_report(store.aggregate_core_scenarios())
+
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        sys.exit(0 if report["overall"]["pass"] else 2)
+
+    overall = report["overall"]
+    print("🧪 核心场景基准报告\n")
+    print(f"  样本数: {overall['runs']}")
+    print(f"  首轮命中率: {overall['first_pass_rate'] * 100:.1f}%")
+    print(f"  最终成功率: {overall['final_success_rate'] * 100:.1f}%")
+    print(f"  浏览器链路成功率: {overall['browser_chain_success_rate'] * 100:.1f}%")
+    print(f"  发布门禁: {'✅ 通过' if overall['pass'] else '❌ 未通过'}")
+    print()
+    print("场景明细:")
+    for row in report["scenarios"]:
+        print(
+            f"  - {row['name']:<10} runs={row['runs']:<3d} "
+            f"first={row['first_pass_rate'] * 100:>5.1f}% "
+            f"final={row['final_success_rate'] * 100:>5.1f}% "
+            f"repair={row['avg_repair_count']:.2f} "
+            f"quality={row['avg_quality_score']:.2f}"
+        )
+
+    if not overall["pass"]:
+        print("\n⚠️ 未达平衡档门槛，建议先修复集中失败码后再打版本标签。")
+    sys.exit(0 if overall["pass"] else 2)
 
 
 def _cmd_schedule(args) -> None:

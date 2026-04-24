@@ -436,6 +436,30 @@ class TestLearnConfirm:
         result = await executor._handle_learn_confirm(route, event)
         assert "学会" in result
 
+    @pytest.mark.asyncio
+    async def test_existing_skill_low_confidence_requires_second_confirm(self):
+        executor = _make_executor()
+        executor._vault_manager.list_skills = MagicMock(return_value=[MagicMock(name="web_automate")])
+        executor._find_skill_candidates = MagicMock(
+            return_value=[MagicMock(skill_name="web_automate", confidence=0.69, matched_terms=["浏览器"])]
+        )
+        executor._handle_skill = AsyncMock(return_value="收到！任务已创建")
+
+        event = Event(
+            event=EventType.USER_MESSAGE,
+            conversation_id="c1",
+            user_id="u1",
+            payload={"text": "要"},
+        )
+        reply = await executor._try_existing_skill_before_learning("帮我打开浏览器", event)
+        assert "用这个技能" in reply
+        assert executor._pending_learn_requests["c1"] == "帮我打开浏览器"
+        executor._handle_skill.assert_not_awaited()
+
+        force_reply = await executor._try_existing_skill_before_learning("帮我打开浏览器", event, force_use=True)
+        assert "复用已有技能" in force_reply
+        executor._handle_skill.assert_awaited_once()
+
 
 # ─── LearningEngine ────────────────────────────────────────────────
 

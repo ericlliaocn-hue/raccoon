@@ -20,6 +20,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlparse
 
 try:
     from .browser_engine import BrowserEngine
@@ -84,10 +85,15 @@ class BrowserSessionManager:
         优先复用空闲的同模式会话；传入 reuse_url 时先找已打开相同站点的会话。
         """
         async with self._lock:
+            reuse_domain = self._extract_domain(reuse_url)
+
             # 1. reuse_url 命中已有 tab 时，优先复用对应会话
             if reuse_url:
                 for session in self._sessions.values():
                     if not session.in_use and session.mode == mode:
+                        if self._domain_state(session, reuse_domain) == "invalid":
+                            logger.info("session_skipped_invalid_domain: id=%s domain=%s", session.id, reuse_domain)
+                            continue
                         if session.engine.select_reuse_page(reuse_url):
                             session.in_use = True
                             session.owner = owner
@@ -104,6 +110,8 @@ class BrowserSessionManager:
             # 2. 尝试复用空闲会话
             for session in self._sessions.values():
                 if not session.in_use and session.mode == mode:
+                    if self._domain_state(session, reuse_domain) == "invalid":
+                        continue
                     if reuse_url:
                         session.engine.select_reuse_page(reuse_url)
                     session.in_use = True
@@ -141,6 +149,24 @@ class BrowserSessionManager:
             self._sessions[session.id] = session
             logger.info("session_created: id=%s mode=%s owner=%s", session.id, mode, owner)
             return session
+
+    def _extract_domain(self, reuse_url: str) -> str:
+        if not reuse_url:
+            return ""
+        try:
+            parsed = urlparse(reuse_url if "://" in reuse_url else f"https://{reuse_url}")
+            return parsed.netloc.lower()
+        except Exception:
+            return ""
+
+    def _domain_state(self, session: BrowserSession, domain: str) -> str:
+        if not domain:
+            return "valid"
+        try:
+            runtime = session.engine.get_runtime_artifacts()
+            return str((runtime.get("domain_health") or {}).get(domain, "valid"))
+        except Exception:
+            return "valid"
 
     async def release(self, session_id: str) -> None:
         """释放浏览器会话（归还到池中，不关闭浏览器）"""
