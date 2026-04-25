@@ -520,3 +520,28 @@ def test_shell_command_detection_handles_english_and_paths(tmp_path: Path):
     assert engine._extract_shell_command("run /usr/local/bin/backup_logs.sh --tail 20").startswith(
         "/usr/local/bin/backup_logs.sh"
     )
+
+
+def test_login_form_target_requires_url_and_action_context(tmp_path: Path):
+    engine = LearningEngine(config=_make_config(tmp_path), learning_store=LearningRunStore(_make_config(tmp_path)))
+    assert engine._has_form_target("登录 https://fixture.local/login，账号 test_user，提交申请") is True
+    assert engine._has_form_target("访问 https://fixture.local/home 看一下页面") is False
+    assert engine._has_form_target("登录系统并提交流程单") is False
+
+
+def test_build_playbook_params_for_web_automate_contains_stable_actions(tmp_path: Path):
+    engine = LearningEngine(config=_make_config(tmp_path), learning_store=LearningRunStore(_make_config(tmp_path)))
+    params, reason = engine._build_playbook_exec_params(
+        skill_name="web_automate",
+        user_message="登录 https://fixture.local/login，账号 test_user，上传 /tmp/demo.pdf 并提交申请。",
+    )
+
+    assert reason is None
+    assert params["auto_resume"] is True
+    assert params["continue_on_error"] is False
+    actions = params["actions"]
+    assert actions[0]["action"] == "open"
+    assert "fixture.local" in actions[0]["url"]
+    assert any(step["action"] == "type" for step in actions)
+    assert any(step["action"] == "upload_file" for step in actions)
+    assert actions[-1]["action"] == "screenshot"

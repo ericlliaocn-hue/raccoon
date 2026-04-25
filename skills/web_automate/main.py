@@ -15,6 +15,8 @@ from __future__ import annotations
 import json
 import re
 import sys
+import time
+from pathlib import Path
 from typing import Any
 
 # ── 模式检测 ──────────────────────────────────────────────
@@ -253,6 +255,34 @@ def _build_result(
     }
 
 
+def _persist_run_artifacts(
+    *,
+    task_id: str,
+    owner: str,
+    mode: str,
+    action_list: list[dict[str, Any]],
+    details: list[dict[str, Any]],
+    runtime_artifacts: dict[str, Any],
+    output_dir: Path | None = None,
+) -> str:
+    out_dir = output_dir or (Path(__file__).parent.parent.parent / "output")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = int(time.time() * 1000)
+    base = re.sub(r"[^a-zA-Z0-9_.-]+", "_", task_id or owner or "run")
+    filename = f"web_automate_artifacts_{base}_{stamp}.json"
+    path = out_dir / filename
+    payload = {
+        "task_id": task_id,
+        "owner": owner,
+        "mode": mode,
+        "action_count": len(action_list),
+        "details": details,
+        "runtime_artifacts": runtime_artifacts,
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return str(path)
+
+
 async def run_browser_skill(data: dict[str, Any]) -> dict[str, Any]:
     """默认运行路径：通过 BrowserSessionManager 获取/释放浏览器会话。"""
     task_id = data.get("task_id", "")
@@ -264,6 +294,7 @@ async def run_browser_skill(data: dict[str, Any]) -> dict[str, Any]:
     raw = str(params.get("prompt") or origin).strip()
     url = _extract_url(raw)
     action_list = params.get("actions") if isinstance(params.get("actions"), list) else _parse_actions(raw, url)
+    continue_on_error = bool(params.get("continue_on_error", False))
     owner = str(conversation_id or task_id or "web_automate")
 
     try:
@@ -282,8 +313,21 @@ async def run_browser_skill(data: dict[str, Any]) -> dict[str, Any]:
             session=session,
             owner=owner,
         )
-        details = await session.engine.execute(run_actions, start_index=resume_from)
+        details = await session.engine.execute(
+            run_actions,
+            start_index=resume_from,
+            continue_on_error=continue_on_error,
+        )
         runtime = session.engine.get_runtime_artifacts()
+        artifact_manifest = _persist_run_artifacts(
+            task_id=task_id,
+            owner=owner,
+            mode=mode,
+            action_list=run_actions,
+            details=details,
+            runtime_artifacts=runtime,
+        )
+        runtime["artifact_manifest"] = artifact_manifest
         result = _build_result(
             mode,
             details,

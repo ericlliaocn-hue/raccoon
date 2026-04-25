@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.7] - 2026-04-25
+
+### 🔧 地基加固（学习闭环 + 浏览器链路）
+
+> 目标：在不扩生态/多平台的前提下，优先把“真实学习可执行性”和“浏览器长链路稳定性”继续压实。
+
+- **学习闭环执行深化**：`login_form_chain` 增加登录流程上下文约束（URL 不是唯一条件），减少“地址有了但动作条件不足”导致的伪执行
+- **稳定编排入参增强**：`web_automate` 稳定执行路径可注入结构化动作序列（登录/上传/提交），降低纯自然语言解析漂移
+- **浏览器失败策略增强**：长链路默认 fail-fast（失败即停），减少级联错误污染，恢复点更明确
+- **浏览器证据沉淀**：每次运行生成 artifacts manifest（检查点/失败证据/域名健康），支持后续定位与复盘
+- **回归覆盖补强**：新增学习闭环与浏览器 fail-fast/continue-on-error 测试，保障修复可持续
+
 ## [0.5.6] - 2026-04-25
 
 ### ⚙️ 稳定化冲刺（执行成功率优先）

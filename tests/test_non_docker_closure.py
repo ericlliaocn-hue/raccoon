@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -292,3 +294,77 @@ def test_web_automate_auto_resume_from_failed_step():
     assert resumed is True
     assert resume_from == 1
     assert actions == session.last_run["action_list"][1:]
+
+
+def test_web_automate_persist_artifacts_manifest(tmp_path):
+    from skills.web_automate.main import _persist_run_artifacts
+
+    manifest = _persist_run_artifacts(
+        task_id="task-1",
+        owner="conv-1",
+        mode="cdp",
+        action_list=[{"action": "open", "url": "https://fixture.local/login"}],
+        details=[{"action": "open", "success": True, "message": "ok"}],
+        runtime_artifacts={"checkpoints": [{"step_index": 0}]},
+        output_dir=tmp_path,
+    )
+
+    path = tmp_path / Path(manifest).name
+    assert path.exists()
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["task_id"] == "task-1"
+    assert payload["mode"] == "cdp"
+    assert payload["action_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_browser_engine_execute_fail_fast_stops_on_first_failure():
+    from skills.web_automate.actions import ActionResult
+    from skills.web_automate.browser_engine import BrowserEngine
+
+    engine = BrowserEngine("headless")
+
+    async def _fake_execute(index, act, action_type):
+        if action_type == "click":
+            return ActionResult(success=False, message="boom")
+        return ActionResult(success=True, message="ok")
+
+    engine._execute_action_reliable = _fake_execute  # type: ignore[assignment]
+    results = await engine.execute(
+        [
+            {"action": "open", "url": "https://fixture.local/login"},
+            {"action": "click", "selector": "#submit"},
+            {"action": "screenshot"},
+        ]
+    )
+
+    assert len(results) == 2
+    assert results[-1]["action"] == "click"
+    assert results[-1]["success"] is False
+
+
+@pytest.mark.asyncio
+async def test_browser_engine_execute_continue_on_error_runs_all_steps():
+    from skills.web_automate.actions import ActionResult
+    from skills.web_automate.browser_engine import BrowserEngine
+
+    engine = BrowserEngine("headless")
+
+    async def _fake_execute(index, act, action_type):
+        if action_type == "click":
+            return ActionResult(success=False, message="boom")
+        return ActionResult(success=True, message="ok")
+
+    engine._execute_action_reliable = _fake_execute  # type: ignore[assignment]
+    results = await engine.execute(
+        [
+            {"action": "open", "url": "https://fixture.local/login"},
+            {"action": "click", "selector": "#submit"},
+            {"action": "screenshot"},
+        ],
+        continue_on_error=True,
+    )
+
+    assert len(results) == 3
+    assert results[1]["success"] is False
+    assert results[2]["action"] == "screenshot"

@@ -620,6 +620,7 @@ class BrowserEngine:
         action_list: list[dict[str, Any]],
         *,
         start_index: int = 0,
+        continue_on_error: bool = False,
     ) -> list[dict[str, Any]]:
         """执行动作序列，返回每个动作的结果"""
         results = []
@@ -638,7 +639,9 @@ class BrowserEngine:
                 "data": result.data,
                 "step_checkpoint": checkpoint,
             })
-            # 如果动作失败，继续执行下一个（不中断），由调用方决定是否中止链路
+            if not result.success and not continue_on_error:
+                # 默认 fail-fast：失败即停，避免级联错误污染后续步骤
+                break
         return results
 
     async def _do_action(self, act: dict[str, Any], action_type: str) -> ActionResult:

@@ -807,7 +807,15 @@ class LearningEngine:
         if skill_name == "web_automate":
             if not self._has_form_target(user_message):
                 return {}, "missing_form_target"
-            return {"prompt": user_message, "auto_resume": True}, None
+            actions = self._build_login_chain_actions(user_message)
+            if not actions:
+                return {}, "missing_form_context"
+            return {
+                "prompt": user_message,
+                "auto_resume": True,
+                "actions": actions,
+                "continue_on_error": False,
+            }, None
 
         if skill_name == "shell_exec":
             command = self._extract_shell_command(user_message)
@@ -973,12 +981,114 @@ class LearningEngine:
         return False
 
     def _has_form_target(self, text: str) -> bool:
-        value = str(text or "").lower()
-        if re.search(r"https?://", value):
-            return True
-        if any(token in value for token in ("oa.example", "example.com", "oa.internal")):
+        value = str(text or "")
+        lower = value.lower()
+        if any(token in lower for token in ("oa.example", "example.com", "oa.internal")):
             return False
-        return False
+        url = self._extract_url_like(value)
+        if not url:
+            return False
+        return self._has_login_flow_context(value)
+
+    def _has_login_flow_context(self, text: str) -> bool:
+        normalized = normalize_intent_phrase(text)
+        _, _, has_secret = self._extract_login_credentials(text)
+        if has_secret:
+            return True
+        operation_tokens = (
+            "登录",
+            "signin",
+            "submit",
+            "提交",
+            "上传",
+            "upload",
+            "表单",
+            "流程单",
+            "已有登录态",
+            "已登录",
+            "cookie",
+            "token",
+        )
+        return any(token in normalized for token in operation_tokens)
+
+    def _extract_login_credentials(self, text: str) -> tuple[str, str, bool]:
+        value = str(text or "")
+        username = ""
+        password = ""
+        user_match = re.search(
+            r"(?:账号|账户|用户名|username|user)\s*[:：=]?\s*([a-zA-Z0-9_.@-]+)",
+            value,
+            re.IGNORECASE,
+        )
+        if user_match:
+            username = user_match.group(1).strip()
+        pass_match = re.search(
+            r"(?:密码|password|pass)\s*[:：=]?\s*([^\s，。；;]+)",
+            value,
+            re.IGNORECASE,
+        )
+        if pass_match:
+            password = pass_match.group(1).strip()
+        return username, password, bool(username or password)
+
+    def _build_login_chain_actions(self, text: str) -> list[dict[str, Any]]:
+        url = self._extract_url_like(text)
+        if not url:
+            return []
+
+        actions: list[dict[str, Any]] = [{"action": "open", "url": url}]
+        username, password, _ = self._extract_login_credentials(text)
+        if username:
+            actions.append(
+                {
+                    "action": "type",
+                    "selector": "input[name='username'], input[name='user'], input[type='email'], #username, #user",
+                    "text": username,
+                }
+            )
+        if password:
+            actions.append(
+                {
+                    "action": "type",
+                    "selector": "input[name='password'], input[type='password'], #password, #passwd",
+                    "text": password,
+                }
+            )
+
+        normalized = normalize_intent_phrase(text)
+        if any(token in normalized for token in ("登录", "signin", "提交")):
+            actions.append(
+                {
+                    "action": "click",
+                    "selector": "button[type='submit'], button.login, #login, .login-btn, .btn-primary",
+                    "retries": 2,
+                }
+            )
+            actions.append({"action": "wait", "ms": 1200})
+
+        upload_path = self._extract_file_path_like(text)
+        if upload_path and any(token in normalized for token in ("上传", "upload", "附件", "file")):
+            actions.append(
+                {
+                    "action": "upload_file",
+                    "selector": "input[type='file']",
+                    "file_paths": [upload_path],
+                    "retries": 1,
+                }
+            )
+
+        if any(token in normalized for token in ("提交", "submit", "保存", "发送")):
+            actions.append(
+                {
+                    "action": "click",
+                    "selector": "button[type='submit'], button.submit, #submit, .submit-btn, .btn-primary",
+                    "retries": 2,
+                }
+            )
+            actions.append({"action": "wait", "ms": 1000})
+
+        actions.append({"action": "screenshot", "full_page": True})
+        return actions
 
     def _has_concrete_shell_command(self, text: str) -> bool:
         value = str(text or "").strip()
@@ -2785,6 +2895,8 @@ cron 示例：
             return "metadata_invalid"
         if "compile_failed" in msg or "syntaxerror" in msg:
             return "compile_failed"
+        if "missing_form_context" in msg or "missing_form_target" in msg:
+            return "missing_form_target"
         if "no module named" in msg or "dependency" in msg or "pip" in msg:
             return "dependency_missing"
         if "timeout" in msg or "timed out" in msg:
