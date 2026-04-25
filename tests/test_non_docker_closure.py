@@ -296,6 +296,36 @@ def test_web_automate_auto_resume_from_failed_step():
     assert actions == session.last_run["action_list"][1:]
 
 
+def test_web_automate_auto_resume_from_persisted_state():
+    from types import SimpleNamespace
+
+    from skills.web_automate.main import _resolve_resume_plan
+
+    session = SimpleNamespace(last_run={})
+    persisted = {
+        "owner": "conv-2",
+        "action_list": [
+            {"action": "open", "url": "https://fixture.local/login"},
+            {"action": "type", "selector": "#username", "text": "demo"},
+            {"action": "click", "selector": "#submit"},
+        ],
+        "failed_step": 2,
+    }
+
+    actions, resume_from, resumed = _resolve_resume_plan(
+        origin="继续",
+        params={},
+        action_list=[{"action": "screenshot"}],
+        session=session,
+        owner="conv-2",
+        persisted_last_run=persisted,
+    )
+
+    assert resumed is True
+    assert resume_from == 2
+    assert actions == persisted["action_list"][2:]
+
+
 def test_web_automate_persist_artifacts_manifest(tmp_path):
     from skills.web_automate.main import _persist_run_artifacts
 
@@ -315,6 +345,34 @@ def test_web_automate_persist_artifacts_manifest(tmp_path):
     assert payload["task_id"] == "task-1"
     assert payload["mode"] == "cdp"
     assert payload["action_count"] == 1
+
+
+def test_web_automate_persist_failure_evidence_manifest(tmp_path):
+    from skills.web_automate.main import _persist_failure_evidence
+
+    manifest = _persist_failure_evidence(
+        task_id="task-2",
+        owner="conv-2",
+        mode="cdp",
+        details=[
+            {"action": "open", "success": True, "message": "ok"},
+            {"action": "click", "success": False, "message": "selector missing"},
+        ],
+        runtime_artifacts={
+            "checkpoints": [{"step_index": 1}],
+            "domain_health": {"fixture.local": "suspected_expired"},
+            "artifacts": [{"screenshot": "/tmp/a.png", "dom_snapshot": "/tmp/a.html"}],
+        },
+        output_dir=tmp_path,
+    )
+
+    assert manifest is not None
+    path = tmp_path / Path(str(manifest)).name
+    assert path.exists()
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["task_id"] == "task-2"
+    assert len(payload["failed_steps"]) == 1
+    assert payload["failed_steps"][0]["action"] == "click"
 
 
 @pytest.mark.asyncio
@@ -368,3 +426,72 @@ async def test_browser_engine_execute_continue_on_error_runs_all_steps():
     assert len(results) == 3
     assert results[1]["success"] is False
     assert results[2]["action"] == "screenshot"
+
+
+@pytest.mark.asyncio
+async def test_browser_engine_custom_url_assertion():
+    from skills.web_automate.actions import ActionResult
+    from skills.web_automate.browser_engine import BrowserEngine
+
+    class _Page:
+        def __init__(self):
+            self.url = "https://fixture.local/dashboard"
+
+        async def wait_for_selector(self, selector, timeout=1000, state="visible"):
+            return None
+
+        async def inner_text(self, selector):
+            return "dashboard ok"
+
+    engine = BrowserEngine("headless")
+    engine._page = _Page()
+
+    ok, reason = await engine._assert_action_result(  # type: ignore[attr-defined]
+        "open",
+        {"expected_url_contains": ["dashboard", "fixture.local"]},
+        ActionResult(success=True, message="ok", data={"url": "https://fixture.local/dashboard"}),
+    )
+    assert ok is True
+    assert reason == ""
+
+    ok2, reason2 = await engine._assert_action_result(  # type: ignore[attr-defined]
+        "open",
+        {"expected_url_contains": "not-found"},
+        ActionResult(success=True, message="ok", data={"url": "https://fixture.local/dashboard"}),
+    )
+    assert ok2 is False
+    assert "url_assert_failed" in reason2
+
+
+@pytest.mark.asyncio
+async def test_browser_engine_custom_text_assertion():
+    from skills.web_automate.actions import ActionResult
+    from skills.web_automate.browser_engine import BrowserEngine
+
+    class _Page:
+        url = "https://fixture.local/report"
+
+        async def wait_for_selector(self, selector, timeout=1000, state="visible"):
+            return None
+
+        async def inner_text(self, selector):
+            return "report contains summary and timestamp"
+
+    engine = BrowserEngine("headless")
+    engine._page = _Page()
+
+    ok, reason = await engine._assert_action_result(  # type: ignore[attr-defined]
+        "read_page",
+        {"assert_text_contains": ["summary", "timestamp"]},
+        ActionResult(success=True, message="ok", data={}),
+    )
+    assert ok is True
+    assert reason == ""
+
+    ok2, reason2 = await engine._assert_action_result(  # type: ignore[attr-defined]
+        "read_page",
+        {"assert_text_contains": "absent-token"},
+        ActionResult(success=True, message="ok", data={}),
+    )
+    assert ok2 is False
+    assert "text_assert_failed" in reason2

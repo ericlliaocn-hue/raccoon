@@ -13,13 +13,16 @@
   raccoon skills [list|install|uninstall|info]  # Skill 管理
   raccoon logs                     # 查看日志
   raccoon doctor                   # 诊断检查
-  raccoon benchmark core           # 核心场景基准报告
+  raccoon benchmark core           # 核心场景夹具基准报告
+  raccoon benchmark live           # 真实外站压测（稳定包+扰动包）
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
+import io
 import json
 import re
 import subprocess
@@ -87,13 +90,15 @@ def main() -> None:
 
     # ─── benchmark ────────────────────────────────────────────
     p_benchmark = sub.add_parser("benchmark", help="基准测试与报告")
-    p_benchmark.add_argument("suite", nargs="?", default="core", choices=["core"], help="基准套件")
+    p_benchmark.add_argument("suite", nargs="?", default="core", choices=["core", "live"], help="基准套件")
     p_benchmark.add_argument("--json", action="store_true", help="输出 JSON")
     p_benchmark.add_argument(
         "--store-only",
         action="store_true",
         help="仅输出当前 learning_runs 聚合，不运行双包基准",
     )
+    p_benchmark.add_argument("--stable-rounds", type=int, default=5, help="live 稳定包轮数")
+    p_benchmark.add_argument("--perturb-rounds", type=int, default=3, help="live 扰动包轮数")
 
     # ─── schedule ─────────────────────────────────────────────
     p_schedule = sub.add_parser("schedule", help="定时任务管理")
@@ -138,7 +143,46 @@ def main() -> None:
 # 子命令实现
 # ═══════════════════════════════════════════════════════════════
 
+def _is_local_host(host: str) -> bool:
+    value = str(host or "").strip().lower()
+    return value in {"127.0.0.1", "localhost", "::1"}
+
+
+def _validate_http_security_guard(host: str, config) -> tuple[bool, str]:
+    """远程监听安全闸门（fail-closed）。
+
+    当启用远程监听且配置要求强制认证时，必须提供足够长度的 token。
+    """
+    if _is_local_host(host):
+        return True, ""
+    if not bool(getattr(config, "http_enforce_remote_auth", True)):
+        return True, ""
+
+    token = str(getattr(config, "http_auth_token", "") or "")
+    min_len = int(getattr(config, "http_min_auth_token_length", 16) or 16)
+    if not token:
+        return (
+            False,
+            "远程监听已拒绝：未配置 http_auth_token。"
+            "请先在 config.json 或环境变量中配置 token。",
+        )
+    if len(token) < min_len:
+        return (
+            False,
+            f"远程监听已拒绝：http_auth_token 长度不足（当前 {len(token)}，要求 >= {min_len}）。",
+        )
+    return True, ""
+
+
 def _cmd_start(args) -> None:
+    if not args.cli:
+        from src.config import load_config
+
+        ok, reason = _validate_http_security_guard(args.host, load_config())
+        if not ok:
+            print(f"❌ {reason}")
+            sys.exit(1)
+
     from src.daemon import start
     ok = start(http=not args.cli, host=args.host, port=args.port)
     sys.exit(0 if ok else 1)
@@ -151,6 +195,14 @@ def _cmd_stop() -> None:
 
 
 def _cmd_restart(args) -> None:
+    if not args.cli:
+        from src.config import load_config
+
+        ok, reason = _validate_http_security_guard(args.host, load_config())
+        if not ok:
+            print(f"❌ {reason}")
+            sys.exit(1)
+
     from src.daemon import restart
     ok = restart(http=not args.cli, host=args.host, port=args.port)
     sys.exit(0 if ok else 1)
@@ -370,6 +422,7 @@ def _cmd_doctor() -> None:
     # 2. 依赖检查
     deps = [
         ("pydantic", "pydantic"),
+        ("pydantic_settings", "pydantic-settings"),
         ("fastapi", "fastapi"),
         ("uvicorn", "uvicorn"),
         ("structlog", "structlog"),
@@ -379,6 +432,7 @@ def _cmd_doctor() -> None:
         ("click", "click"),
         ("rich", "rich"),
         ("aiosqlite", "aiosqlite"),
+        ("playwright", "playwright"),
         ("bs4", "beautifulsoup4"),
         ("feedparser", "feedparser"),
         ("aiosmtplib", "aiosmtplib"),
@@ -404,11 +458,16 @@ def _cmd_doctor() -> None:
             else:
                 print("  ⚠️  LLM API Key 未配置")
                 issues.append("LLM API Key 未配置")
-            if config.http_host == "127.0.0.1":
+
+            if _is_local_host(config.http_host):
                 print("  ✅ HTTP 默认仅监听本地")
             else:
-                print(f"  ⚠️  HTTP 监听地址为 {config.http_host}，请确认已配置认证")
-                issues.append("HTTP 未使用本地监听地址")
+                ok, reason = _validate_http_security_guard(config.http_host, config)
+                if ok:
+                    print(f"  ✅ 远程监听鉴权已满足 ({config.http_host})")
+                else:
+                    print(f"  ❌ {reason}")
+                    issues.append("远程监听安全闸门未满足")
         except Exception as e:
             print(f"  ❌ 配置加载失败: {e}")
             issues.append("配置加载失败")
@@ -660,13 +719,75 @@ def _cmd_doctor() -> None:
 
 def _cmd_benchmark(args) -> None:
     """核心场景基准报告。默认跑双包夹具基准并输出 mismatch。"""
-    if args.suite != "core":
+    if args.suite not in {"core", "live"}:
         print(f"❌ 不支持的基准套件: {args.suite}")
         sys.exit(1)
 
-    from src.config import load_config
+    try:
+        from src.config import load_config
+    except ModuleNotFoundError as e:
+        missing = getattr(e, "name", "unknown")
+        print(f"❌ benchmark 依赖缺失：{missing}")
+        print("   请先安装依赖：python3.11 -m pip install -e .[dev]")
+        sys.exit(1)
 
     config = load_config()
+    if args.suite == "live":
+        from src.brain.live_benchmark_runner import run_live_benchmark_sync
+
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            report = run_live_benchmark_sync(
+                config,
+                stable_rounds=max(1, int(args.stable_rounds)),
+                perturb_rounds=max(1, int(args.perturb_rounds)),
+            )
+        if report.get("error"):
+            if args.json:
+                print(json.dumps(report, ensure_ascii=False, indent=2))
+            else:
+                print(f"❌ {report.get('message') or report.get('error')}")
+            sys.exit(2)
+
+        if args.json:
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            sys.exit(0 if report.get("overall", {}).get("pass") else 2)
+
+        overall = report.get("overall", {})
+        stable = report.get("stable_summary", {})
+        perturb = report.get("perturb_summary", {})
+        print("🌍 真实外站压测报告（live）\n")
+        print(f"  总运行数: {overall.get('total_runs', 0)}")
+        print(f"  决策成功率: {overall.get('decision_success_rate', 0.0) * 100:.1f}%")
+        print(f"  执行成功率: {overall.get('execution_success_rate', 0.0) * 100:.1f}%")
+        print(f"  浏览器链路执行成功率: {overall.get('browser_chain_execution_success_rate', 0.0) * 100:.1f}%")
+        print(f"  场景识别准确率(扰动): {overall.get('scenario_detect_accuracy', 0.0) * 100:.1f}%")
+        print(f"  发布门禁: {'✅ 通过' if overall.get('pass') else '❌ 未通过'}")
+        print()
+        print("稳定包场景明细:")
+        for scenario_id, row in (stable.get("by_scenario") or {}).items():
+            print(
+                f"  - {scenario_id:<18} runs={row.get('runs', 0):<3d} "
+                f"decision={row.get('decision_success_rate', 0.0) * 100:>5.1f}% "
+                f"exec={row.get('execution_success_rate', 0.0) * 100:>5.1f}%"
+            )
+        print(
+            f"\n扰动包: runs={perturb.get('total_runs', 0)} "
+            f"detect={perturb.get('scenario_detect_accuracy', 0.0) * 100:.1f}% "
+            f"exec={perturb.get('execution_success_rate', 0.0) * 100:.1f}%"
+        )
+        if overall.get("failure_code_topn"):
+            print("\nfailure_code TopN:")
+            for item in overall["failure_code_topn"]:
+                print(f"  - {item.get('code', 'unknown')}: {item.get('count', 0)}")
+        if report.get("mismatch_samples"):
+            print("\nmismatch Top10:")
+            for item in report["mismatch_samples"][:10]:
+                print(
+                    f"  - expected={item.get('expected_scenario')} "
+                    f"actual={item.get('detected_scenario')}"
+                )
+        sys.exit(0 if overall.get("pass") else 2)
+
     if args.store_only:
         from src.brain.core_benchmark import build_core_scenario_report
         from src.brain.learning_store import LearningRunStore
@@ -700,6 +821,13 @@ def _cmd_benchmark(args) -> None:
 
     overall = report["overall"]
     pack_overall = bundle.get("overall", {})
+    if int(pack_overall.get("total_cases", 0)) <= 0:
+        print("❌ 基准执行异常：未产生有效样本（total_cases=0）")
+        sys.exit(2)
+    if int(overall.get("runs", 0)) <= 0:
+        print("❌ 基准执行异常：learning_runs 样本为空（runs=0）")
+        sys.exit(2)
+
     print("🧪 核心场景基准报告（双包夹具）\n")
     print(f"  双包样本: {pack_overall.get('total_cases', 0)}")
     print(f"  双包匹配率: {pack_overall.get('pack_match_rate', 0.0) * 100:.1f}%")
@@ -748,6 +876,15 @@ def _cmd_benchmark(args) -> None:
                     if item.get("actual_reason")
                     else ""
                 )
+            )
+
+    if bundle.get("observation_packs"):
+        print("\n观测包（offline + real_task）:")
+        for item in bundle["observation_packs"]:
+            print(
+                f"  - {item.get('pack_id')} total={item.get('total', 0)} "
+                f"exec={item.get('execution_success_rate', 0.0) * 100:.1f}% "
+                f"outcomes={json.dumps(item.get('outcome_counts', {}), ensure_ascii=False)}"
             )
 
     if not overall["pass"]:
@@ -937,6 +1074,11 @@ def _run_http(host: str, port: int) -> None:
     from src.config import load_config
 
     config = load_config()
+    ok, reason = _validate_http_security_guard(host, config)
+    if not ok:
+        print(f"❌ {reason}")
+        sys.exit(1)
+
     app = create_app(config)
     uvicorn.run(app, host=host, port=port)
 

@@ -181,6 +181,43 @@ def _is_resume_intent(text: str) -> bool:
     return any(signal in lower for signal in _RESUME_SIGNALS)
 
 
+def _resume_store_dir(output_dir: Path | None = None) -> Path:
+    base = output_dir or (Path(__file__).parent.parent.parent / "output")
+    store = base / "web_automate_resume"
+    store.mkdir(parents=True, exist_ok=True)
+    return store
+
+
+def _resume_store_path(owner: str, output_dir: Path | None = None) -> Path:
+    safe_owner = re.sub(r"[^a-zA-Z0-9_.-]+", "_", owner or "default")
+    return _resume_store_dir(output_dir) / f"{safe_owner}.json"
+
+
+def _load_persisted_last_run(owner: str, output_dir: Path | None = None) -> dict[str, Any] | None:
+    path = _resume_store_path(owner, output_dir)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            return payload
+    except Exception:
+        return None
+    return None
+
+
+def _persist_last_run(owner: str, state: dict[str, Any], output_dir: Path | None = None) -> str:
+    path = _resume_store_path(owner, output_dir)
+    path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    return str(path)
+
+
+def _clear_persisted_last_run(owner: str, output_dir: Path | None = None) -> None:
+    path = _resume_store_path(owner, output_dir)
+    if path.exists():
+        path.unlink()
+
+
 def _resolve_resume_plan(
     *,
     origin: str,
@@ -188,6 +225,7 @@ def _resolve_resume_plan(
     action_list: list[dict[str, Any]],
     session: Any,
     owner: str,
+    persisted_last_run: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], int, bool]:
     explicit = params.get("resume_from_step")
     if isinstance(explicit, int):
@@ -200,6 +238,8 @@ def _resolve_resume_plan(
         return action_list, 0, False
 
     last_run = getattr(session, "last_run", {}) or {}
+    if not isinstance(last_run, dict) or not last_run:
+        last_run = persisted_last_run or {}
     if not isinstance(last_run, dict):
         return action_list, 0, False
     if str(last_run.get("owner") or "") != str(owner):
@@ -283,6 +323,37 @@ def _persist_run_artifacts(
     return str(path)
 
 
+def _persist_failure_evidence(
+    *,
+    task_id: str,
+    owner: str,
+    mode: str,
+    details: list[dict[str, Any]],
+    runtime_artifacts: dict[str, Any],
+    output_dir: Path | None = None,
+) -> str | None:
+    failed_steps = [detail for detail in details if not detail.get("success")]
+    if not failed_steps:
+        return None
+
+    out_dir = output_dir or (Path(__file__).parent.parent.parent / "output")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = int(time.time() * 1000)
+    base = re.sub(r"[^a-zA-Z0-9_.-]+", "_", task_id or owner or "run")
+    path = out_dir / f"web_automate_failure_evidence_{base}_{stamp}.json"
+    payload = {
+        "task_id": task_id,
+        "owner": owner,
+        "mode": mode,
+        "failed_steps": failed_steps,
+        "checkpoints": runtime_artifacts.get("checkpoints", []),
+        "domain_health": runtime_artifacts.get("domain_health", {}),
+        "artifacts": runtime_artifacts.get("artifacts", []),
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return str(path)
+
+
 async def run_browser_skill(data: dict[str, Any]) -> dict[str, Any]:
     """默认运行路径：通过 BrowserSessionManager 获取/释放浏览器会话。"""
     task_id = data.get("task_id", "")
@@ -305,6 +376,7 @@ async def run_browser_skill(data: dict[str, Any]) -> dict[str, Any]:
     session = None
     manager = get_session_manager()
     try:
+        persisted_last_run = _load_persisted_last_run(owner)
         session = await manager.acquire(mode, owner=owner, reuse_url=url or "")
         run_actions, resume_from, resumed = _resolve_resume_plan(
             origin=origin,
@@ -312,6 +384,7 @@ async def run_browser_skill(data: dict[str, Any]) -> dict[str, Any]:
             action_list=action_list,
             session=session,
             owner=owner,
+            persisted_last_run=persisted_last_run,
         )
         details = await session.engine.execute(
             run_actions,
@@ -328,6 +401,15 @@ async def run_browser_skill(data: dict[str, Any]) -> dict[str, Any]:
             runtime_artifacts=runtime,
         )
         runtime["artifact_manifest"] = artifact_manifest
+        failure_evidence_manifest = _persist_failure_evidence(
+            task_id=task_id,
+            owner=owner,
+            mode=mode,
+            details=details,
+            runtime_artifacts=runtime,
+        )
+        if failure_evidence_manifest:
+            runtime["failure_evidence_manifest"] = failure_evidence_manifest
         result = _build_result(
             mode,
             details,
@@ -350,6 +432,19 @@ async def run_browser_skill(data: dict[str, Any]) -> dict[str, Any]:
             "details": details,
             "runtime": runtime,
         }
+        _persist_last_run(
+            owner,
+            {
+                "owner": owner,
+                "action_list": action_list,
+                "failed_step": failed_step,
+                "details": details,
+                "runtime": runtime,
+                "updated_at": int(time.time()),
+            },
+        )
+        if failed_step is None:
+            _clear_persisted_last_run(owner)
     finally:
         if session is not None:
             await manager.release(session.id)

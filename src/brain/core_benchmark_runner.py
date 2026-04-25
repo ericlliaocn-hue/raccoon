@@ -140,6 +140,8 @@ async def run_core_benchmark_packs(
     *,
     clarification_pack: Path | None = None,
     execution_pack: Path | None = None,
+    offline_pack: Path | None = None,
+    real_task_pack: Path | None = None,
 ) -> dict[str, Any]:
     base = config or RaccoonConfig()
     benchmark_db = PROJECT_ROOT / "data" / "benchmarks" / "core_fixture_latest.db"
@@ -159,6 +161,9 @@ async def run_core_benchmark_packs(
     clarification_pack = clarification_pack or (PROJECT_ROOT / "benchmarks" / "core" / "clarification_pack.json")
     execution_pack = execution_pack or (PROJECT_ROOT / "benchmarks" / "core" / "execution_pack.json")
     packs = [_load_pack(clarification_pack), _load_pack(execution_pack)]
+    offline_pack = offline_pack or (PROJECT_ROOT / "benchmarks" / "core" / "offline_sample_pack.json")
+    real_task_pack = real_task_pack or (PROJECT_ROOT / "benchmarks" / "core" / "real_task_sample_pack.json")
+    observation_packs = [_load_pack(offline_pack), _load_pack(real_task_pack)]
 
     pack_summaries: list[dict[str, Any]] = []
     mismatches: list[dict[str, Any]] = []
@@ -224,6 +229,48 @@ async def run_core_benchmark_packs(
             }
         )
 
+    observation_summaries: list[dict[str, Any]] = []
+    for pack in observation_packs:
+        cases = list(pack.get("cases", []))
+        outcome_counts: dict[str, int] = {}
+        execution_attempted = 0
+        execution_success = 0
+        for case in cases:
+            prompt = str(case.get("prompt", ""))
+            scenario_id = str(case.get("scenario_id", "") or "")
+            case_id = str(case.get("case_id", ""))
+
+            task = Task(
+                conversation_id=f"bench_obs_{pack.get('pack_id', 'core')}_{case_id}",
+                user_id="benchmark",
+                origin_message=prompt,
+                skill_name="learning",
+                context={"scenario_id": scenario_id, "benchmark_case_id": case_id},
+            )
+            result = await engine.learn(task, prompt)
+            run_id = str(result.get("learning_run_id", "") or "")
+            run = store.get(run_id) if run_id else None
+            outcome = str(getattr(run, "handling_outcome", "") or "unknown")
+            outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
+            if run and run.execution_attempted:
+                execution_attempted += 1
+                if run.execution_success:
+                    execution_success += 1
+
+        observation_summaries.append(
+            {
+                "pack_id": pack.get("pack_id"),
+                "type": pack.get("type"),
+                "total": len(cases),
+                "outcome_counts": outcome_counts,
+                "execution_attempted": execution_attempted,
+                "execution_success": execution_success,
+                "execution_success_rate": (
+                    execution_success / execution_attempted if execution_attempted else 0.0
+                ),
+            }
+        )
+
     report = build_core_scenario_report(
         store.aggregate_core_scenarios(),
         store.top_failure_clusters(days=7, limit=10),
@@ -239,6 +286,7 @@ async def run_core_benchmark_packs(
             "mismatch_count": len(mismatches),
         },
         "mismatches": mismatches,
+        "observation_packs": observation_summaries,
         "benchmark_report": report,
     }
 
@@ -248,11 +296,15 @@ def run_core_benchmark_packs_sync(
     *,
     clarification_pack: Path | None = None,
     execution_pack: Path | None = None,
+    offline_pack: Path | None = None,
+    real_task_pack: Path | None = None,
 ) -> dict[str, Any]:
     return asyncio.run(
         run_core_benchmark_packs(
             config=config,
             clarification_pack=clarification_pack,
             execution_pack=execution_pack,
+            offline_pack=offline_pack,
+            real_task_pack=real_task_pack,
         )
     )

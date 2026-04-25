@@ -148,6 +148,10 @@ raccoon doctor
 raccoon benchmark core
 raccoon benchmark core --json
 
+# 真实外站压测（稳定包 + 扰动包）
+raccoon benchmark live
+raccoon benchmark live --json
+
 # 查看日志
 raccoon logs
 raccoon logs -f         # 持续跟踪

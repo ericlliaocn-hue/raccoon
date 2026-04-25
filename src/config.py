@@ -62,6 +62,8 @@ class RaccoonConfig(BaseSettings):
     http_host: str = "127.0.0.1"
     http_port: int = 8900
     http_auth_token: str = ""  # 为空则不启用认证，生产环境建议配置
+    http_enforce_remote_auth: bool = True  # 远程监听（非 localhost）时是否强制要求 token
+    http_min_auth_token_length: int = 16  # 远程模式下 token 最小长度
 
     # ─── Browser (CDP) ───
     chrome_path: str = ""  # Chrome 可执行文件路径，为空则自动检测

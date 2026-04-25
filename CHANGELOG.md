@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.8] - 2026-04-25
+
+### 🛠️ 双向修复（平衡档契约）+ 真实外站压测固化
+
+> 目标：修复 `price_monitor` / `remote_exec` 在真实外站压测中“执行成功却被契约误杀”的确定性失败。
+
+- **版本先行同步**：`pyproject.toml`、`src/__init__.py`、静态资源版本参数和 UI 版本文案统一到 `0.5.8`
+- **Skill 结构化证据补齐**：`change_detector` 输出标准化 `artifacts`（`target/url/path/snapshot_id/content_hash/subcmd`）；`shell_exec` 输出 `command/exit_code/task_id/trace` 并保留向后兼容 reply/files
+- **执行契约平衡化**：`price_monitor`、`remote_exec` 改为“结构化证据优先 + 文案兜底”，降低误杀但不放宽 `login_form_chain` 的严格约束
+- **LearningEngine 证据归一**：执行结果入库前补齐最小证据（来自 task/params 的 `target`、`command`、`task_id`、`trace` 等），避免因 Skill 返回字段缺失导致误判
+- **外站压测一键化**：新增 `raccoon benchmark live`，统一输出 `decision_success` / `execution_success` / 场景识别准确率 / 浏览器链路成功率 / failure_code TopN / mismatch 样本
+- **测试补齐**：新增契约正反例、Skill `artifacts` 完整性、稳定路径执行回归测试，覆盖本轮修复点
+
+### 🚀 学习闭环 + 浏览器稳定性硬化
+
+> 目标：把“该中 Skill 就执行、该追问就追问、浏览器失败可恢复可复盘”落到可验收门禁。
+
+- **场景契约接入学习主链**：新增 `scenario_contracts`，统一核心场景请求前置校验与执行后契约校验（price/login/remote/schedule）
+- **reused 可控执行补强**：`content_skill_bundle` 在 runner 可用时会尝试真实执行，保留 `reused` 语义但增加 `execution_attempted/execution_success` 数据
+- **失败修复模板化**：按 `failure_code` 注入定向修复策略，降低泛化重试比例
+- **浏览器恢复落盘**：`web_automate` 增加跨进程 resume 状态持久化（`output/web_automate_resume/*.json`）
+- **失败证据标准化**：新增 failure evidence manifest（失败步骤 + checkpoint + domain_health + artifacts）
+- **浏览器强断言**：动作支持 `expected_url_contains` / `expected_url_not_contains` / `assert_selector` / `assert_text_contains`，减少“执行成功但业务未完成”
+- **benchmark 三轨观测**：在双包断言外新增 `offline + real_task` 观测包输出，避免只看夹具数据
+- **门禁防空跑**：`raccoon benchmark core` 新增 `runs=0/total_cases=0` 保护并输出明确失败
+- **远程监听安全闸门**：新增 fail-closed 启动校验（非 localhost 且未配置/弱 token 时拒绝启动），并在 doctor 明确报错
+- **doctor 依赖检查补齐**：新增 `pydantic-settings`、`playwright` 依赖可用性检查
+
 ## [0.5.7] - 2026-04-25
 
 ### 🔧 地基加固（学习闭环 + 浏览器链路）

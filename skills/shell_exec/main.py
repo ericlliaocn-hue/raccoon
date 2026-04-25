@@ -13,6 +13,7 @@ import json
 import shlex
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 # 危险命令黑名单（子串匹配，忽略大小写）
@@ -39,11 +40,17 @@ def _extract_command(text: str) -> str:
     return text.strip()
 
 
+def _build_trace(task_id: str) -> str:
+    prefix = (task_id or "task")[:8]
+    return f"{prefix}-{uuid.uuid4().hex[:8]}"
+
+
 def main() -> None:
     data = json.loads(sys.stdin.read())
     task_id = data.get("task_id", "")
     origin = data.get("origin_message", "")
     params = data.get("params", {})
+    trace_id = _build_trace(task_id)
 
     # 优先用 params.rest，否则从 origin_message 解析
     cmd = (params.get("rest") or "").strip()
@@ -55,6 +62,13 @@ def main() -> None:
             "task_id": task_id,
             "reply": "❌ 未提供命令，请说「执行 ls -la」或「shell pwd」",
             "files": [],
+            "artifacts": {
+                "command": "",
+                "exit_code": None,
+                "task_id": task_id,
+                "trace": trace_id,
+                "error": "missing_command",
+            },
         }
         print(json.dumps(result, ensure_ascii=False))
         return
@@ -64,6 +78,14 @@ def main() -> None:
             "task_id": task_id,
             "reply": f"⛔ 拒绝执行危险命令：{cmd}\n涉及系统破坏性操作，已被安全策略拦截。",
             "files": [],
+            "artifacts": {
+                "command": cmd,
+                "exit_code": None,
+                "task_id": task_id,
+                "trace": trace_id,
+                "blocked": True,
+                "error": "dangerous_command",
+            },
         }
         print(json.dumps(result, ensure_ascii=False))
         return
@@ -98,11 +120,27 @@ def main() -> None:
             output = output[:MAX_OUTPUT] + f"\n\n... (输出截断，共 {len(output)} 字符)"
 
         if exit_code == 0:
-            reply = f"✅ 命令执行成功 (exit {exit_code})\n\n```\n{output.strip()}\n```"
+            reply = (
+                f"✅ 命令执行成功 (exit {exit_code})\n"
+                f"trace={trace_id} task={task_id}\n\n```\n{output.strip()}\n```"
+            )
         else:
-            reply = f"⚠️ 命令返回非零退出码 (exit {exit_code})\n\n```\n{output.strip()}\n```"
+            reply = (
+                f"⚠️ 命令返回非零退出码 (exit {exit_code})\n"
+                f"trace={trace_id} task={task_id}\n\n```\n{output.strip()}\n```"
+            )
 
-        result = {"task_id": task_id, "reply": reply, "files": []}
+        result = {
+            "task_id": task_id,
+            "reply": reply,
+            "files": [],
+            "artifacts": {
+                "command": cmd,
+                "exit_code": exit_code,
+                "task_id": task_id,
+                "trace": trace_id,
+            },
+        }
         print(json.dumps(result, ensure_ascii=False))
 
     except subprocess.TimeoutExpired:
@@ -110,13 +148,28 @@ def main() -> None:
             "task_id": task_id,
             "reply": f"⏱️ 命令超时（{TIMEOUT}秒）：{cmd}",
             "files": [],
+            "artifacts": {
+                "command": cmd,
+                "exit_code": None,
+                "task_id": task_id,
+                "trace": trace_id,
+                "error": "timeout",
+            },
         }
         print(json.dumps(result, ensure_ascii=False))
     except FileNotFoundError:
+        not_found = cmd.split()[0] if isinstance(cmd, str) else cmd[0]
         result = {
             "task_id": task_id,
-            "reply": f"❌ 命令未找到：{cmd.split()[0] if isinstance(cmd, str) else cmd[0]}",
+            "reply": f"❌ 命令未找到：{not_found}",
             "files": [],
+            "artifacts": {
+                "command": cmd,
+                "exit_code": None,
+                "task_id": task_id,
+                "trace": trace_id,
+                "error": "command_not_found",
+            },
         }
         print(json.dumps(result, ensure_ascii=False))
     except Exception as e:
@@ -124,6 +177,13 @@ def main() -> None:
             "task_id": task_id,
             "reply": f"❌ 执行出错：{e}",
             "files": [],
+            "artifacts": {
+                "command": cmd,
+                "exit_code": None,
+                "task_id": task_id,
+                "trace": trace_id,
+                "error": str(e),
+            },
         }
         print(json.dumps(result, ensure_ascii=False))
 

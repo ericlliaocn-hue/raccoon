@@ -297,6 +297,45 @@ async def test_learning_preflight_reuses_content_skill_bundle(tmp_path: Path):
     assert "weibo_hot" in run.artifacts["skills"]
 
 
+@pytest.mark.asyncio
+async def test_learning_preflight_reused_bundle_can_execute_when_runner_available(tmp_path: Path):
+    config = _make_config(tmp_path)
+    store = LearningRunStore(config)
+
+    class _ReportRunner:
+        async def run(self, task, params):
+            return {"reply": "✅ 日报已生成，来源与时间已附带。", "files": []}
+
+    class _Vault:
+        def list_skills(self):
+            return [
+                SimpleNamespace(name="weibo_hot"),
+                SimpleNamespace(name="ai_daily_report"),
+            ]
+
+        def get_skill_runner(self, name):
+            return _ReportRunner() if name == "ai_daily_report" else None
+
+    engine = LearningEngine(config=config, vault_manager=_Vault(), learning_store=store)
+    result = await engine.learn(
+        Task(
+            conversation_id="c1",
+            user_id="u1",
+            origin_message="帮我整理一下今天重点。",
+            skill_name="learning",
+        ),
+        "帮我整理一下今天重点。",
+    )
+
+    run = store.get(result["learning_run_id"])
+    assert run is not None
+    assert run.status == LearningRunStatus.SUCCEEDED
+    assert run.handling_outcome == "reused"
+    assert run.execution_attempted is True
+    assert run.execution_success is True
+    assert "ai_daily_report" in (run.artifacts.get("executed_bundle_skills") or [])
+
+
 def test_learning_blocks_fake_endpoint_and_extracts_fenced_code(tmp_path: Path):
     engine = LearningEngine(config=_make_config(tmp_path))
     assert engine._analysis_has_fake_endpoint(
@@ -428,6 +467,46 @@ async def test_learning_preflight_executes_price_monitor_when_target_complete(tm
 
 
 @pytest.mark.asyncio
+async def test_learning_preflight_executes_price_monitor_with_minimal_runner_artifacts(tmp_path: Path):
+    config = _make_config(tmp_path)
+    store = LearningRunStore(config)
+
+    class _Runner:
+        async def run(self, task, params):
+            assert params["subcmd"] == "snapshot"
+            assert "url" in params
+            return {"reply": "监控已创建", "files": []}
+
+    class _Vault:
+        def list_skills(self):
+            return []
+
+        def get_skill_runner(self, name):
+            return _Runner() if name == "change_detector" else None
+
+        def get_skill(self, name):
+            return SkillMetadata(name=name) if name == "change_detector" else None
+
+    engine = LearningEngine(config=config, vault_manager=_Vault(), learning_store=store)
+    result = await engine.learn(
+        Task(
+            conversation_id="c1b",
+            user_id="u1",
+            origin_message="监控 https://item.jd.com/100012043978.html，降价提醒。",
+            skill_name="learning",
+        ),
+        "监控 https://item.jd.com/100012043978.html，降价提醒。",
+    )
+
+    run = store.get(result["learning_run_id"])
+    assert run is not None
+    assert run.handling_outcome == "executed"
+    assert run.execution_success is True
+    assert run.failure_code is None
+    assert run.artifacts.get("execution_artifacts", {}).get("target")
+
+
+@pytest.mark.asyncio
 async def test_learning_preflight_executes_remote_exec_with_backtick_command(tmp_path: Path):
     config = _make_config(tmp_path)
     store = LearningRunStore(config)
@@ -465,6 +544,49 @@ async def test_learning_preflight_executes_remote_exec_with_backtick_command(tmp
     assert run.handling_outcome == "executed"
     assert run.execution_success is True
     assert run.skill_name == "shell_exec"
+
+
+@pytest.mark.asyncio
+async def test_learning_preflight_executes_remote_exec_with_normalized_trace_artifacts(tmp_path: Path):
+    config = _make_config(tmp_path)
+    store = LearningRunStore(config)
+
+    class _ShellRunner:
+        async def run(self, task, params):
+            assert params["rest"] == "pwd"
+            return {"reply": "✅ 命令执行成功 (exit 0)", "files": []}
+
+    class _Vault:
+        def list_skills(self):
+            return []
+
+        def get_skill_runner(self, name):
+            return _ShellRunner() if name == "shell_exec" else None
+
+        def get_skill(self, name):
+            if name != "shell_exec":
+                return None
+            return SkillMetadata(name=name, risk_level="low")
+
+    engine = LearningEngine(config=config, vault_manager=_Vault(), learning_store=store)
+    result = await engine.learn(
+        Task(
+            conversation_id="c2b",
+            user_id="u2",
+            origin_message="先审批，再执行 `pwd` 并返回结果。",
+            skill_name="learning",
+        ),
+        "先审批，再执行 `pwd` 并返回结果。",
+    )
+
+    run = store.get(result["learning_run_id"])
+    assert run is not None
+    assert run.handling_outcome == "executed"
+    assert run.execution_success is True
+    assert run.failure_code is None
+    artifacts = run.artifacts.get("execution_artifacts", {})
+    assert artifacts.get("command") == "pwd"
+    assert artifacts.get("trace")
 
 
 @pytest.mark.asyncio

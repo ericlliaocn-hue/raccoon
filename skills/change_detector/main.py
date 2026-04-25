@@ -16,6 +16,7 @@ import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 # 快照存储目录
 SNAPSHOT_DIR = Path("data") / "snapshots"
@@ -29,6 +30,35 @@ def _snapshot_path(target_id: str) -> Path:
 def _make_target_id(url_or_path: str) -> str:
     """生成目标 ID（URL/路径的哈希）"""
     return hashlib.md5(url_or_path.encode()).hexdigest()[:12]
+
+
+def _build_artifacts(
+    *,
+    subcmd: str,
+    target: str = "",
+    url: str = "",
+    path: str = "",
+    snapshot_id: str = "",
+    content_hash: str = "",
+    changed: bool | None = None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    artifacts: dict[str, Any] = {"subcmd": subcmd}
+    if target:
+        artifacts["target"] = target
+    if url:
+        artifacts["url"] = url
+    if path:
+        artifacts["path"] = path
+    if snapshot_id:
+        artifacts["snapshot_id"] = snapshot_id
+    if content_hash:
+        artifacts["content_hash"] = content_hash
+    if changed is not None:
+        artifacts["changed"] = bool(changed)
+    if extra:
+        artifacts.update(extra)
+    return artifacts
 
 
 def _fetch_url(url: str) -> str | None:
@@ -78,7 +108,12 @@ def cmd_snapshot(params: dict) -> dict:
     name = params.get("name", "")
 
     if not url and not path:
-        return {"reply": "请提供 url 或 path 参数", "changed": False, "diff": ""}
+        return {
+            "reply": "请提供 url 或 path 参数",
+            "changed": False,
+            "diff": "",
+            "artifacts": _build_artifacts(subcmd="snapshot"),
+        }
 
     target = url or path
     target_id = _make_target_id(target)
@@ -86,7 +121,19 @@ def cmd_snapshot(params: dict) -> dict:
     # 获取内容
     content = _fetch_url(url) if url else _read_file(path)
     if content is None:
-        return {"reply": f"无法获取内容: {target}", "changed": False, "diff": ""}
+        return {
+            "reply": f"无法获取内容: {target}",
+            "changed": False,
+            "diff": "",
+            "artifacts": _build_artifacts(
+                subcmd="snapshot",
+                target=target,
+                url=url,
+                path=path,
+                snapshot_id=target_id,
+                extra={"error": "target_unreachable"},
+            ),
+        }
 
     content_hash = hashlib.sha256(content.encode()).hexdigest()
 
@@ -115,11 +162,48 @@ def cmd_snapshot(params: dict) -> dict:
             "reply": f"快照已更新！检测到变化: {name or target}\n旧哈希: {old_hash[:16]}...\n新哈希: {content_hash[:16]}...",
             "changed": True,
             "diff": "内容已变化，使用 check 命令查看详细差异",
+            "artifacts": _build_artifacts(
+                subcmd="snapshot",
+                target=target,
+                url=url,
+                path=path,
+                snapshot_id=target_id,
+                content_hash=content_hash,
+                changed=True,
+                extra={"previous_content_hash": old_hash},
+            ),
         }
     elif old_hash:
-        return {"reply": f"快照已更新，内容未变化: {name or target}", "changed": False, "diff": ""}
+        return {
+            "reply": f"监控已创建：快照已更新，内容未变化: {name or target}",
+            "changed": False,
+            "diff": "",
+            "artifacts": _build_artifacts(
+                subcmd="snapshot",
+                target=target,
+                url=url,
+                path=path,
+                snapshot_id=target_id,
+                content_hash=content_hash,
+                changed=False,
+                extra={"previous_content_hash": old_hash},
+            ),
+        }
     else:
-        return {"reply": f"首次快照已创建: {name or target} (内容 {len(content)} 字符)", "changed": False, "diff": ""}
+        return {
+            "reply": f"监控已创建：首次快照已创建: {name or target} (内容 {len(content)} 字符)",
+            "changed": False,
+            "diff": "",
+            "artifacts": _build_artifacts(
+                subcmd="snapshot",
+                target=target,
+                url=url,
+                path=path,
+                snapshot_id=target_id,
+                content_hash=content_hash,
+                changed=False,
+            ),
+        }
 
 
 def cmd_check(params: dict) -> dict:
@@ -143,11 +227,31 @@ def cmd_check(params: dict) -> dict:
                 break
 
     if not target_id:
-        return {"reply": f"未找到监控目标: {name or target}", "changed": False, "diff": ""}
+        return {
+            "reply": f"未找到监控目标: {name or target}",
+            "changed": False,
+            "diff": "",
+            "artifacts": _build_artifacts(
+                subcmd="check",
+                target=target,
+                snapshot_id=target_id or "",
+                extra={"error": "target_not_found"},
+            ),
+        }
 
     sp = _snapshot_path(target_id)
     if not sp.exists():
-        return {"reply": f"没有快照记录: {name or target}，请先使用 snapshot 创建", "changed": False, "diff": ""}
+        return {
+            "reply": f"没有快照记录: {name or target}，请先使用 snapshot 创建",
+            "changed": False,
+            "diff": "",
+            "artifacts": _build_artifacts(
+                subcmd="check",
+                target=target,
+                snapshot_id=target_id,
+                extra={"error": "snapshot_not_found"},
+            ),
+        }
 
     old_data = json.loads(sp.read_text("utf-8"))
     old_hash = old_data["content_hash"]
@@ -155,18 +259,52 @@ def cmd_check(params: dict) -> dict:
     # 获取当前内容
     content = _fetch_url(target) if old_data["type"] == "url" else _read_file(target)
     if content is None:
-        return {"reply": f"无法获取当前内容: {target}", "changed": False, "diff": ""}
+        return {
+            "reply": f"无法获取当前内容: {target}",
+            "changed": False,
+            "diff": "",
+            "artifacts": _build_artifacts(
+                subcmd="check",
+                target=target,
+                snapshot_id=target_id,
+                content_hash=old_hash,
+                extra={"error": "target_unreachable"},
+            ),
+        }
 
     new_hash = hashlib.sha256(content.encode()).hexdigest()
 
     if new_hash == old_hash:
-        return {"reply": f"未检测到变化: {old_data.get('name', target)}", "changed": False, "diff": ""}
+        return {
+            "reply": f"未检测到变化: {old_data.get('name', target)}",
+            "changed": False,
+            "diff": "",
+            "artifacts": _build_artifacts(
+                subcmd="check",
+                target=target,
+                url=target if old_data["type"] == "url" else "",
+                path=target if old_data["type"] == "file" else "",
+                snapshot_id=target_id,
+                content_hash=new_hash,
+                changed=False,
+            ),
+        }
 
     # 保存旧快照内容用于 diff（简化：只报告哈希变化）
     return {
         "reply": f"检测到变化！{old_data.get('name', target)}\n旧哈希: {old_hash[:16]}...\n新哈希: {new_hash[:16]}...\n内容长度: {old_data['content_length']} → {len(content)}",
         "changed": True,
         "diff": f"hash: {old_hash[:16]}... → {new_hash[:16]}...",
+        "artifacts": _build_artifacts(
+            subcmd="check",
+            target=target,
+            url=target if old_data["type"] == "url" else "",
+            path=target if old_data["type"] == "file" else "",
+            snapshot_id=target_id,
+            content_hash=new_hash,
+            changed=True,
+            extra={"previous_content_hash": old_hash},
+        ),
     }
 
 
@@ -192,10 +330,24 @@ def cmd_check_all() -> dict:
             results.append(f"  {data.get('name', target)}: 无变化")
 
     if not results:
-        return {"reply": "没有监控目标，请先使用 snapshot 添加", "changed": False, "diff": ""}
+        return {
+            "reply": "没有监控目标，请先使用 snapshot 添加",
+            "changed": False,
+            "diff": "",
+            "artifacts": _build_artifacts(subcmd="check_all", extra={"checked": 0}),
+        }
 
     summary = f"检查了 {len(results)} 个目标，{changed_count} 个有变化:\n" + "\n".join(results)
-    return {"reply": summary, "changed": changed_count > 0, "diff": ""}
+    return {
+        "reply": summary,
+        "changed": changed_count > 0,
+        "diff": "",
+        "artifacts": _build_artifacts(
+            subcmd="check_all",
+            changed=changed_count > 0,
+            extra={"checked": len(results), "changed_count": changed_count},
+        ),
+    }
 
 
 def cmd_list() -> dict:
@@ -206,9 +358,19 @@ def cmd_list() -> dict:
         targets.append(f"  [{data['target_id']}] {data.get('name', data['target'])} ({data['type']}, 快照于 {data.get('snapshot_at', 'unknown')})")
 
     if not targets:
-        return {"reply": "没有监控目标", "changed": False, "diff": ""}
+        return {
+            "reply": "没有监控目标",
+            "changed": False,
+            "diff": "",
+            "artifacts": _build_artifacts(subcmd="list", extra={"count": 0}),
+        }
 
-    return {"reply": f"监控目标 ({len(targets)}):\n" + "\n".join(targets), "changed": False, "diff": ""}
+    return {
+        "reply": f"监控目标 ({len(targets)}):\n" + "\n".join(targets),
+        "changed": False,
+        "diff": "",
+        "artifacts": _build_artifacts(subcmd="list", extra={"count": len(targets)}),
+    }
 
 
 def cmd_remove(params: dict) -> dict:
@@ -221,17 +383,50 @@ def cmd_remove(params: dict) -> dict:
         sp = _snapshot_path(target_id)
         if sp.exists():
             sp.unlink()
-            return {"reply": f"已删除监控目标: {target_id}", "changed": False, "diff": ""}
-        return {"reply": f"未找到: {target_id}", "changed": False, "diff": ""}
+            return {
+                "reply": f"已删除监控目标: {target_id}",
+                "changed": False,
+                "diff": "",
+                "artifacts": _build_artifacts(subcmd="remove", snapshot_id=target_id, extra={"removed": True}),
+            }
+        return {
+            "reply": f"未找到: {target_id}",
+            "changed": False,
+            "diff": "",
+            "artifacts": _build_artifacts(
+                subcmd="remove",
+                snapshot_id=target_id,
+                extra={"removed": False, "error": "target_not_found"},
+            ),
+        }
 
     # 按名称或 target 查找
     for f in SNAPSHOT_DIR.glob("*.json"):
         data = json.loads(f.read_text("utf-8"))
         if data.get("name") == name or data["target"] == target:
             f.unlink()
-            return {"reply": f"已删除监控目标: {data.get('name', data['target'])}", "changed": False, "diff": ""}
+            return {
+                "reply": f"已删除监控目标: {data.get('name', data['target'])}",
+                "changed": False,
+                "diff": "",
+                "artifacts": _build_artifacts(
+                    subcmd="remove",
+                    target=data["target"],
+                    snapshot_id=data.get("target_id", ""),
+                    extra={"removed": True},
+                ),
+            }
 
-    return {"reply": f"未找到监控目标: {name or target}", "changed": False, "diff": ""}
+    return {
+        "reply": f"未找到监控目标: {name or target}",
+        "changed": False,
+        "diff": "",
+        "artifacts": _build_artifacts(
+            subcmd="remove",
+            target=target,
+            extra={"removed": False, "error": "target_not_found"},
+        ),
+    }
 
 
 def main() -> None:
@@ -259,10 +454,16 @@ def main() -> None:
     elif subcmd == "remove":
         result = cmd_remove(params)
     else:
-        result = {"reply": f"未知子命令: {subcmd}，可用: snapshot, check, list, remove", "changed": False, "diff": ""}
+        result = {
+            "reply": f"未知子命令: {subcmd}，可用: snapshot, check, list, remove",
+            "changed": False,
+            "diff": "",
+            "artifacts": _build_artifacts(subcmd=subcmd, extra={"error": "unknown_subcmd"}),
+        }
 
     result["task_id"] = task_id
     result.setdefault("files", [])
+    result.setdefault("artifacts", _build_artifacts(subcmd=subcmd))
     print(json.dumps(result, ensure_ascii=False))
 
 

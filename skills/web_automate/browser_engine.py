@@ -577,7 +577,7 @@ class BrowserEngine:
                 continue
 
             self._update_domain_health(action_type, result)
-            assert_ok, assert_reason = self._assert_action_result(action_type, result)
+            assert_ok, assert_reason = await self._assert_action_result(action_type, act, result)
             if result.success and assert_ok:
                 return result
 
@@ -593,7 +593,12 @@ class BrowserEngine:
             data={"failure_code": "browser_action_failed", "artifacts": artifact},
         )
 
-    def _assert_action_result(self, action_type: str, result: ActionResult) -> tuple[bool, str]:
+    async def _assert_action_result(
+        self,
+        action_type: str,
+        act: dict[str, Any],
+        result: ActionResult,
+    ) -> tuple[bool, str]:
         if not result.success:
             return False, result.message
         data = result.data or {}
@@ -601,9 +606,43 @@ class BrowserEngine:
             screenshot = data.get("path")
             if not screenshot or not Path(str(screenshot)).exists():
                 return False, "screenshot_file_missing"
-        if action_type in {"open", "click", "press_key"} and self._page:
-            if str(self._page.url).startswith("about:blank"):
+        if self._page is not None:
+            current_url = str(self._page.url or "")
+            if action_type in {"open", "click", "press_key"} and current_url.startswith("about:blank"):
                 return False, "page_not_navigated"
+
+            expected_url = act.get("expected_url_contains")
+            if expected_url:
+                expected = [str(expected_url)] if isinstance(expected_url, str) else [str(v) for v in expected_url if v]
+                if expected and not any(token in current_url for token in expected):
+                    return False, f"url_assert_failed(expected_contains={expected}, actual={current_url})"
+
+            blocked_url = act.get("expected_url_not_contains")
+            if blocked_url:
+                blocked = [str(blocked_url)] if isinstance(blocked_url, str) else [str(v) for v in blocked_url if v]
+                if blocked and any(token in current_url for token in blocked):
+                    return False, f"url_assert_failed(unexpected_contains={blocked}, actual={current_url})"
+
+            assert_selector = str(act.get("assert_selector") or "").strip()
+            if assert_selector:
+                timeout = max(200, int(act.get("assert_timeout_ms", 1500)))
+                try:
+                    await self._page.wait_for_selector(assert_selector, timeout=timeout, state="visible")
+                except Exception:
+                    return False, f"selector_assert_failed({assert_selector})"
+
+            assert_text = act.get("assert_text_contains")
+            if assert_text:
+                candidates = [str(assert_text)] if isinstance(assert_text, str) else [str(v) for v in assert_text if v]
+                if candidates:
+                    source_text = str(data.get("text") or "")
+                    if not source_text:
+                        try:
+                            source_text = str(await self._page.inner_text("body"))
+                        except Exception:
+                            source_text = ""
+                    if not any(token in source_text for token in candidates):
+                        return False, f"text_assert_failed(expected_contains={candidates})"
         return True, ""
 
     def get_runtime_artifacts(self) -> dict[str, Any]:

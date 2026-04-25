@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import ast
+import hashlib
 import json
 import py_compile
 import re
@@ -42,6 +43,11 @@ import structlog
 from src.brain.core_benchmark import detect_core_scenario_id, evaluate_quality, normalize_intent_phrase
 from src.brain.core_scenario_playbook import CoreScenarioPlaybook
 from src.brain.failure_guidance import failure_hint
+from src.brain.scenario_contracts import (
+    contract_for,
+    evaluate_execution_contract,
+    evaluate_request_contract,
+)
 from src.config import RaccoonConfig
 from src.eventbus.events import EventType, make_event
 from src.memcore.reader import MemCoreReader
@@ -251,6 +257,7 @@ class LearningEngine:
 
                 if run.repair_count < max_repairs:
                     repair_hint = self._repair_hint_for_failure(run.failure_code)
+                    repair_template = self._repair_template_for_failure(run.failure_code)
                     fixed_code = await self._repair_skill(
                         skill_name,
                         f"[{run.failure_code}] {error_msg}\n{repair_hint}".strip(),
@@ -259,6 +266,7 @@ class LearningEngine:
                         actual_reply=validation.get("reply", ""),
                         debug_info=validation.get("debug_info"),
                         current_code=current_code,
+                        repair_context=repair_template,
                     )
                     if fixed_code:
                         current_code = fixed_code
@@ -502,6 +510,7 @@ class LearningEngine:
         execution_attempted: bool = False,
         execution_success: bool = False,
         clarification_reason: str | None = None,
+        files: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Mark the learning run as handled without generating a new Skill."""
         run.skill_name = skill_name or run.skill_name
@@ -520,7 +529,7 @@ class LearningEngine:
         self._save_run(run, status=LearningRunStatus.SUCCEEDED, reply=reply, error=None)
         return {
             "reply": reply,
-            "files": [],
+            "files": files or [],
             "learned": False,
             "skill_name": run.skill_name,
             "learning_run_id": run.run_id,
@@ -541,6 +550,21 @@ class LearningEngine:
                 run,
                 "检测到占位或内部示例地址。请提供真实可访问地址后再继续，我不会把假入口写进 Skill。",
                 reason="placeholder_endpoint",
+            )
+
+        contract_reason = evaluate_request_contract(
+            scenario_id,
+            has_monitor_target=self._has_monitor_target(user_message),
+            has_form_target=self._has_form_target(user_message),
+            has_shell_command=self._has_concrete_shell_command(user_message),
+            has_schedule_target=self._has_schedule_target(user_message),
+        )
+        if contract_reason:
+            return await self._clarify_run(
+                run,
+                self._contract_reason_message(contract_reason, scenario_id=scenario_id),
+                reason=contract_reason,
+                capability=self._contract_capability(scenario_id, contract_reason),
             )
 
         decision = self._playbook.decide(
@@ -593,6 +617,17 @@ class LearningEngine:
                 base_artifacts=decision.artifacts,
             )
 
+        if decision.skill_name == "content_skill_bundle":
+            executed_bundle = await self._try_execute_content_skill_bundle(
+                task=task,
+                user_message=user_message,
+                run=run,
+                decision_reply=decision.reply,
+                decision_artifacts=decision.artifacts,
+            )
+            if executed_bundle:
+                return executed_bundle
+
         return await self._succeed_without_learning(
             run,
             decision.reply,
@@ -601,6 +636,91 @@ class LearningEngine:
             handling_outcome=decision.handling_outcome,
             execution_attempted=decision.handling_outcome == "executed",
             execution_success=decision.handling_outcome == "executed",
+        )
+
+    async def _try_execute_content_skill_bundle(
+        self,
+        *,
+        task: Task,
+        user_message: str,
+        run: LearningRun,
+        decision_reply: str,
+        decision_artifacts: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Try to convert reused content bundle into controllable execution.
+
+        We keep `handling_outcome=reused` for compatibility, but mark execution
+        attempted/succeeded when at least one bundled skill can run.
+        """
+        if not self._vault:
+            return None
+
+        skills = list((decision_artifacts or {}).get("skills") or [])
+        if not skills:
+            return None
+
+        replies: list[str] = []
+        files: list[dict[str, Any]] = []
+        succeeded_skills: list[str] = []
+        failed_skills: list[dict[str, str]] = []
+
+        for skill_name in skills[:3]:
+            runner = self._vault.get_skill_runner(skill_name)
+            if not runner:
+                continue
+            sub_task = Task(
+                conversation_id=task.conversation_id,
+                user_id=task.user_id,
+                origin_message=user_message,
+                skill_name=skill_name,
+                context={**task.context, "learning_run_id": run.run_id, "scenario_id": run.scenario_id},
+            )
+            exec_result = await self._execute_learned_skill(
+                sub_task,
+                skill_name,
+                user_message,
+                params={"rest": user_message},
+            )
+            if exec_result.get("success"):
+                succeeded_skills.append(skill_name)
+                replies.append(str(exec_result.get("reply") or "").strip())
+                for f in exec_result.get("files", []) or []:
+                    if isinstance(f, dict):
+                        files.append(f)
+            else:
+                failed_skills.append(
+                    {
+                        "skill": skill_name,
+                        "error": str(exec_result.get("error") or "execute_failed"),
+                    }
+                )
+
+        if not succeeded_skills:
+            return None
+
+        reply_parts = [decision_reply, "", f"✅ 已执行内容能力：{', '.join(succeeded_skills)}"]
+        if replies:
+            merged = "\n\n".join(part for part in replies if part)
+            if merged:
+                reply_parts.extend(["", merged])
+        if failed_skills:
+            run.artifacts["content_bundle_failures"] = failed_skills
+            reply_parts.append(
+                f"\n⚠️ 部分能力未执行成功：{', '.join(item['skill'] for item in failed_skills)}"
+            )
+
+        merged_artifacts = dict(decision_artifacts or {})
+        merged_artifacts["executed_bundle_skills"] = succeeded_skills
+        merged_artifacts["execution_mode"] = "reused_bundle_execution"
+        return await self._succeed_without_learning(
+            run,
+            "\n".join(part for part in reply_parts if part is not None).strip(),
+            skill_name="content_skill_bundle",
+            artifacts=merged_artifacts,
+            handling_outcome="reused",
+            execution_attempted=True,
+            execution_success=True,
+            files=files,
         )
 
     async def _execute_stable_playbook_path(
@@ -687,6 +807,21 @@ class LearningEngine:
                 f"执行上下文已记录，可用于后续修复。"
             )
             return await self._fail_run(run, reply, error_text)
+
+        contract_ok, contract_error = evaluate_execution_contract(
+            run.scenario_id,
+            reply=str(exec_result.get("reply") or ""),
+            execution_result=exec_result,
+        )
+        if not contract_ok:
+            return await self._fail_run(
+                run,
+                (
+                    f"❌ 稳定执行路径输出未满足场景契约（{contract_error}）。"
+                    "已记录执行证据，请补齐关键参数后重试。"
+                ),
+                str(contract_error or "execution_contract_failed"),
+            )
 
         quality_score, detail = evaluate_quality(
             run.scenario_id,
@@ -892,28 +1027,52 @@ class LearningEngine:
             )
 
         scenario_id = self._infer_scenario_id(run, user_message)
-        if scenario_id == "price_monitor" and not self._has_monitor_target(user_message):
+        reason = evaluate_request_contract(
+            scenario_id,
+            has_monitor_target=self._has_monitor_target(user_message),
+            has_form_target=self._has_form_target(user_message),
+            has_shell_command=self._has_concrete_shell_command(user_message),
+            has_schedule_target=self._has_schedule_target(user_message),
+        )
+        if reason:
             return await self._clarify_run(
                 run,
-                "价格监控缺少商品链接/SKU，当前只做追问，不生成不可执行的监控 Skill。",
-                reason="missing_price_target",
-                analysis=analysis,
-            )
-        if scenario_id == "login_form_chain" and not self._has_form_target(user_message):
-            return await self._clarify_run(
-                run,
-                "登录表单链路缺少真实网址、账号状态和表单字段，当前只做追问，不生成占位自动化 Skill。",
-                reason="missing_form_target",
-                analysis=analysis,
-            )
-        if scenario_id == "remote_exec" and not self._has_concrete_shell_command(user_message):
-            return await self._clarify_run(
-                run,
-                "远程/命令执行缺少具体命令或脚本路径，当前只做追问，不生成审批系统占位 Skill。",
-                reason="missing_shell_command",
+                self._contract_reason_message(reason, scenario_id=scenario_id),
+                reason=reason,
+                capability=self._contract_capability(scenario_id, reason),
                 analysis=analysis,
             )
         return None
+
+    def _contract_reason_message(self, reason: str, *, scenario_id: str | None = None) -> str:
+        messages = {
+            "missing_price_target": "价格监控缺少商品链接/SKU，当前只做追问，不生成不可执行的监控 Skill。",
+            "missing_form_target": "登录表单链路缺少真实网址、账号状态和表单字段，当前只做追问，不生成占位自动化 Skill。",
+            "missing_shell_command": "远程/命令执行缺少具体命令或脚本路径，当前只做追问，不生成审批系统占位 Skill。",
+            "missing_schedule_target": "提醒场景缺少时间表达和提醒内容，当前只做追问，不生成无效定时任务。",
+        }
+        message = messages.get(reason, "当前请求缺少关键执行参数，请补充后重试。")
+        contract = contract_for(scenario_id)
+        if contract and contract.required_description:
+            return f"{message}（契约要求：{contract.required_description}）"
+        return message
+
+    def _contract_capability(self, scenario_id: str | None, reason: str) -> str | None:
+        mapping = {
+            "price_monitor": "change_detector",
+            "login_form_chain": "web_automate",
+            "remote_exec": "shell_exec",
+            "reminder_schedule": "scheduler",
+        }
+        if scenario_id and scenario_id in mapping:
+            return mapping[scenario_id]
+        reason_mapping = {
+            "missing_price_target": "change_detector",
+            "missing_form_target": "web_automate",
+            "missing_shell_command": "shell_exec",
+            "missing_schedule_target": "scheduler",
+        }
+        return reason_mapping.get(reason)
 
     async def _clarify_run(
         self,
@@ -979,6 +1138,9 @@ class LearningEngine:
         if any(platform in value.lower() for platform in ("jd.com", "taobao", "tmall", "amazon", "pdd")):
             return True
         return False
+
+    def _has_schedule_target(self, text: str) -> bool:
+        return CoreScenarioPlaybook._has_schedule_target(text)
 
     def _has_form_target(self, text: str) -> bool:
         value = str(text or "")
@@ -1467,6 +1629,24 @@ class LearningEngine:
                 self._build_failure_report(user_message, run.attempt_log, exec_result),
                 str(exec_result.get("error") or "execute_failed"),
             )
+        contract_ok, contract_error = evaluate_execution_contract(
+            run.scenario_id,
+            reply=str(exec_result.get("reply") or ""),
+            execution_result=exec_result,
+        )
+        if not contract_ok:
+            return await self._fail_run(
+                run,
+                self._build_failure_report(
+                    user_message,
+                    run.attempt_log,
+                    {
+                        "error": str(contract_error or "execution_contract_failed"),
+                        "reply": exec_result.get("reply", ""),
+                    },
+                ),
+                str(contract_error or "execution_contract_failed"),
+            )
         final_quality, final_detail = evaluate_quality(
             run.scenario_id,
             analysis=run.analysis,
@@ -1619,6 +1799,14 @@ class LearningEngine:
         exec_result = await self._execute_learned_skill(task, skill_name, user_message)
         if not exec_result.get("success"):
             run.failure_code = self._classify_failure_code(str(exec_result.get("error") or "experience_execute_failed"))
+            return None
+        contract_ok, contract_error = evaluate_execution_contract(
+            run.scenario_id,
+            reply=str(exec_result.get("reply") or ""),
+            execution_result=exec_result,
+        )
+        if not contract_ok:
+            run.failure_code = self._classify_failure_code(str(contract_error or "execution_contract_failed"))
             return None
 
         reply = f"📋 复用已有学习经验，直接使用技能「{skill_name}」。\n\n{exec_result.get('reply', '')}"
@@ -2377,7 +2565,13 @@ if __name__ == "__main__":
             files = result.get("files", [])
             # 提取 _debug 诊断信息（Skill 代码在失败时应写入此字段）
             debug_info = result.get("_debug", {})
-            artifacts = result.get("artifacts", {})
+            artifacts = self._normalize_execution_artifacts(
+                skill_name=skill_name,
+                task=task,
+                params=run_params,
+                artifacts=result.get("artifacts", {}),
+                reply=str(reply or ""),
+            )
 
             # 语义验证：即使没抛异常，也检查 reply 是否表示失败
             validation = self._validate_result(reply, result)
@@ -2409,6 +2603,60 @@ if __name__ == "__main__":
         except Exception as e:
             logger.error("learned_skill_exec_failed", skill=skill_name, error=str(e))
             return {"success": False, "error": str(e)}
+
+    def _normalize_execution_artifacts(
+        self,
+        *,
+        skill_name: str,
+        task: Task,
+        params: dict[str, Any],
+        artifacts: dict[str, Any] | None,
+        reply: str,
+    ) -> dict[str, Any]:
+        """补齐执行证据，避免契约因字段缺失误判。
+
+        平衡档策略：优先使用 Skill 返回字段，缺失时从 task/params 推导最小可追踪信息。
+        """
+        normalized = dict(artifacts or {})
+
+        if skill_name == "change_detector":
+            subcmd = str(normalized.get("subcmd") or params.get("subcmd") or "snapshot").lower()
+            url = str(normalized.get("url") or params.get("url") or "")
+            path = str(normalized.get("path") or params.get("path") or "")
+            target = str(normalized.get("target") or params.get("target") or url or path or "")
+            if target:
+                normalized["target"] = target
+            if url:
+                normalized["url"] = url
+            if path:
+                normalized["path"] = path
+            normalized["subcmd"] = subcmd
+            if target and not normalized.get("snapshot_id"):
+                normalized["snapshot_id"] = hashlib.md5(target.encode("utf-8")).hexdigest()[:12]
+            if not normalized.get("content_hash"):
+                match = re.search(r"(?:新哈希|hash)\s*[:：]?\s*([0-9a-fA-F]{16,64})", reply)
+                if match:
+                    normalized["content_hash"] = match.group(1)
+
+        if skill_name == "shell_exec":
+            command = str(
+                normalized.get("command")
+                or params.get("rest")
+                or self._extract_shell_command(task.origin_message)
+                or ""
+            ).strip()
+            if command:
+                normalized["command"] = command
+            if not normalized.get("task_id"):
+                normalized["task_id"] = task.task_id
+            if "exit_code" not in normalized:
+                match = re.search(r"exit\s*([0-9]+)", reply, re.IGNORECASE)
+                if match:
+                    normalized["exit_code"] = int(match.group(1))
+            if not normalized.get("trace"):
+                normalized["trace"] = f"task={task.task_id}"
+
+        return normalized
 
     def _validate_result(self, reply: str, result: dict | None = None) -> dict:
         """语义验证：检查 reply 内容是否真正表示成功
@@ -2480,6 +2728,7 @@ if __name__ == "__main__":
         actual_reply: str = "",
         debug_info: dict | None = None,
         current_code: str | None = None,
+        repair_context: str = "",
     ) -> str | None:
         """根据执行错误信息，让 LLM 修复 Skill 代码
 
@@ -2524,6 +2773,13 @@ Skill 实际输出（reply）：
 请根据此信息判断：API 是否已废弃/变更？是否需要换接口？数据解析逻辑是否正确？
 """
 
+        repair_context_section = ""
+        if repair_context:
+            repair_context_section = f"""\
+失败码专项修复策略：
+{repair_context}
+"""
+
         prompt = f"""以下 Skill 代码执行出错，请修复。
 
 Skill 名称：{skill_name}
@@ -2538,6 +2794,7 @@ Skill 名称：{skill_name}
 {error_msg}
 {actual_reply_section}
 {debug_section}
+{repair_context_section}
 {_SKILL_STANDARD_CORE}
 
 修复要求：
@@ -2895,8 +3152,12 @@ cron 示例：
             return "metadata_invalid"
         if "compile_failed" in msg or "syntaxerror" in msg:
             return "compile_failed"
+        if "missing_schedule_target" in msg:
+            return "missing_schedule_target"
         if "missing_form_context" in msg or "missing_form_target" in msg:
             return "missing_form_target"
+        if "execution_contract_" in msg:
+            return "execution_contract_failed"
         if "no module named" in msg or "dependency" in msg or "pip" in msg:
             return "dependency_missing"
         if "timeout" in msg or "timed out" in msg:
@@ -2915,6 +3176,18 @@ cron 示例：
 
     def _repair_hint_for_failure(self, failure_code: str | None) -> str:
         return f"修复方向：{failure_hint(failure_code)}"
+
+    def _repair_template_for_failure(self, failure_code: str | None) -> str:
+        code = str(failure_code or "unknown_error")
+        templates = {
+            "parse_failed": "- 强化容错解析（空字段/类型变化）\n- 避免正则硬编码，优先结构化解析\n- 输出前检查 reply 非空且字段完整",
+            "auth_failed": "- 不要硬猜签名参数\n- 优先切到公开接口或可复用已有 Skill\n- 需要登录态时输出清晰追问而不是返回空壳数据",
+            "data_hollow": "- 检测空壳默认值并主动失败\n- 增加字段完整性检查，缺关键字段直接报错\n- 回复中包含数据来源或采集时间",
+            "dependency_missing": "- 仅声明真实依赖（# requires）\n- 对缺依赖路径加降级逻辑\n- 不要在运行时静默安装依赖",
+            "timeout": "- 拆分动作，单步超时可控\n- 网络请求增加重试上限和退避\n- 浏览器链路增加 checkpoint 与可恢复点",
+            "execution_contract_failed": "- 补齐场景契约输出：price 需目标信息，login 需 checkpoint，remote 需 trace，schedule 需创建信号",
+        }
+        return templates.get(code, "- 保持协议输出稳定\n- 优先保证可执行，再做优化")
 
     def _maybe_mark_new_skill_candidate(self, run: LearningRun, failure_code: str | None) -> dict[str, Any] | None:
         store = getattr(self, "_learning_store", None)

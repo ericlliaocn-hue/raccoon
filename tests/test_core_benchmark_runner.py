@@ -23,6 +23,8 @@ def test_core_benchmark_runner_runs_dual_pack_and_generates_non_empty_report(tmp
     assert result["overall"]["mismatch_count"] == len(result["mismatches"])
     assert len(result["packs"]) == 2
     assert all(pack["total"] > 0 for pack in result["packs"])
+    assert len(result["observation_packs"]) == 2
+    assert all(item["total"] > 0 for item in result["observation_packs"])
 
     report = result["benchmark_report"]
     assert report["overall"]["runs"] > 0
