@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.5] - 2026-04-25
+
+### 🎯 执行成功率冲刺（第一批）
+
+> 目标：优先压降“该追问却直接执行”和“失败后不可运营”的问题，把执行稳定性再抬一档。
+
+- **执行前置拦截补强**：`Executor` 对 `change_detector` 缺少 URL/SKU、`web_automate/web_browse` 占位地址等输入统一追问阻断，减少无效执行与假成功
+- **失败码治理收敛**：新增统一 `failure_code` 修复建议中心，LearningEngine / benchmark / doctor 复用同一套建议，避免提示漂移
+- **诊断可运营化**：`raccoon doctor` 输出失败码 TopN 及对应修复建议，支持按失败集中度快速排障
+- **基准报告增强**：核心场景 benchmark 的 `failure_code_topn` 增加可执行修复建议字段（hint），周报可直接落动作
+- **场景识别误判修复**：修复 `remote_exec` 识别中 `oa` 子串误判（如 `~/Downloads` 被误判为登录场景）的问题，新增边界匹配逻辑
+- **工作日调度识别修复**：`_try_create_schedule()` 增加 `工作日/每个工作日` 信号词，修复“每个工作日 09:30 …”被错误追问的问题
+
 ## [0.5.4] - 2026-04-25
 
 ### 📊 双指标体系 + 场景 Playbook 编排

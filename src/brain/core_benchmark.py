@@ -6,6 +6,8 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from src.brain.failure_guidance import guidance_for_failure
+
 
 @dataclass(frozen=True)
 class ScenarioSpec:
@@ -229,6 +231,18 @@ def build_core_scenario_report(
         for key, value in handling_totals.items()
     }
 
+    enriched_failures = []
+    for item in top_failures or []:
+        code = str(item.get("failure_code") or "unknown_error")
+        guidance = guidance_for_failure(code)
+        enriched_failures.append(
+            {
+                **item,
+                "hint": guidance.get("hint", ""),
+                "action": guidance.get("action", ""),
+            }
+        )
+
     return {
         "thresholds": CORE_BENCHMARK_THRESHOLDS,
         "overall": {
@@ -248,5 +262,5 @@ def build_core_scenario_report(
             "legacy_gates": legacy_gates,
         },
         "scenarios": scenarios,
-        "failure_code_topn": top_failures or [],
+        "failure_code_topn": enriched_failures,
     }

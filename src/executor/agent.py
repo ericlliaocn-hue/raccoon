@@ -216,13 +216,23 @@ class Executor:
         if not skill_name:
             return "错误：路由结果缺少 skill_name"
 
-        if skill_name == "shell_exec" and not self._has_concrete_shell_command(
-            event.payload.get("text", "")
-        ):
+        origin_text = str(event.payload.get("text", "") or "")
+
+        if skill_name == "shell_exec" and not self._has_concrete_shell_command(origin_text):
             return (
                 "需要补充具体命令或脚本路径，我不会根据模糊描述自行编命令。\n\n"
                 "例如：`执行 df -h`、`执行 du -sh ~/Downloads`、`执行 bash /path/to/archive.sh`。"
             )
+
+        preflight_reply, normalized_params = self._preflight_skill_request(
+            skill_name,
+            origin_text,
+            route.params,
+        )
+        if preflight_reply:
+            return preflight_reply
+        if normalized_params != route.params:
+            route = route.model_copy(update={"params": normalized_params})
 
         # 检查是否为 interactive Skill → 走 FlowEngine
         skill_meta = self._vault_manager.get_skill(skill_name)
@@ -894,6 +904,191 @@ confidence 是 0.0-1.0 的小数；只有非常确定时才高于 0.7。"""
             r"`[^`]+`",
         )
         return any(re.search(pattern, value, re.IGNORECASE) for pattern in concrete_patterns)
+
+    def _preflight_skill_request(
+        self,
+        skill_name: str,
+        origin_text: str,
+        params: dict[str, Any],
+    ) -> tuple[str | None, dict[str, Any]]:
+        """执行前置阻断：缺关键参数/占位输入直接追问，不进入执行链路。"""
+        normalized = dict(params or {})
+        content = " ".join(
+            part
+            for part in (
+                origin_text,
+                str(normalized.get("rest", "") or ""),
+                str(normalized.get("prompt", "") or ""),
+            )
+            if part
+        )
+
+        if skill_name in {"web_automate", "web_browse"} and self._has_placeholder_target(content):
+            return (
+                "检测到占位地址或模板参数（例如 `example.com` / `oa.internal` / `{SKU_ID}`）。\n"
+                "请提供真实可访问的网址后我再执行。",
+                normalized,
+            )
+
+        if skill_name == "web_browse":
+            url = self._extract_url_like(content)
+            if not url:
+                return (
+                    "打开网页需要真实网址，例如：`打开网页 https://www.jd.com`。",
+                    normalized,
+                )
+            normalized.setdefault("rest", url)
+            return None, normalized
+
+        if skill_name == "change_detector":
+            normalized, clarification = self._prepare_change_detector_params(normalized, content)
+            if clarification:
+                return clarification, normalized
+
+        return None, normalized
+
+    def _prepare_change_detector_params(
+        self,
+        params: dict[str, Any],
+        content: str,
+    ) -> tuple[dict[str, Any], str | None]:
+        """把自然语言补成 change_detector 可执行参数，并在缺参时返回追问。"""
+        normalized = dict(params or {})
+        raw_subcmd = str(normalized.get("subcmd", "") or "").strip().lower()
+        text = str(content or "")
+        text_norm = self._normalize_match_text(text)
+
+        subcmd = raw_subcmd
+        if not subcmd:
+            if any(token in text_norm for token in ("删除监控", "移除监控", "取消监控", "remove")):
+                subcmd = "remove"
+            elif any(token in text_norm for token in ("监控列表", "监控项", "list", "列出监控")):
+                subcmd = "list"
+            elif any(token in text_norm for token in ("快照", "snapshot", "新增监控", "开始监控", "添加监控")):
+                subcmd = "snapshot"
+            elif any(token in text_norm for token in ("监控", "watch", "monitor")):
+                subcmd = "snapshot"
+            elif any(token in text_norm for token in ("检查", "检测", "check", "对比", "变化")):
+                subcmd = "check"
+            else:
+                subcmd = "check"
+
+        normalized["subcmd"] = subcmd
+        target_url = self._extract_url_like(text)
+        target_path = self._extract_file_path_like(text)
+
+        if subcmd == "snapshot":
+            if target_url:
+                normalized.setdefault("url", target_url)
+            elif target_path:
+                normalized.setdefault("path", target_path)
+            if self._has_placeholder_target(str(normalized.get("url", "")) or text):
+                return (
+                    normalized,
+                    "监控目标里有占位地址，请给我真实 URL 或文件路径后再开始监控。",
+                )
+            if not normalized.get("url") and not normalized.get("path"):
+                return (
+                    normalized,
+                    "创建监控需要目标 URL/SKU 或文件路径；请补充后我再执行。",
+                )
+            return normalized, None
+
+        if subcmd in {"check", "remove"}:
+            if target_url:
+                normalized.setdefault("target", target_url)
+            elif target_path:
+                normalized.setdefault("target", target_path)
+
+            if self._has_placeholder_target(str(normalized.get("target", "")) or text):
+                return (
+                    normalized,
+                    "目标里有占位地址（例如 example.com/oa.internal），请替换成真实可访问地址。",
+                )
+
+            has_target = bool(
+                normalized.get("target")
+                or normalized.get("target_id")
+                or normalized.get("name")
+            )
+
+            if subcmd == "remove" and not has_target:
+                return (
+                    normalized,
+                    "删除监控需要提供 target/target_id/name 之一，避免误删。",
+                )
+
+            explicit_all = any(token in text_norm for token in ("全部", "所有", "all", "全部监控"))
+            monitor_like = self._looks_like_monitor_request(text_norm)
+            if subcmd == "check" and monitor_like and not has_target and not explicit_all:
+                return (
+                    normalized,
+                    "检查变化缺少目标 URL/SKU 或路径。可说“检查全部监控”或给具体目标。",
+                )
+
+            return normalized, None
+
+        return normalized, None
+
+    def _looks_like_monitor_request(self, text_norm: str) -> bool:
+        return any(
+            token in text_norm
+            for token in (
+                "监控",
+                "变化",
+                "检测",
+                "价格",
+                "降价",
+                "watch",
+                "monitor",
+            )
+        )
+
+    def _has_placeholder_target(self, text: str) -> bool:
+        haystack = str(text or "").lower()
+        placeholder_tokens = (
+            "example.com",
+            "oa.internal",
+            "oa.example",
+            "internal.company",
+            "internal.corp",
+            "{sku_id}",
+            "{sku}",
+            "{url}",
+            "<url",
+            "<your",
+            "your_",
+            "todo",
+        )
+        return any(token in haystack for token in placeholder_tokens)
+
+    def _extract_url_like(self, text: str) -> str | None:
+        value = str(text or "").strip()
+        if not value:
+            return None
+        url_match = re.search(r"https?://[^\s'\"<>]+", value, re.IGNORECASE)
+        if url_match:
+            return url_match.group(0)
+        host_match = re.search(
+            r"\b[\w.-]+\.(com|cn|org|net|io|dev|app|co|me|info|xyz|top|cc|vip)(/[^\s'\"<>]*)?\b",
+            value,
+            re.IGNORECASE,
+        )
+        if host_match:
+            return f"https://{host_match.group(0)}"
+        return None
+
+    def _extract_file_path_like(self, text: str) -> str | None:
+        value = str(text or "")
+        # unix-like path
+        unix_match = re.search(r"(~?/[\w./-]+)", value)
+        if unix_match:
+            return unix_match.group(1)
+        # windows-like path
+        win_match = re.search(r"([a-zA-Z]:\\[^\s]+)", value)
+        if win_match:
+            return win_match.group(1)
+        return None
 
     def _normalize_match_text(self, text: str) -> str:
         return normalize_intent_phrase(text)

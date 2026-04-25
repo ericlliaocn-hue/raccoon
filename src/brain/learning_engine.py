@@ -41,6 +41,7 @@ import structlog
 
 from src.brain.core_benchmark import detect_core_scenario_id, evaluate_quality, normalize_intent_phrase
 from src.brain.core_scenario_playbook import CoreScenarioPlaybook
+from src.brain.failure_guidance import failure_hint
 from src.config import RaccoonConfig
 from src.eventbus.events import EventType, make_event
 from src.memcore.reader import MemCoreReader
@@ -643,7 +644,7 @@ class LearningEngine:
             token in text for token in ("监控", "盯", "提醒", "通知")
         ):
             scenario_id = "price_monitor"
-        elif any(token in text for token in ("登录", "表单", "提交", "oa", "后台")):
+        elif any(token in text for token in ("登录", "表单", "提交", "后台")) or self._mentions_oa_context(text):
             scenario_id = "login_form_chain"
         elif any(token in text for token in ("执行", "命令", "脚本", "shell", "审批")):
             scenario_id = "remote_exec"
@@ -655,6 +656,14 @@ class LearningEngine:
             run.scenario_id = scenario_id
             self._save_run(run)
         return scenario_id
+
+    def _mentions_oa_context(self, text: str) -> bool:
+        value = str(text or "")
+        if not value:
+            return False
+        if re.search(r"(?:^|\\s)oa(?:\\s|$)", value):
+            return True
+        return any(token in value for token in ("oa系统", "oa审批", "oa流程", "oa后台", "oa portal"))
 
     def _has_monitor_target(self, text: str) -> bool:
         value = str(text or "")
@@ -2374,7 +2383,18 @@ Skill 名称：{skill_name}
             return None
 
         # 快速检查：消息中是否包含定时信号词
-        schedule_signals = ("每天", "每周", "每月", "定时", "定期", "自动", "监控", "轮询")
+        schedule_signals = (
+            "每天",
+            "每周",
+            "每月",
+            "定时",
+            "定期",
+            "自动",
+            "监控",
+            "轮询",
+            "工作日",
+            "每个工作日",
+        )
         has_schedule_intent = any(s in user_message for s in schedule_signals)
         if not has_schedule_intent:
             return None
@@ -2475,16 +2495,7 @@ cron 示例：
         return "unknown_error"
 
     def _repair_hint_for_failure(self, failure_code: str | None) -> str:
-        hints = {
-            "parse_failed": "修复方向：确保 stdout 只输出 JSON 且包含 reply 字段，避免混入日志文本。",
-            "auth_failed": "修复方向：目标站点可能需要登录态/鉴权，优先改成 CDP 登录态或可公开访问数据源。",
-            "data_hollow": "修复方向：当前解析逻辑只拿到默认值，检查选择器/API 字段并增加空数据兜底。",
-            "dependency_missing": "修复方向：尽量使用项目已有依赖（httpx、bs4 等），并在代码注释里声明 # requires。",
-            "network_failed": "修复方向：增加重试和超时保护，失败时返回可解释错误而不是空结果。",
-            "timeout": "修复方向：降低单次请求耗时、拆分步骤、必要时调整等待策略。",
-            "quality_gate_failed": "修复方向：补齐结构化字段、来源说明、数据新鲜度信息，确保结果可解释。",
-        }
-        return hints.get(str(failure_code or ""), "")
+        return f"修复方向：{failure_hint(failure_code)}"
 
     def _maybe_mark_new_skill_candidate(self, run: LearningRun, failure_code: str | None) -> dict[str, Any] | None:
         store = getattr(self, "_learning_store", None)

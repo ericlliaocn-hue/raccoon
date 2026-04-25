@@ -476,6 +476,7 @@ def _cmd_doctor() -> None:
     # 5d. LearningRun 运行质量
     try:
         from datetime import datetime, timezone, timedelta
+        from src.brain.failure_guidance import failure_action
         from src.brain.learning_store import LearningRunStore
         from src.types import LearningRunStatus
 
@@ -539,6 +540,16 @@ def _cmd_doctor() -> None:
                 print("  ✅ 失败码分布正常")
         else:
             print("  ✅ 最近无集中失败码")
+
+        failure_topn = store.top_failure_clusters(days=7, limit=3)
+        if failure_topn:
+            print("  📌 失败码 Top3 修复建议:")
+            for item in failure_topn:
+                code = str(item.get("failure_code") or "unknown_error")
+                print(
+                    f"     - {code}: {item.get('failures', 0)} 次 / {item.get('conversations', 0)} 会话"
+                    f" → {failure_action(code)}"
+                )
 
         degraded: list[str] = []
         by_scenario: dict[str, list] = {}
@@ -682,6 +693,8 @@ def _cmd_benchmark(args) -> None:
                 f"  - {item.get('failure_code', 'unknown')}: "
                 f"{item.get('failures', 0)} 次 / {item.get('conversations', 0)} 会话"
             )
+            if item.get("action"):
+                print(f"    修复动作: {item.get('action')}")
 
     if not overall["pass"]:
         print("\n⚠️ 未达平衡档门槛，建议先修复集中失败码后再打版本标签。")

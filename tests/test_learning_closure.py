@@ -220,6 +220,49 @@ async def test_learning_preflight_remote_exec_requires_concrete_command(tmp_path
     assert result["skill_name"] == "shell_exec"
 
 
+def test_infer_scenario_does_not_confuse_downloads_with_oa(tmp_path: Path):
+    config = _make_config(tmp_path)
+    store = LearningRunStore(config)
+    engine = LearningEngine(config=config, learning_store=store)
+    run = LearningRun(
+        conversation_id="c1",
+        user_id="u1",
+        request_text="先审批，再执行 `du -sh ~/Downloads` 并返回结果。",
+        scenario_id="remote_exec",
+        status=LearningRunStatus.ANALYZING,
+    )
+
+    scenario_id = engine._infer_scenario_id(run, "先审批，再执行 `du -sh ~/Downloads` 并返回结果。")
+
+    assert scenario_id == "remote_exec"
+
+
+@pytest.mark.asyncio
+async def test_schedule_creation_recognizes_workday_signal(tmp_path: Path):
+    class _FakeScheduler:
+        async def add_schedule(self, entry):
+            return entry
+
+    class _FakeLLM:
+        async def chat(self, messages, temperature=0.1, max_tokens=200):
+            return '{"cron":"30 9 * * 1-5","message":"提醒我检查客户回复","name":"weekday_check"}'
+
+    engine = LearningEngine(
+        config=_make_config(tmp_path),
+        scheduler=_FakeScheduler(),
+        llm_client=_FakeLLM(),
+    )
+
+    created = await engine._try_create_schedule(
+        "每个工作日 09:30 提醒我检查客户回复。",
+        "scheduler",
+        "conv-1",
+    )
+
+    assert created is not None
+    assert "weekday_check" in created
+
+
 @pytest.mark.asyncio
 async def test_learning_preflight_reuses_content_skill_bundle(tmp_path: Path):
     config = _make_config(tmp_path)
@@ -285,3 +328,56 @@ async def test_shell_exec_requires_concrete_command_before_approval():
     )
 
     assert "具体命令" in reply
+
+
+@pytest.mark.asyncio
+async def test_web_browse_blocks_placeholder_url_before_execution():
+    executor = Executor.__new__(Executor)
+    executor._vault_manager = MagicMock()
+    executor._vault_manager.get_skill = MagicMock(return_value=MagicMock(interactive=False, flow=None))
+
+    reply = await Executor._handle_skill(
+        executor,
+        RouteResult(route_type=RouteType.SKILL, skill_name="web_browse"),
+        Event(
+            event=EventType.USER_MESSAGE,
+            conversation_id="c1",
+            user_id="u1",
+            payload={"text": "打开网页 https://example.com 试试看"},
+        ),
+    )
+
+    assert "占位地址" in reply
+
+
+@pytest.mark.asyncio
+async def test_change_detector_requires_target_before_snapshot_execution():
+    executor = Executor.__new__(Executor)
+    executor._vault_manager = MagicMock()
+    executor._vault_manager.get_skill = MagicMock(return_value=MagicMock(interactive=False, flow=None))
+
+    reply = await Executor._handle_skill(
+        executor,
+        RouteResult(route_type=RouteType.SKILL, skill_name="change_detector"),
+        Event(
+            event=EventType.USER_MESSAGE,
+            conversation_id="c1",
+            user_id="u1",
+            payload={"text": "帮我监控这个商品的价格变化，降价就提醒"},
+        ),
+    )
+
+    assert "URL/SKU" in reply
+
+
+def test_change_detector_preflight_infers_snapshot_url_params():
+    executor = Executor.__new__(Executor)
+    params, clarification = Executor._prepare_change_detector_params(
+        executor,
+        {},
+        "帮我监控 https://www.jd.com/item/10086 价格变化",
+    )
+
+    assert clarification is None
+    assert params["subcmd"] == "snapshot"
+    assert params["url"] == "https://www.jd.com/item/10086"
