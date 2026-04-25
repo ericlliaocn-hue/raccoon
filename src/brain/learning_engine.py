@@ -454,6 +454,7 @@ class LearningEngine:
             reply=reply,
             error=str(error),
         )
+        self._persist_failure_backlog(run)
         await self._emit_learning_event(
             EventType.LEARNING_FAILED,
             run,
@@ -466,6 +467,28 @@ class LearningEngine:
             "skill_name": run.skill_name,
             "learning_run_id": run.run_id,
         }
+
+    def _persist_failure_backlog(self, run: LearningRun) -> None:
+        """把未解决失败写入 backlog 文件，便于后续聚类复盘。"""
+        try:
+            learning_dir = self._config.learning_staging_dir.parent
+            learning_dir.mkdir(parents=True, exist_ok=True)
+            backlog_file = learning_dir / "failure_backlog.jsonl"
+            record = {
+                "run_id": run.run_id,
+                "scenario_id": run.scenario_id,
+                "failure_code": run.failure_code,
+                "skill_name": run.skill_name,
+                "handling_outcome": run.handling_outcome,
+                "request_text": run.request_text,
+                "error": run.error,
+                "artifacts": run.artifacts,
+                "updated_at": run.updated_at.isoformat(),
+            }
+            with backlog_file.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            logger.warning("persist_failure_backlog_failed", error=str(exc), run_id=run.run_id)
 
     async def _succeed_without_learning(
         self,
@@ -560,6 +583,16 @@ class LearningEngine:
                 capability=decision.skill_name,
             )
 
+        if decision.handling_outcome == "executed":
+            return await self._execute_stable_playbook_path(
+                task=task,
+                user_message=user_message,
+                run=run,
+                skill_name=decision.skill_name or "",
+                reply_prefix=decision.reply,
+                base_artifacts=decision.artifacts,
+            )
+
         return await self._succeed_without_learning(
             run,
             decision.reply,
@@ -569,6 +602,272 @@ class LearningEngine:
             execution_attempted=decision.handling_outcome == "executed",
             execution_success=decision.handling_outcome == "executed",
         )
+
+    async def _execute_stable_playbook_path(
+        self,
+        *,
+        task: Task,
+        user_message: str,
+        run: LearningRun,
+        skill_name: str,
+        reply_prefix: str,
+        base_artifacts: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if not skill_name:
+            return await self._fail_run(
+                run,
+                "❌ Playbook 命中执行路径，但缺少 skill_name。",
+                "playbook_skill_missing",
+            )
+        if not self._vault:
+            return await self._fail_run(
+                run,
+                f"❌ 稳定执行路径需要 VaultManager，但当前不可用（skill={skill_name}）。",
+                "vault_unavailable",
+            )
+
+        runner = self._vault.get_skill_runner(skill_name)
+        if not runner:
+            return await self._fail_run(
+                run,
+                f"❌ 稳定执行路径未找到 Skill Runner：{skill_name}",
+                "skill_runner_missing",
+            )
+
+        params, missing_reason = self._build_playbook_exec_params(
+            skill_name=skill_name,
+            user_message=user_message,
+        )
+        if missing_reason:
+            return await self._clarify_run(
+                run,
+                f"稳定执行缺少关键参数：{missing_reason}",
+                reason=missing_reason,
+                capability=skill_name,
+            )
+
+        play_task = Task(
+            conversation_id=task.conversation_id,
+            user_id=task.user_id,
+            origin_message=user_message,
+            skill_name=skill_name,
+            context={**task.context, "learning_run_id": run.run_id, "scenario_id": run.scenario_id},
+        )
+        approval_block = await self._review_playbook_execution(play_task, run, skill_name)
+        if approval_block:
+            return approval_block
+
+        run.skill_name = skill_name
+        run.handling_outcome = "executed"
+        run.decision_success = True
+        run.execution_attempted = True
+        run.execution_success = False
+        run.clarification_reason = None
+        run.failure_code = None
+        run.final_success = False
+        run.first_pass = True
+        run.artifacts.update(base_artifacts or {})
+        run.artifacts["playbook_params"] = params
+        self._save_run(run, status=LearningRunStatus.EXECUTING)
+
+        exec_result = await self._execute_learned_skill(
+            play_task,
+            skill_name,
+            user_message,
+            params=params,
+        )
+        if not exec_result.get("success"):
+            if exec_result.get("artifacts") is not None:
+                run.artifacts["execution_artifacts"] = exec_result.get("artifacts")
+            if exec_result.get("debug_info"):
+                run.artifacts["debug_info"] = exec_result.get("debug_info")
+            error_text = str(exec_result.get("error") or "playbook_execution_failed")
+            reply = (
+                f"❌ 稳定执行路径失败（{skill_name}）：{error_text}\n\n"
+                f"执行上下文已记录，可用于后续修复。"
+            )
+            return await self._fail_run(run, reply, error_text)
+
+        quality_score, detail = evaluate_quality(
+            run.scenario_id,
+            analysis=run.analysis,
+            validation=run.validation,
+            execution_result=exec_result,
+        )
+        run.quality_score = max(run.quality_score, quality_score)
+        run.artifacts["quality"] = detail
+        run.execution_result = exec_result
+        run.execution_success = True
+        run.final_success = True
+        if exec_result.get("artifacts") is not None:
+            run.artifacts["execution_artifacts"] = exec_result.get("artifacts")
+        if exec_result.get("debug_info"):
+            run.artifacts["debug_info"] = exec_result.get("debug_info")
+        reply_suffix = str(exec_result.get("reply") or "").strip()
+        reply = f"{reply_prefix}\n\n{reply_suffix}".strip()
+        self._save_run(
+            run,
+            status=LearningRunStatus.SUCCEEDED,
+            reply=reply,
+            error=None,
+        )
+        return {
+            "reply": reply,
+            "files": exec_result.get("files", []),
+            "learned": False,
+            "skill_name": skill_name,
+            "learning_run_id": run.run_id,
+            "schedule_created": run.schedule_created,
+        }
+
+    async def _review_playbook_execution(
+        self,
+        task: Task,
+        run: LearningRun,
+        skill_name: str,
+    ) -> dict[str, Any] | None:
+        if not self._approval_engine:
+            return None
+
+        meta = self._vault.get_skill(skill_name) if self._vault else None
+        risk_level = str(getattr(meta, "risk_level", "") or "").lower()
+        requires_approval = bool(getattr(meta, "requires_approval", False) or risk_level == "high")
+        if not requires_approval:
+            return None
+
+        result = await self._approval_engine.review(task, metadata=meta, risk_level=risk_level or "high")
+        run.approval_id = result.approval_id
+        run.approval_status = result.status.value
+        if result.approved:
+            return None
+
+        reason = str(result.reason or result.status.value or "approval_rejected")
+        if result.status.value == "pending":
+            run.handling_outcome = "clarified"
+            run.clarification_reason = "pending_approval"
+            run.decision_success = True
+            run.execution_attempted = False
+            run.execution_success = False
+            run.final_success = True
+            self._save_run(
+                run,
+                status=LearningRunStatus.PENDING_APPROVAL,
+                reply=(
+                    f"稳定执行路径命中「{skill_name}」，但当前需要审批。"
+                    f"审批 ID: {(result.approval_id or '')[:8]}"
+                ),
+                error=None,
+            )
+            await self._emit_learning_event(
+                EventType.LEARNING_APPROVAL_REQUIRED,
+                run,
+                {"approval_id": result.approval_id, "skill_name": skill_name},
+            )
+            return {
+                "reply": (
+                    f"任务已进入审批队列（{skill_name}，审批 ID: {(result.approval_id or '')[:8]}）。"
+                    "审批通过后请重新下发同一请求。"
+                ),
+                "files": [],
+                "learned": False,
+                "skill_name": skill_name,
+                "learning_run_id": run.run_id,
+            }
+
+        return await self._fail_run(
+            run,
+            f"❌ 执行被审批拒绝：{reason}",
+            reason,
+        )
+
+    def _build_playbook_exec_params(
+        self,
+        *,
+        skill_name: str,
+        user_message: str,
+    ) -> tuple[dict[str, Any], str | None]:
+        if skill_name == "change_detector":
+            params: dict[str, Any] = {"subcmd": "snapshot"}
+            url = self._extract_url_like(user_message)
+            if url:
+                params["url"] = url
+                return params, None
+            path = self._extract_file_path_like(user_message)
+            if path:
+                params["path"] = path
+                return params, None
+            sku_match = re.search(r"sku\s*[:：=]?\s*([a-zA-Z0-9_-]+)", user_message, re.IGNORECASE)
+            if sku_match:
+                sku = sku_match.group(1)
+                params["url"] = f"https://item.jd.com/{sku}.html"
+                params["sku"] = sku
+                return params, None
+            return {}, "missing_price_target"
+
+        if skill_name == "web_automate":
+            if not self._has_form_target(user_message):
+                return {}, "missing_form_target"
+            return {"prompt": user_message, "auto_resume": True}, None
+
+        if skill_name == "shell_exec":
+            command = self._extract_shell_command(user_message)
+            if not command:
+                return {}, "missing_shell_command"
+            return {"rest": command}, None
+
+        return {"rest": user_message}, None
+
+    def _extract_url_like(self, text: str) -> str | None:
+        value = str(text or "").strip()
+        if not value:
+            return None
+        url_match = re.search(r"https?://[^\s'\"<>]+", value, re.IGNORECASE)
+        if url_match:
+            return url_match.group(0)
+        host_match = re.search(
+            r"\b[\w.-]+\.(com|cn|org|net|io|dev|app|co|me|info|xyz|top|cc|vip|local)(/[^\s'\"<>]*)?\b",
+            value,
+            re.IGNORECASE,
+        )
+        if host_match:
+            return f"https://{host_match.group(0)}"
+        return None
+
+    def _extract_file_path_like(self, text: str) -> str | None:
+        value = str(text or "")
+        unix_match = re.search(r"(~?/[\w./-]+)", value)
+        if unix_match:
+            return unix_match.group(1)
+        win_match = re.search(r"([a-zA-Z]:\\[^\s]+)", value)
+        if win_match:
+            return win_match.group(1)
+        return None
+
+    def _extract_shell_command(self, text: str) -> str:
+        value = str(text or "").strip()
+        if not value:
+            return ""
+        fenced = re.search(r"`([^`]+)`", value)
+        if fenced:
+            return fenced.group(1).strip()
+        command_match = re.search(
+            r"(?:执行|运行|run|exec)\s+([^\n，。；;]+)",
+            value,
+            re.IGNORECASE,
+        )
+        if command_match:
+            return command_match.group(1).strip()
+        token_match = re.search(
+            r"\b(ls|pwd|df|du|cat|tail|grep|find|python|python3|bash|sh|git|npm|pnpm|uv|pytest|ruff)\b[^\n，。；;]*",
+            value,
+            re.IGNORECASE,
+        )
+        if token_match:
+            return token_match.group(0).strip()
+        script_match = re.search(r"(/[\w./-]+\.sh(?:\s+[^\n，。；;]+)?)", value)
+        if script_match:
+            return script_match.group(1).strip()
+        return ""
 
     async def _block_invalid_or_incomplete_plan(
         self,
@@ -661,7 +960,7 @@ class LearningEngine:
         value = str(text or "")
         if not value:
             return False
-        if re.search(r"(?:^|\\s)oa(?:\\s|$)", value):
+        if re.search(r"(?:^|\s)oa(?:\s|$)", value):
             return True
         return any(token in value for token in ("oa系统", "oa审批", "oa流程", "oa后台", "oa portal"))
 
@@ -1933,14 +2232,19 @@ if __name__ == "__main__":
 
     # 空壳输出检测：这些默认值大量出现 → 数据解析失败
     _HOLLOW_PATTERNS = (
-        "无标题", "未知作者", "未知", "暂无", "N/A", "n/a", "-",
+        "无标题", "未知作者", "未知", "暂无", "N/A", "n/a",
     )
 
     # API 错误码模式（如 B站 -352、-403 等）
     _API_ERROR_CODE_PATTERN = re.compile(r"[（(]-?\d+[）)]|code['\"]?\s*[:=]\s*[-]?\d+")
 
     async def _execute_learned_skill(
-        self, task: Task, skill_name: str, user_message: str
+        self,
+        task: Task,
+        skill_name: str,
+        user_message: str,
+        *,
+        params: dict[str, Any] | None = None,
     ) -> dict:
         """执行刚学会的 Skill，并进行语义验证
 
@@ -1955,7 +2259,10 @@ if __name__ == "__main__":
             if not runner:
                 return {"success": False, "error": "Skill runner not found"}
 
-            result = await runner.run(task, {"rest": user_message})
+            run_params = dict(params or {})
+            if not run_params:
+                run_params = {"rest": user_message}
+            result = await runner.run(task, run_params)
             reply = result.get("reply", "")
             files = result.get("files", [])
             # 提取 _debug 诊断信息（Skill 代码在失败时应写入此字段）

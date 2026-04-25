@@ -15,6 +15,7 @@ from src.config import RaccoonConfig
 from src.eventbus.events import EventType
 from src.executor.agent import Executor, SkillCandidate
 from src.memcore.writer import MemCoreWriter
+from src.types import SkillMetadata
 from src.types import Event, LearningRun, LearningRunStatus, RouteResult, RouteType, Task
 
 
@@ -381,3 +382,141 @@ def test_change_detector_preflight_infers_snapshot_url_params():
     assert clarification is None
     assert params["subcmd"] == "snapshot"
     assert params["url"] == "https://www.jd.com/item/10086"
+
+
+@pytest.mark.asyncio
+async def test_learning_preflight_executes_price_monitor_when_target_complete(tmp_path: Path):
+    config = _make_config(tmp_path)
+    store = LearningRunStore(config)
+
+    class _Runner:
+        async def run(self, task, params):
+            assert params["subcmd"] == "snapshot"
+            assert "url" in params
+            return {"reply": "✅ 监控已创建", "files": [], "artifacts": {"target": params["url"]}}
+
+    class _Vault:
+        def __init__(self):
+            self._runner = _Runner()
+
+        def list_skills(self):
+            return []
+
+        def get_skill_runner(self, name):
+            return self._runner if name == "change_detector" else None
+
+        def get_skill(self, name):
+            return SkillMetadata(name=name) if name == "change_detector" else None
+
+    engine = LearningEngine(config=config, vault_manager=_Vault(), learning_store=store)
+    result = await engine.learn(
+        Task(
+            conversation_id="c1",
+            user_id="u1",
+            origin_message="监控 https://item.jd.com/100012043978.html，降价提醒。",
+            skill_name="learning",
+        ),
+        "监控 https://item.jd.com/100012043978.html，降价提醒。",
+    )
+
+    run = store.get(result["learning_run_id"])
+    assert run is not None
+    assert run.handling_outcome == "executed"
+    assert run.execution_attempted is True
+    assert run.execution_success is True
+    assert run.skill_name == "change_detector"
+
+
+@pytest.mark.asyncio
+async def test_learning_preflight_executes_remote_exec_with_backtick_command(tmp_path: Path):
+    config = _make_config(tmp_path)
+    store = LearningRunStore(config)
+
+    class _ShellRunner:
+        async def run(self, task, params):
+            assert params["rest"] == "du -sh ~/Downloads"
+            return {"reply": "✅ 审批通过，执行结果 trace run_id=abc", "files": []}
+
+    class _Vault:
+        def list_skills(self):
+            return []
+
+        def get_skill_runner(self, name):
+            return _ShellRunner() if name == "shell_exec" else None
+
+        def get_skill(self, name):
+            if name != "shell_exec":
+                return None
+            return SkillMetadata(name=name, risk_level="low")
+
+    engine = LearningEngine(config=config, vault_manager=_Vault(), learning_store=store)
+    result = await engine.learn(
+        Task(
+            conversation_id="c2",
+            user_id="u2",
+            origin_message="先审批，再执行 `du -sh ~/Downloads` 并返回结果。",
+            skill_name="learning",
+        ),
+        "先审批，再执行 `du -sh ~/Downloads` 并返回结果。",
+    )
+
+    run = store.get(result["learning_run_id"])
+    assert run is not None
+    assert run.handling_outcome == "executed"
+    assert run.execution_success is True
+    assert run.skill_name == "shell_exec"
+
+
+@pytest.mark.asyncio
+async def test_learning_preflight_executes_login_chain_when_target_complete(tmp_path: Path):
+    config = _make_config(tmp_path)
+    store = LearningRunStore(config)
+
+    class _BrowserRunner:
+        async def run(self, task, params):
+            assert "fixture.local" in params["prompt"]
+            return {"reply": "✅ 登录成功，提交成功，checkpoint 已恢复", "files": []}
+
+    class _Vault:
+        def list_skills(self):
+            return []
+
+        def get_skill_runner(self, name):
+            return _BrowserRunner() if name == "web_automate" else None
+
+        def get_skill(self, name):
+            return SkillMetadata(name=name) if name == "web_automate" else None
+
+    engine = LearningEngine(config=config, vault_manager=_Vault(), learning_store=store)
+    result = await engine.learn(
+        Task(
+            conversation_id="c3",
+            user_id="u3",
+            origin_message="登录 https://fixture.local/login 并提交采购申请。",
+            skill_name="learning",
+        ),
+        "登录 https://fixture.local/login 并提交采购申请。",
+    )
+
+    run = store.get(result["learning_run_id"])
+    assert run is not None
+    assert run.handling_outcome == "executed"
+    assert run.execution_success is True
+    assert run.skill_name == "web_automate"
+
+
+def test_oa_context_boundary_avoids_english_substring_noise(tmp_path: Path):
+    engine = LearningEngine(config=_make_config(tmp_path), learning_store=LearningRunStore(_make_config(tmp_path)))
+    assert engine._mentions_oa_context("please update roadmap for q2") is False
+    assert engine._mentions_oa_context("检查 download path ~/Downloads") is False
+    assert engine._mentions_oa_context("进入 oa 系统审批流程") is True
+
+
+def test_shell_command_detection_handles_english_and_paths(tmp_path: Path):
+    engine = LearningEngine(config=_make_config(tmp_path), learning_store=LearningRunStore(_make_config(tmp_path)))
+    assert engine._has_concrete_shell_command("run df -h /var/log and send summary") is True
+    assert engine._has_concrete_shell_command("帮我处理日志问题") is False
+    assert engine._extract_shell_command("please run `du -sh ~/Downloads` now") == "du -sh ~/Downloads"
+    assert engine._extract_shell_command("run /usr/local/bin/backup_logs.sh --tail 20").startswith(
+        "/usr/local/bin/backup_logs.sh"
+    )

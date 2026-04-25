@@ -62,8 +62,8 @@ class CoreScenarioPlaybook:
                 )
             return PlaybookDecision(
                 scenario_id=scenario_id,
-                handling_outcome="reused",
-                reply="这个需求命中价格监控稳定路径，优先复用现有监控能力，不走自由生成。",
+                handling_outcome="executed",
+                reply="这个需求命中价格监控稳定路径，将直接执行监控能力。",
                 skill_name="change_detector",
                 artifacts={"reused_capability": "change_detector"},
             )
@@ -80,8 +80,8 @@ class CoreScenarioPlaybook:
                 )
             return PlaybookDecision(
                 scenario_id=scenario_id,
-                handling_outcome="reused",
-                reply="这个需求命中浏览器长链路稳定编排，优先走已有 web_automate 策略。",
+                handling_outcome="executed",
+                reply="这个需求命中浏览器长链路稳定编排，将直接执行 web_automate。",
                 skill_name="web_automate",
                 artifacts={"reused_capability": "web_automate"},
             )
@@ -131,8 +131,8 @@ class CoreScenarioPlaybook:
                 )
             return PlaybookDecision(
                 scenario_id=scenario_id,
-                handling_outcome="reused",
-                reply="这个需求命中 shell_exec 稳定路径，将直接复用 shell_exec + 审批链路。",
+                handling_outcome="executed",
+                reply="这个需求命中 shell_exec 稳定路径，将直接执行 shell_exec + 审批链路。",
                 skill_name="shell_exec",
                 artifacts={"reused_capability": "shell_exec", "requires_approval": True},
             )

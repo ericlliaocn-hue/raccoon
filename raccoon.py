@@ -89,6 +89,11 @@ def main() -> None:
     p_benchmark = sub.add_parser("benchmark", help="基准测试与报告")
     p_benchmark.add_argument("suite", nargs="?", default="core", choices=["core"], help="基准套件")
     p_benchmark.add_argument("--json", action="store_true", help="输出 JSON")
+    p_benchmark.add_argument(
+        "--store-only",
+        action="store_true",
+        help="仅输出当前 learning_runs 聚合，不运行双包基准",
+    )
 
     # ─── schedule ─────────────────────────────────────────────
     p_schedule = sub.add_parser("schedule", help="定时任务管理")
@@ -473,6 +478,19 @@ def _cmd_doctor() -> None:
     except Exception as e:
         print(f"  ⚠️  learning staging 检查失败: {e}")
 
+    # 5c. 学习失败 backlog
+    try:
+        backlog_file = config.learning_staging_dir.parent / "failure_backlog.jsonl"
+        if backlog_file.exists():
+            backlog_lines = sum(1 for _ in backlog_file.open("r", encoding="utf-8"))
+            print(f"  ⚠️  learning failure backlog 累积 {backlog_lines} 条")
+            if backlog_lines >= 20:
+                issues.append("learning failure backlog 累积过多")
+        else:
+            print("  ✅ learning failure backlog 为空")
+    except Exception as e:
+        print(f"  ⚠️  learning failure backlog 检查失败: {e}")
+
     # 5d. LearningRun 运行质量
     try:
         from datetime import datetime, timezone, timedelta
@@ -641,29 +659,52 @@ def _cmd_doctor() -> None:
 
 
 def _cmd_benchmark(args) -> None:
-    """核心场景基准报告（基于 LearningRun 聚合）。"""
+    """核心场景基准报告。默认跑双包夹具基准并输出 mismatch。"""
     if args.suite != "core":
         print(f"❌ 不支持的基准套件: {args.suite}")
         sys.exit(1)
 
-    from src.brain.core_benchmark import build_core_scenario_report
-    from src.brain.learning_store import LearningRunStore
     from src.config import load_config
 
     config = load_config()
-    store = LearningRunStore(config)
-    report = build_core_scenario_report(
-        store.aggregate_core_scenarios(),
-        store.top_failure_clusters(days=7, limit=10),
-    )
+    if args.store_only:
+        from src.brain.core_benchmark import build_core_scenario_report
+        from src.brain.learning_store import LearningRunStore
 
+        store = LearningRunStore(config)
+        report = build_core_scenario_report(
+            store.aggregate_core_scenarios(),
+            store.top_failure_clusters(days=7, limit=10),
+        )
+        if args.json:
+            print(json.dumps({"mode": "store_only", "benchmark_report": report}, ensure_ascii=False, indent=2))
+            sys.exit(0 if report["overall"]["pass"] else 2)
+
+        overall = report["overall"]
+        print("🧪 核心场景基准报告（store_only）\n")
+        print(f"  样本数: {overall['runs']}")
+        print(f"  决策成功率: {overall['decision_success_rate'] * 100:.1f}%")
+        print(f"  执行成功率: {overall['execution_success_rate'] * 100:.1f}%")
+        print(f"  浏览器链路执行成功率: {overall['browser_chain_execution_success_rate'] * 100:.1f}%")
+        print(f"  卡死率: {overall['stuck_rate'] * 100:.2f}%")
+        print(f"  发布门禁: {'✅ 通过' if overall['pass'] else '❌ 未通过'}")
+        sys.exit(0 if overall["pass"] else 2)
+
+    from src.brain.core_benchmark_runner import run_core_benchmark_packs_sync
+
+    bundle = run_core_benchmark_packs_sync(config)
+    report = bundle["benchmark_report"]
     if args.json:
-        print(json.dumps(report, ensure_ascii=False, indent=2))
+        print(json.dumps(bundle, ensure_ascii=False, indent=2))
         sys.exit(0 if report["overall"]["pass"] else 2)
 
     overall = report["overall"]
-    print("🧪 核心场景基准报告\n")
-    print(f"  样本数: {overall['runs']}")
+    pack_overall = bundle.get("overall", {})
+    print("🧪 核心场景基准报告（双包夹具）\n")
+    print(f"  双包样本: {pack_overall.get('total_cases', 0)}")
+    print(f"  双包匹配率: {pack_overall.get('pack_match_rate', 0.0) * 100:.1f}%")
+    print(f"  mismatch 数量: {pack_overall.get('mismatch_count', 0)}")
+    print(f"  learning_runs 样本数: {overall['runs']}")
     print(f"  决策成功率: {overall['decision_success_rate'] * 100:.1f}%")
     print(f"  执行成功率: {overall['execution_success_rate'] * 100:.1f}%")
     print(f"  浏览器链路执行成功率: {overall['browser_chain_execution_success_rate'] * 100:.1f}%")
@@ -695,6 +736,19 @@ def _cmd_benchmark(args) -> None:
             )
             if item.get("action"):
                 print(f"    修复动作: {item.get('action')}")
+
+    if bundle.get("mismatches"):
+        print("\nmismatch Top10:")
+        for item in bundle["mismatches"][:10]:
+            print(
+                f"  - [{item.get('pack_id')}/{item.get('case_id')}] "
+                f"expected={item.get('expected_outcome')} actual={item.get('actual_outcome')}"
+                + (
+                    f" reason={item.get('actual_reason')}"
+                    if item.get("actual_reason")
+                    else ""
+                )
+            )
 
     if not overall["pass"]:
         print("\n⚠️ 未达平衡档门槛，建议先修复集中失败码后再打版本标签。")

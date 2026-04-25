@@ -18,6 +18,21 @@ def test_playbook_price_monitor_requires_target():
     assert decision.clarification_reason == "missing_price_target"
 
 
+def test_playbook_price_monitor_executes_with_target():
+    playbook = CoreScenarioPlaybook()
+    decision = playbook.decide(
+        scenario_id="price_monitor",
+        message="监控 https://item.jd.com/10086.html，降价提醒。",
+        available_content_skills=[],
+        has_monitor_target=True,
+        has_form_target=False,
+        has_shell_command=False,
+    )
+    assert decision is not None
+    assert decision.handling_outcome == "executed"
+    assert decision.skill_name == "change_detector"
+
+
 def test_playbook_daily_brief_prefers_reuse():
     playbook = CoreScenarioPlaybook()
     decision = playbook.decide(
@@ -48,6 +63,21 @@ def test_playbook_remote_exec_requires_command():
     assert decision.skill_name == "shell_exec"
 
 
+def test_playbook_remote_exec_executes_with_command():
+    playbook = CoreScenarioPlaybook()
+    decision = playbook.decide(
+        scenario_id="remote_exec",
+        message="先审批，再执行 `du -sh ~/Downloads`。",
+        available_content_skills=[],
+        has_monitor_target=False,
+        has_form_target=False,
+        has_shell_command=True,
+    )
+    assert decision is not None
+    assert decision.handling_outcome == "executed"
+    assert decision.skill_name == "shell_exec"
+
+
 def test_playbook_reminder_goes_scheduler_when_target_complete():
     playbook = CoreScenarioPlaybook()
     decision = playbook.decide(
@@ -61,3 +91,18 @@ def test_playbook_reminder_goes_scheduler_when_target_complete():
     assert decision is not None
     assert decision.handling_outcome == "executed"
     assert decision.requires_scheduler is True
+
+
+def test_playbook_login_executes_with_target():
+    playbook = CoreScenarioPlaybook()
+    decision = playbook.decide(
+        scenario_id="login_form_chain",
+        message="登录 https://fixture.local/login 并提交表单。",
+        available_content_skills=[],
+        has_monitor_target=False,
+        has_form_target=True,
+        has_shell_command=False,
+    )
+    assert decision is not None
+    assert decision.handling_outcome == "executed"
+    assert decision.skill_name == "web_automate"

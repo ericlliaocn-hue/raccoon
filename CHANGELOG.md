@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.6] - 2026-04-25
+
+### ⚙️ 稳定化冲刺（执行成功率优先）
+
+> 目标：把“命中可复用”升级成“可控执行”，并给基准与浏览器链路补齐可复盘能力。
+
+- **版本先行落地**：按规则先完成 `pyproject/src/static/changelog` 版本同步，再开始本轮开发
+- **Playbook 执行通道补强**：`price_monitor/login_form_chain/remote_exec` 命中后在参数完整时走稳定执行路径，不再只记 `reused`
+- **浏览器链路硬化**：统一 `wait-visible -> wait-stable -> action -> assert`，失败自动留证据（截图/DOM/请求摘要）并携带 checkpoint
+- **基准一键化升级**：`raccoon benchmark core` 支持双包（clarification + execution）执行与 mismatch 报告，避免空报告
+- **路由误判回归补充**：新增路径/英文词干扰测试，减少误判和误触发
+
 ## [0.5.5] - 2026-04-25
 
 ### 🎯 执行成功率冲刺（第一批）
