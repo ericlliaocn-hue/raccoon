@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.4] - 2026-04-25
+
+### 📊 双指标体系 + 场景 Playbook 编排
+
+> 目标：解决"追问也算成功"的统计偏差，6 场景走稳定复用路径。
+
+- **LearningRun 双指标落库**：新增 `decision_success`、`execution_attempted`、`execution_success`、`handling_outcome`、`clarification_reason`
+- **核心场景稳定编排 Playbook**：新增 `CoreScenarioPlaybook`，6 场景优先走稳定复用路径，缺参统一追问
+- **/learning/runs 筛选增强**：新增 `execution_success`、`handling_outcome`、`clarification_reason` 过滤参数
+- **基准双指标升级**：`/benchmarks/core-scenarios/latest` 与 `raccoon benchmark core` 输出决策成功率、执行成功率、浏览器链路执行成功率、卡死率、handling_outcome 分布和 failure_code TopN
+- **发布门禁更新**：decision_success >=95%、execution_success >=85%、browser_chain >=90%、stuck_rate <=1%
+- **doctor 执行质量告警**：新增 execution_success 趋势下滑、场景退化、失败码集中检测
+- **样本包补充**：新增 `clarification_pack.json`、`execution_pack.json`
+
 ## [0.5.3] - 2026-04-25
 
 ### 🚦 版本先行落地（0.5.3 起）+ 📊 核心场景基线固化
@@ -22,6 +36,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **假入口拦截**：阻止 `example.com`、`oa.internal`、`{SKU_ID}` 等占位/假地址进入生成、验证和安装
 - **生成代码清洗**：统一提取 Python 代码块，避免 LLM 把 Markdown 围栏写进 `main.py` 导致编译失败
 - **shell_exec 保护**：直接命中 `shell_exec` 但缺具体命令时先追问，不进入审批/执行链路
+- **LearningRun 双指标落库**：新增 `decision_success`、`execution_attempted`、`execution_success`、`handling_outcome`、`clarification_reason`，解决“追问也算执行成功”的统计偏差
+- **核心场景稳定编排 Playbook**：新增 `CoreScenarioPlaybook`，6 场景优先走稳定复用路径（scheduler/content bundle/web_automate/shell_exec），缺参统一追问
+- **/learning/runs 筛选增强**：新增 `execution_success`、`handling_outcome`、`clarification_reason` 过滤参数
+- **基准双指标升级**：`/benchmarks/core-scenarios/latest` 与 `raccoon benchmark core` 输出决策成功率、执行成功率、浏览器链路执行成功率、卡死率、`handling_outcome` 分布和 `failure_code TopN`
+- **发布门禁更新**：发布 pass 改为 `decision_success >=95%`、`execution_success >=85%`、`browser_chain_execution_success >=90%`、`stuck_rate <=1%`
+- **doctor 执行质量告警**：新增 execution_success 趋势下滑、场景退化、失败码集中检测
+- **基准样本包补充**：新增 `benchmarks/core/clarification_pack.json`、`benchmarks/core/execution_pack.json`，并更新周报模板为双指标版
 
 ## [0.5.2] - 2026-04-25
 

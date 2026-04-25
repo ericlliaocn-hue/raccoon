@@ -277,6 +277,11 @@ class LearningRun(BaseModel):
     status: LearningRunStatus = LearningRunStatus.ANALYZING
     first_pass: bool = False
     final_success: bool = False
+    decision_success: bool = False
+    execution_attempted: bool = False
+    execution_success: bool = False
+    handling_outcome: str = "failed"  # clarified / reused / executed / failed
+    clarification_reason: str | None = None
     failure_code: str | None = None
     quality_score: float = 0.0
     skill_name: str | None = None

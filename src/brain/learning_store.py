@@ -24,6 +24,11 @@ CREATE TABLE IF NOT EXISTS learning_runs (
     status TEXT NOT NULL,
     first_pass INTEGER NOT NULL DEFAULT 0,
     final_success INTEGER NOT NULL DEFAULT 0,
+    decision_success INTEGER NOT NULL DEFAULT 0,
+    execution_attempted INTEGER NOT NULL DEFAULT 0,
+    execution_success INTEGER NOT NULL DEFAULT 0,
+    handling_outcome TEXT NOT NULL DEFAULT 'failed',
+    clarification_reason TEXT,
     failure_code TEXT,
     quality_score REAL NOT NULL DEFAULT 0,
     skill_name TEXT,
@@ -62,10 +67,25 @@ CREATE INDEX IF NOT EXISTS idx_learning_runs_failure
 ON learning_runs(failure_code, created_at DESC);
 """
 
+_CREATE_EXECUTION_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_learning_runs_execution
+ON learning_runs(execution_success, created_at DESC);
+"""
+
+_CREATE_HANDLING_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_learning_runs_handling_outcome
+ON learning_runs(handling_outcome, created_at DESC);
+"""
+
 _MIGRATION_COLUMNS: dict[str, str] = {
     "scenario_id": "ALTER TABLE learning_runs ADD COLUMN scenario_id TEXT",
     "first_pass": "ALTER TABLE learning_runs ADD COLUMN first_pass INTEGER NOT NULL DEFAULT 0",
     "final_success": "ALTER TABLE learning_runs ADD COLUMN final_success INTEGER NOT NULL DEFAULT 0",
+    "decision_success": "ALTER TABLE learning_runs ADD COLUMN decision_success INTEGER NOT NULL DEFAULT 0",
+    "execution_attempted": "ALTER TABLE learning_runs ADD COLUMN execution_attempted INTEGER NOT NULL DEFAULT 0",
+    "execution_success": "ALTER TABLE learning_runs ADD COLUMN execution_success INTEGER NOT NULL DEFAULT 0",
+    "handling_outcome": "ALTER TABLE learning_runs ADD COLUMN handling_outcome TEXT NOT NULL DEFAULT 'failed'",
+    "clarification_reason": "ALTER TABLE learning_runs ADD COLUMN clarification_reason TEXT",
     "failure_code": "ALTER TABLE learning_runs ADD COLUMN failure_code TEXT",
     "quality_score": "ALTER TABLE learning_runs ADD COLUMN quality_score REAL NOT NULL DEFAULT 0",
     "artifacts": "ALTER TABLE learning_runs ADD COLUMN artifacts TEXT NOT NULL DEFAULT '{}'",
@@ -89,13 +109,15 @@ class LearningRunStore:
 
     def _init_db(self) -> None:
         with self._connect() as conn:
+            conn.executescript(_CREATE_LEARNING_RUNS)
+            self._ensure_columns(conn)
             conn.executescript(
-                _CREATE_LEARNING_RUNS
-                + _CREATE_LEARNING_RUNS_INDEX
+                _CREATE_LEARNING_RUNS_INDEX
                 + _CREATE_SCENARIO_INDEX
                 + _CREATE_FAILURE_INDEX
+                + _CREATE_EXECUTION_INDEX
+                + _CREATE_HANDLING_INDEX
             )
-            self._ensure_columns(conn)
             conn.commit()
         logger.info("learning_store_initialized", db=str(self._db_path))
 
@@ -115,12 +137,14 @@ class LearningRunStore:
                 """
                 INSERT OR REPLACE INTO learning_runs (
                     run_id, conversation_id, user_id, request_text, source_task_id,
-                    scenario_id, status, first_pass, final_success, failure_code, quality_score,
+                    scenario_id, status, first_pass, final_success,
+                    decision_success, execution_attempted, execution_success, handling_outcome, clarification_reason,
+                    failure_code, quality_score,
                     skill_name, candidate_skill_name, candidate_confidence,
                     staging_dir, analysis, validation, artifacts, dependencies, repair_count,
                     approval_id, approval_status, execution_result, reply, error,
                     schedule_created, attempt_log, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 self._params(run),
             )
@@ -148,6 +172,9 @@ class LearningRunStore:
         scenario_id: str | None = None,
         failure_code: str | None = None,
         first_pass: bool | None = None,
+        execution_success: bool | None = None,
+        handling_outcome: str | None = None,
+        clarification_reason: str | None = None,
     ) -> list[LearningRun]:
         where: list[str] = []
         params: list[object] = []
@@ -160,6 +187,15 @@ class LearningRunStore:
         if first_pass is not None:
             where.append("first_pass = ?")
             params.append(1 if first_pass else 0)
+        if execution_success is not None:
+            where.append("execution_success = ?")
+            params.append(1 if execution_success else 0)
+        if handling_outcome:
+            where.append("handling_outcome = ?")
+            params.append(handling_outcome)
+        if clarification_reason:
+            where.append("clarification_reason = ?")
+            params.append(clarification_reason)
 
         where_sql = f"WHERE {' AND '.join(where)}" if where else ""
         with self._connect() as conn:
@@ -178,6 +214,20 @@ class LearningRunStore:
                     COUNT(*) AS total_runs,
                     SUM(CASE WHEN first_pass = 1 THEN 1 ELSE 0 END) AS first_pass_runs,
                     SUM(CASE WHEN final_success = 1 THEN 1 ELSE 0 END) AS final_success_runs,
+                    SUM(CASE WHEN decision_success = 1 THEN 1 ELSE 0 END) AS decision_success_runs,
+                    SUM(CASE WHEN execution_attempted = 1 THEN 1 ELSE 0 END) AS execution_attempted_runs,
+                    SUM(CASE WHEN execution_success = 1 THEN 1 ELSE 0 END) AS execution_success_runs,
+                    SUM(CASE WHEN handling_outcome = 'clarified' THEN 1 ELSE 0 END) AS clarified_runs,
+                    SUM(CASE WHEN handling_outcome = 'reused' THEN 1 ELSE 0 END) AS reused_runs,
+                    SUM(CASE WHEN handling_outcome = 'executed' THEN 1 ELSE 0 END) AS executed_runs,
+                    SUM(CASE WHEN handling_outcome = 'failed' THEN 1 ELSE 0 END) AS failed_runs,
+                    SUM(
+                        CASE
+                            WHEN status NOT IN ('succeeded', 'failed')
+                                 AND datetime(updated_at) <= datetime('now', '-30 minute')
+                            THEN 1 ELSE 0
+                        END
+                    ) AS stuck_runs,
                     AVG(quality_score) AS avg_quality_score,
                     AVG(CASE WHEN repair_count IS NULL THEN 0 ELSE repair_count END) AS avg_repair_count
                 FROM learning_runs
@@ -192,14 +242,40 @@ class LearningRunStore:
             total = int(row["total_runs"] or 0)
             first_pass_runs = int(row["first_pass_runs"] or 0)
             final_success_runs = int(row["final_success_runs"] or 0)
+            decision_success_runs = int(row["decision_success_runs"] or 0)
+            execution_attempted_runs = int(row["execution_attempted_runs"] or 0)
+            execution_success_runs = int(row["execution_success_runs"] or 0)
+            clarified_runs = int(row["clarified_runs"] or 0)
+            reused_runs = int(row["reused_runs"] or 0)
+            executed_runs = int(row["executed_runs"] or 0)
+            failed_runs = int(row["failed_runs"] or 0)
+            stuck_runs = int(row["stuck_runs"] or 0)
             result.append(
                 {
                     "scenario_id": row["scenario_id"],
                     "runs": total,
+                    "decision_success_runs": decision_success_runs,
+                    "execution_attempted_runs": execution_attempted_runs,
+                    "execution_success_runs": execution_success_runs,
+                    "stuck_runs": stuck_runs,
                     "first_pass_rate": (first_pass_runs / total) if total else 0.0,
                     "final_success_rate": (final_success_runs / total) if total else 0.0,
+                    "decision_success_rate": (decision_success_runs / total) if total else 0.0,
+                    "execution_attempt_rate": (execution_attempted_runs / total) if total else 0.0,
+                    "execution_success_rate": (
+                        (execution_success_runs / execution_attempted_runs)
+                        if execution_attempted_runs
+                        else 0.0
+                    ),
+                    "stuck_rate": (stuck_runs / total) if total else 0.0,
                     "avg_repair_count": float(row["avg_repair_count"] or 0.0),
                     "avg_quality_score": float(row["avg_quality_score"] or 0.0),
+                    "handling_outcomes": {
+                        "clarified": clarified_runs,
+                        "reused": reused_runs,
+                        "executed": executed_runs,
+                        "failed": failed_runs,
+                    },
                 }
             )
         return result
@@ -215,7 +291,7 @@ class LearningRunStore:
                 FROM learning_runs
                 WHERE failure_code IS NOT NULL
                   AND failure_code != ''
-                  AND final_success = 0
+                  AND (handling_outcome = 'failed' OR execution_success = 0)
                   AND datetime(created_at) >= datetime('now', ?)
                 GROUP BY failure_code
                 ORDER BY failures DESC, conversations DESC
@@ -253,7 +329,7 @@ class LearningRunStore:
                 FROM learning_runs
                 WHERE failure_code IS NOT NULL
                   AND failure_code != ''
-                  AND final_success = 0
+                  AND (handling_outcome = 'failed' OR execution_success = 0)
                   AND datetime(created_at) >= datetime('now', ?)
                 GROUP BY failure_code, COALESCE(scenario_id, '')
                 HAVING COUNT(*) >= ? AND COUNT(DISTINCT conversation_id) >= ?
@@ -273,7 +349,7 @@ class LearningRunStore:
                     FROM learning_runs
                     WHERE failure_code = ?
                       AND COALESCE(scenario_id, '') = ?
-                      AND final_success = 0
+                      AND (handling_outcome = 'failed' OR execution_success = 0)
                     ORDER BY updated_at DESC
                     LIMIT 1
                     """,
@@ -324,6 +400,11 @@ class LearningRunStore:
             run.status.value if isinstance(run.status, LearningRunStatus) else str(run.status),
             1 if run.first_pass else 0,
             1 if run.final_success else 0,
+            1 if run.decision_success else 0,
+            1 if run.execution_attempted else 0,
+            1 if run.execution_success else 0,
+            run.handling_outcome,
+            run.clarification_reason,
             run.failure_code,
             float(run.quality_score or 0.0),
             run.skill_name,
@@ -365,6 +446,11 @@ class LearningRunStore:
             status=LearningRunStatus(row["status"]),
             first_pass=bool(row["first_pass"]),
             final_success=bool(row["final_success"]),
+            decision_success=bool(row["decision_success"]),
+            execution_attempted=bool(row["execution_attempted"]),
+            execution_success=bool(row["execution_success"]),
+            handling_outcome=row["handling_outcome"] or "failed",
+            clarification_reason=row["clarification_reason"],
             failure_code=row["failure_code"],
             quality_score=float(row["quality_score"] or 0.0),
             skill_name=row["skill_name"],

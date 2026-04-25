@@ -26,10 +26,14 @@ CORE_SCENARIOS: tuple[ScenarioSpec, ...] = (
 CORE_SCENARIO_IDS = tuple(spec.scenario_id for spec in CORE_SCENARIOS)
 
 CORE_BENCHMARK_THRESHOLDS = {
+    "decision_success_rate": 0.95,
+    "execution_success_rate": 0.85,
+    "browser_chain_execution_success_rate": 0.90,
+    "stuck_rate_max": 0.01,
+    # 兼容旧报告字段
     "first_pass_rate": 0.70,
     "final_success_rate": 0.85,
     "browser_chain_success_rate": 0.90,
-    "stuck_rate_max": 0.01,
 }
 
 
@@ -114,25 +118,52 @@ def evaluate_quality(
     return score, {"checks": checks, "scenario_id": scenario_id}
 
 
-def build_core_scenario_report(aggregated_rows: list[dict[str, object]]) -> dict[str, Any]:
+def build_core_scenario_report(
+    aggregated_rows: list[dict[str, object]],
+    top_failures: list[dict[str, object]] | None = None,
+) -> dict[str, Any]:
     row_map = {str(row["scenario_id"]): row for row in aggregated_rows}
     scenarios: list[dict[str, Any]] = []
 
     total_runs = 0
     total_first_pass = 0.0
     total_final_success = 0.0
+    total_decision_success = 0.0
+    total_execution_attempted = 0
+    total_execution_success = 0.0
+    total_stuck = 0
+    handling_totals = {"clarified": 0, "reused": 0, "executed": 0, "failed": 0}
 
     for spec in CORE_SCENARIOS:
         row = row_map.get(spec.scenario_id, {})
         runs = int(row.get("runs", 0) or 0)
         first_pass_rate = float(row.get("first_pass_rate", 0.0) or 0.0)
         final_success_rate = float(row.get("final_success_rate", 0.0) or 0.0)
+        decision_success_rate = float(row.get("decision_success_rate", first_pass_rate) or 0.0)
+        execution_attempt_rate = float(row.get("execution_attempt_rate", 0.0) or 0.0)
+        execution_success_rate = float(row.get("execution_success_rate", final_success_rate) or 0.0)
+        stuck_rate = float(row.get("stuck_rate", 0.0) or 0.0)
         avg_repair_count = float(row.get("avg_repair_count", 0.0) or 0.0)
         avg_quality_score = float(row.get("avg_quality_score", 0.0) or 0.0)
+        handling_outcomes = row.get("handling_outcomes", {}) or {}
+        clarified = int(handling_outcomes.get("clarified", 0) or 0)
+        reused = int(handling_outcomes.get("reused", 0) or 0)
+        executed = int(handling_outcomes.get("executed", 0) or 0)
+        failed = int(handling_outcomes.get("failed", 0) or 0)
 
         total_runs += runs
         total_first_pass += first_pass_rate * runs
         total_final_success += final_success_rate * runs
+        total_decision_success += decision_success_rate * runs
+        attempted_runs = int(row.get("execution_attempted_runs", 0) or round(execution_attempt_rate * runs))
+        success_runs = int(row.get("execution_success_runs", 0) or round(execution_success_rate * attempted_runs))
+        total_execution_attempted += attempted_runs
+        total_execution_success += success_runs
+        total_stuck += int(row.get("stuck_runs", 0) or round(stuck_rate * runs))
+        handling_totals["clarified"] += clarified
+        handling_totals["reused"] += reused
+        handling_totals["executed"] += executed
+        handling_totals["failed"] += failed
 
         scenarios.append(
             {
@@ -141,31 +172,81 @@ def build_core_scenario_report(aggregated_rows: list[dict[str, object]]) -> dict
                 "runs": runs,
                 "first_pass_rate": first_pass_rate,
                 "final_success_rate": final_success_rate,
+                "decision_success_rate": decision_success_rate,
+                "execution_attempt_rate": execution_attempt_rate,
+                "execution_success_rate": execution_success_rate,
+                "stuck_rate": stuck_rate,
                 "avg_repair_count": avg_repair_count,
                 "avg_quality_score": avg_quality_score,
+                "handling_outcomes": {
+                    "clarified": clarified,
+                    "reused": reused,
+                    "executed": executed,
+                    "failed": failed,
+                },
             }
         )
 
     overall_first_pass = (total_first_pass / total_runs) if total_runs else 0.0
     overall_final_success = (total_final_success / total_runs) if total_runs else 0.0
+    overall_decision_success = (total_decision_success / total_runs) if total_runs else 0.0
+    overall_execution_success = (
+        (total_execution_success / total_execution_attempted)
+        if total_execution_attempted
+        else 0.0
+    )
+    overall_stuck_rate = (total_stuck / total_runs) if total_runs else 0.0
     browser_row = row_map.get("login_form_chain", {})
-    browser_chain_success = float(browser_row.get("final_success_rate", 0.0) or 0.0)
+    browser_chain_execution_success = float(
+        browser_row.get(
+            "execution_success_rate",
+            browser_row.get("final_success_rate", 0.0),
+        )
+        or 0.0
+    )
 
     gates = {
+        "decision_success_rate_ok": (
+            overall_decision_success >= CORE_BENCHMARK_THRESHOLDS["decision_success_rate"]
+        ),
+        "execution_success_rate_ok": (
+            overall_execution_success >= CORE_BENCHMARK_THRESHOLDS["execution_success_rate"]
+        ),
+        "browser_chain_execution_success_rate_ok": (
+            browser_chain_execution_success
+            >= CORE_BENCHMARK_THRESHOLDS["browser_chain_execution_success_rate"]
+        ),
+        "stuck_rate_ok": overall_stuck_rate <= CORE_BENCHMARK_THRESHOLDS["stuck_rate_max"],
+    }
+    legacy_gates = {
         "first_pass_rate_ok": overall_first_pass >= CORE_BENCHMARK_THRESHOLDS["first_pass_rate"],
         "final_success_rate_ok": overall_final_success >= CORE_BENCHMARK_THRESHOLDS["final_success_rate"],
-        "browser_chain_success_ok": browser_chain_success >= CORE_BENCHMARK_THRESHOLDS["browser_chain_success_rate"],
+        "browser_chain_success_ok": browser_chain_execution_success >= CORE_BENCHMARK_THRESHOLDS["browser_chain_success_rate"],
+    }
+    handling_total_count = sum(handling_totals.values())
+    handling_rates = {
+        key: (value / handling_total_count if handling_total_count else 0.0)
+        for key, value in handling_totals.items()
     }
 
     return {
         "thresholds": CORE_BENCHMARK_THRESHOLDS,
         "overall": {
             "runs": total_runs,
+            "decision_success_rate": overall_decision_success,
+            "execution_attempts": total_execution_attempted,
+            "execution_success_rate": overall_execution_success,
+            "browser_chain_execution_success_rate": browser_chain_execution_success,
+            "stuck_rate": overall_stuck_rate,
             "first_pass_rate": overall_first_pass,
             "final_success_rate": overall_final_success,
-            "browser_chain_success_rate": browser_chain_success,
+            "browser_chain_success_rate": browser_chain_execution_success,
+            "handling_outcomes": handling_totals,
+            "handling_outcome_rates": handling_rates,
             "pass": all(gates.values()),
             "gates": gates,
+            "legacy_gates": legacy_gates,
         },
         "scenarios": scenarios,
+        "failure_code_topn": top_failures or [],
     }

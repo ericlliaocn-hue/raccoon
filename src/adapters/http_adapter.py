@@ -789,6 +789,9 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
         scenario_id: str | None = None,
         failure_code: str | None = None,
         first_pass: bool | None = None,
+        execution_success: bool | None = None,
+        handling_outcome: str | None = None,
+        clarification_reason: str | None = None,
     ) -> list[dict]:
         """列出最近学习运行记录。"""
         runs = learning_store.list_recent(
@@ -796,6 +799,9 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
             scenario_id=scenario_id,
             failure_code=failure_code,
             first_pass=first_pass,
+            execution_success=execution_success,
+            handling_outcome=handling_outcome,
+            clarification_reason=clarification_reason,
         )
         return [run.model_dump(mode="json") for run in runs]
 
@@ -825,7 +831,10 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
     @app.get("/benchmarks/core-scenarios/latest")
     async def get_core_scenarios_benchmark() -> dict:
         """核心场景基准聚合（只读）。"""
-        report = build_core_scenario_report(learning_store.aggregate_core_scenarios())
+        report = build_core_scenario_report(
+            learning_store.aggregate_core_scenarios(),
+            learning_store.top_failure_clusters(days=7, limit=10),
+        )
         report["generated_at"] = datetime.now(timezone.utc).isoformat()
         return report
 

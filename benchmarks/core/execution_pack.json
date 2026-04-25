@@ -1,0 +1,81 @@
+{
+  "pack_id": "core-execution-v1",
+  "type": "execution",
+  "generated_at": "2026-04-25T00:00:00Z",
+  "description": "参数完整的执行样本，用于验证 execution_success 与浏览器链路稳定性。",
+  "fixture_environment": "core-fixture-v1",
+  "cases": [
+    {
+      "case_id": "exec-daily-001",
+      "scenario_id": "daily_brief",
+      "prompt": "给我一份今天 AI + 半导体双主题简报，列出来源和时间。",
+      "expected_outcome": "reused"
+    },
+    {
+      "case_id": "exec-daily-002",
+      "scenario_id": "daily_brief",
+      "prompt": "整理今天最重要的 5 条技术新闻并标注来源链接。",
+      "expected_outcome": "reused"
+    },
+    {
+      "case_id": "exec-price-001",
+      "scenario_id": "price_monitor",
+      "prompt": "监控 https://item.jd.com/100012043978.html，降到 4299 提醒我。",
+      "expected_outcome": "executed"
+    },
+    {
+      "case_id": "exec-price-002",
+      "scenario_id": "price_monitor",
+      "prompt": "监控 sku=100123456789 的库存恢复并通知我。",
+      "expected_outcome": "executed"
+    },
+    {
+      "case_id": "exec-login-001",
+      "scenario_id": "login_form_chain",
+      "prompt": "登录 https://fixture.local/login，账号 test_user，按步骤填写并提交采购申请。",
+      "expected_outcome": "executed"
+    },
+    {
+      "case_id": "exec-login-002",
+      "scenario_id": "login_form_chain",
+      "prompt": "打开 https://fixture.local/oa，登录后上传 /tmp/demo.pdf 并提交表单。",
+      "expected_outcome": "executed"
+    },
+    {
+      "case_id": "exec-material-001",
+      "scenario_id": "material_collection",
+      "prompt": "收集 AI 热门话题素材，按平台去重并输出 15 条。",
+      "expected_outcome": "reused"
+    },
+    {
+      "case_id": "exec-material-002",
+      "scenario_id": "material_collection",
+      "prompt": "抓取本周热点内容并按主题聚类，输出来源说明。",
+      "expected_outcome": "reused"
+    },
+    {
+      "case_id": "exec-reminder-001",
+      "scenario_id": "reminder_schedule",
+      "prompt": "每个工作日 09:30 提醒我检查客户回复。",
+      "expected_outcome": "executed"
+    },
+    {
+      "case_id": "exec-reminder-002",
+      "scenario_id": "reminder_schedule",
+      "prompt": "每周五 18:00 提醒我汇总本周学习失败案例。",
+      "expected_outcome": "executed"
+    },
+    {
+      "case_id": "exec-remote-001",
+      "scenario_id": "remote_exec",
+      "prompt": "先审批，再执行 `du -sh ~/Downloads` 并返回结果。",
+      "expected_outcome": "executed"
+    },
+    {
+      "case_id": "exec-remote-002",
+      "scenario_id": "remote_exec",
+      "prompt": "先审批，再运行 /usr/local/bin/backup_logs.sh 并输出最后 20 行日志。",
+      "expected_outcome": "executed"
+    }
+  ]
+}

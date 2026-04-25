@@ -1,0 +1,92 @@
+{
+  "pack_id": "core-clarification-v1",
+  "type": "clarification",
+  "generated_at": "2026-04-25T00:00:00Z",
+  "description": "故意缺关键参数，用于验证 decision_success（该追问时必须追问）。",
+  "cases": [
+    {
+      "case_id": "clarify-price-001",
+      "scenario_id": "price_monitor",
+      "prompt": "帮我盯这个商品，降价就提醒我。",
+      "expected_outcome": "clarified",
+      "expected_reason": "missing_price_target"
+    },
+    {
+      "case_id": "clarify-price-002",
+      "scenario_id": "price_monitor",
+      "prompt": "监控这个显示器库存恢复，通知我。",
+      "expected_outcome": "clarified",
+      "expected_reason": "missing_price_target"
+    },
+    {
+      "case_id": "clarify-login-001",
+      "scenario_id": "login_form_chain",
+      "prompt": "登录系统然后帮我提交表单。",
+      "expected_outcome": "clarified",
+      "expected_reason": "missing_form_target"
+    },
+    {
+      "case_id": "clarify-login-002",
+      "scenario_id": "login_form_chain",
+      "prompt": "后台流程中断了，你继续提交流程单。",
+      "expected_outcome": "clarified",
+      "expected_reason": "missing_form_target"
+    },
+    {
+      "case_id": "clarify-remote-001",
+      "scenario_id": "remote_exec",
+      "prompt": "先审批，再帮我清理服务器日志。",
+      "expected_outcome": "clarified",
+      "expected_reason": "missing_shell_command"
+    },
+    {
+      "case_id": "clarify-remote-002",
+      "scenario_id": "remote_exec",
+      "prompt": "帮我跑一个高风险任务，先确认风险。",
+      "expected_outcome": "clarified",
+      "expected_reason": "missing_shell_command"
+    },
+    {
+      "case_id": "clarify-reminder-001",
+      "scenario_id": "reminder_schedule",
+      "prompt": "记得提醒我复盘。",
+      "expected_outcome": "clarified",
+      "expected_reason": "missing_schedule_target"
+    },
+    {
+      "case_id": "clarify-reminder-002",
+      "scenario_id": "reminder_schedule",
+      "prompt": "给我加个提醒。",
+      "expected_outcome": "clarified",
+      "expected_reason": "missing_schedule_target"
+    },
+    {
+      "case_id": "clarify-placeholder-001",
+      "scenario_id": "login_form_chain",
+      "prompt": "登录 https://example.com 然后提交。",
+      "expected_outcome": "clarified",
+      "expected_reason": "placeholder_endpoint"
+    },
+    {
+      "case_id": "clarify-placeholder-002",
+      "scenario_id": "login_form_chain",
+      "prompt": "访问 oa.internal 并执行审批流程。",
+      "expected_outcome": "clarified",
+      "expected_reason": "placeholder_endpoint"
+    },
+    {
+      "case_id": "clarify-daily-001",
+      "scenario_id": "daily_brief",
+      "prompt": "帮我整理一下今天重点。",
+      "expected_outcome": "reused",
+      "expected_reason": null
+    },
+    {
+      "case_id": "clarify-material-001",
+      "scenario_id": "material_collection",
+      "prompt": "收集本周热点素材并去重。",
+      "expected_outcome": "reused",
+      "expected_reason": null
+    }
+  ]
+}

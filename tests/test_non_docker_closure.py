@@ -107,6 +107,10 @@ def test_learning_runs_filter_and_core_benchmark_endpoint(tmp_path):
         status=LearningRunStatus.SUCCEEDED,
         first_pass=True,
         final_success=True,
+        decision_success=True,
+        execution_attempted=True,
+        execution_success=True,
+        handling_outcome="executed",
         quality_score=0.9,
     )
     app.state.learning_store.add(run)
@@ -120,6 +124,10 @@ def test_learning_runs_filter_and_core_benchmark_endpoint(tmp_path):
                 status=LearningRunStatus.FAILED,
                 first_pass=False,
                 final_success=False,
+                decision_success=True,
+                execution_attempted=True,
+                execution_success=False,
+                handling_outcome="failed",
                 failure_code="data_hollow",
                 quality_score=0.2,
             )
@@ -136,11 +144,22 @@ def test_learning_runs_filter_and_core_benchmark_endpoint(tmp_path):
         assert len(data) >= 1
         assert data[0]["scenario_id"] == "daily_brief"
 
+        by_execution = client.get("/learning/runs?execution_success=true", headers=headers)
+        assert by_execution.status_code == 200
+        assert any(item["execution_success"] for item in by_execution.json())
+
+        failed = client.get("/learning/runs?handling_outcome=failed", headers=headers)
+        assert failed.status_code == 200
+        assert all(item["handling_outcome"] == "failed" for item in failed.json())
+
         bench = client.get("/benchmarks/core-scenarios/latest", headers=headers)
         assert bench.status_code == 200
         payload = bench.json()
         assert "overall" in payload
         assert "scenarios" in payload
+        assert "decision_success_rate" in payload["overall"]
+        assert "execution_success_rate" in payload["overall"]
+        assert "failure_code_topn" in payload
 
         candidates = client.get(
             "/learning/candidates?days=7&min_failures=5&min_conversations=2",

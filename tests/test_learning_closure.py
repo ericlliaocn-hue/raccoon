@@ -181,6 +181,11 @@ async def test_learning_preflight_price_monitor_requires_target(tmp_path: Path):
     assert run is not None
     assert run.status == LearningRunStatus.SUCCEEDED
     assert run.final_success is True
+    assert run.decision_success is True
+    assert run.execution_attempted is False
+    assert run.execution_success is False
+    assert run.handling_outcome == "clarified"
+    assert run.clarification_reason == "missing_price_target"
     assert run.artifacts["clarification_required"] is True
     assert run.artifacts["reason"] == "missing_price_target"
     assert "商品链接" in result["reply"]
@@ -206,6 +211,11 @@ async def test_learning_preflight_remote_exec_requires_concrete_command(tmp_path
     assert run is not None
     assert run.status == LearningRunStatus.SUCCEEDED
     assert run.final_success is True
+    assert run.decision_success is True
+    assert run.execution_attempted is False
+    assert run.execution_success is False
+    assert run.handling_outcome == "clarified"
+    assert run.clarification_reason == "missing_shell_command"
     assert run.artifacts["reason"] == "missing_shell_command"
     assert result["skill_name"] == "shell_exec"
 
@@ -236,6 +246,9 @@ async def test_learning_preflight_reuses_content_skill_bundle(tmp_path: Path):
     assert run is not None
     assert run.status == LearningRunStatus.SUCCEEDED
     assert run.final_success is True
+    assert run.decision_success is True
+    assert run.handling_outcome == "reused"
+    assert run.execution_attempted is False
     assert run.artifacts["reused_capability"] == "skill_bundle"
     assert "weibo_hot" in run.artifacts["skills"]
 

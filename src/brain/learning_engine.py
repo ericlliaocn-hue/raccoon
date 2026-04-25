@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from src.brain.core_benchmark import detect_core_scenario_id, evaluate_quality, normalize_intent_phrase
+from src.brain.core_scenario_playbook import CoreScenarioPlaybook
 from src.config import RaccoonConfig
 from src.eventbus.events import EventType, make_event
 from src.memcore.reader import MemCoreReader
@@ -114,6 +115,7 @@ class LearningEngine:
         self._event_bus = event_bus
         self._approval_engine = approval_engine
         self._learning_store = learning_store
+        self._playbook = CoreScenarioPlaybook()
         self._auto_install = getattr(
             self._config,
             "learning_auto_install_dependencies",
@@ -404,6 +406,11 @@ class LearningEngine:
             "scenario_id": run.scenario_id,
             "first_pass": run.first_pass,
             "final_success": run.final_success,
+            "decision_success": run.decision_success,
+            "execution_attempted": run.execution_attempted,
+            "execution_success": run.execution_success,
+            "handling_outcome": run.handling_outcome,
+            "clarification_reason": run.clarification_reason,
             "failure_code": run.failure_code,
             "quality_score": run.quality_score,
             "artifacts": run.artifacts,
@@ -423,6 +430,13 @@ class LearningEngine:
 
     async def _fail_run(self, run: LearningRun, reply: str, error: str) -> dict[str, Any]:
         failure_code = self._classify_failure_code(error)
+        previous_outcome = run.handling_outcome
+        if previous_outcome == "executed" and run.status == LearningRunStatus.EXECUTING:
+            run.execution_attempted = True
+        run.handling_outcome = "failed"
+        run.execution_success = False
+        if not run.decision_success and previous_outcome in {"clarified", "reused", "executed"}:
+            run.decision_success = True
         run.final_success = False
         run.failure_code = failure_code
         candidate = self._maybe_mark_new_skill_candidate(run, failure_code)
@@ -460,9 +474,18 @@ class LearningEngine:
         skill_name: str | None = None,
         artifacts: dict[str, Any] | None = None,
         schedule_created: str | None = None,
+        handling_outcome: str = "reused",
+        execution_attempted: bool = False,
+        execution_success: bool = False,
+        clarification_reason: str | None = None,
     ) -> dict[str, Any]:
         """Mark the learning run as handled without generating a new Skill."""
         run.skill_name = skill_name or run.skill_name
+        run.handling_outcome = handling_outcome
+        run.clarification_reason = clarification_reason
+        run.decision_success = True
+        run.execution_attempted = execution_attempted
+        run.execution_success = execution_success
         run.first_pass = True
         run.final_success = True
         run.failure_code = None
@@ -489,77 +512,6 @@ class LearningEngine:
         scenario_id = self._infer_scenario_id(run, user_message)
         text = normalize_intent_phrase(user_message)
 
-        if scenario_id == "reminder_schedule":
-            if self._scheduler:
-                schedule_info = await self._try_create_schedule(user_message, "scheduler", task.conversation_id)
-                if schedule_info:
-                    return await self._succeed_without_learning(
-                        run,
-                        f"这个需求不需要新 Skill，已直接创建定时任务：{schedule_info}",
-                        skill_name="scheduler",
-                        artifacts={"reused_capability": "scheduler"},
-                        schedule_created=schedule_info,
-                    )
-            return await self._clarify_run(
-                run,
-                "这个是提醒/定时需求，应复用系统 Scheduler，不需要新建 Skill。请补充提醒内容和时间，例如「每个工作日 09:30 提醒我检查客户回复」。",
-                reason="scheduler_unavailable_or_incomplete",
-                capability="scheduler",
-            )
-
-        if scenario_id == "daily_brief" and self._available_content_skills():
-            return await self._succeed_without_learning(
-                run,
-                "这个简报需求优先复用已有日报/热榜 Skill，再由对话层汇总，不直接新造爬虫 Skill。",
-                skill_name="content_skill_bundle",
-                artifacts={
-                    "reused_capability": "skill_bundle",
-                    "skills": self._available_content_skills(),
-                },
-            )
-
-        if scenario_id == "remote_exec":
-            if self._has_concrete_shell_command(user_message):
-                return await self._succeed_without_learning(
-                    run,
-                    "这个需求应复用已有高风险技能「shell_exec」并走审批，不需要新建 Skill。请直接发送具体命令，例如「执行 du -sh ~/Downloads」。",
-                    skill_name="shell_exec",
-                    artifacts={"reused_capability": "shell_exec", "requires_approval": True},
-                )
-            return await self._clarify_run(
-                run,
-                "要执行命令/脚本前，需要先给出具体命令或脚本路径。我不会根据「磁盘检查」「日志归档」这类描述自行编命令。",
-                reason="missing_shell_command",
-                capability="shell_exec",
-            )
-
-        if scenario_id == "price_monitor" and not self._has_monitor_target(user_message):
-            return await self._clarify_run(
-                run,
-                "价格监控需要商品链接、SKU 或明确平台+商品标识。请补充目标，例如「监控 https://... 降到 4299 提醒我」。",
-                reason="missing_price_target",
-                capability="change_detector",
-            )
-
-        if scenario_id == "login_form_chain" and not self._has_form_target(user_message):
-            return await self._clarify_run(
-                run,
-                "登录/表单长链路需要真实网址、登录方式和要填写的字段。我不会生成 oa.example.com 这类假入口。",
-                reason="missing_form_target",
-                capability="web_automate",
-            )
-
-        if scenario_id == "material_collection" and self._can_reuse_content_skills(user_message):
-            return await self._succeed_without_learning(
-                run,
-                "这个素材采集需求优先复用已有热榜/日报类 Skill，再汇总去重；当前不直接生成新爬虫 Skill，避免被动态站点和反爬拖垮。",
-                skill_name="content_skill_bundle",
-                artifacts={
-                    "reused_capability": "skill_bundle",
-                    "skills": self._available_content_skills(),
-                },
-            )
-
         if "example.com" in text or "oa.internal" in text:
             return await self._clarify_run(
                 run,
@@ -567,7 +519,55 @@ class LearningEngine:
                 reason="placeholder_endpoint",
             )
 
-        return None
+        decision = self._playbook.decide(
+            scenario_id=scenario_id,
+            message=user_message,
+            available_content_skills=self._available_content_skills(),
+            has_monitor_target=self._has_monitor_target(user_message),
+            has_form_target=self._has_form_target(user_message),
+            has_shell_command=self._has_concrete_shell_command(user_message),
+        )
+        if not decision:
+            return None
+
+        if decision.requires_scheduler:
+            if self._scheduler:
+                schedule_info = await self._try_create_schedule(user_message, "scheduler", task.conversation_id)
+                if schedule_info:
+                    return await self._succeed_without_learning(
+                        run,
+                        f"{decision.reply} 已创建任务：{schedule_info}",
+                        skill_name=decision.skill_name,
+                        artifacts=decision.artifacts,
+                        schedule_created=schedule_info,
+                        handling_outcome="executed",
+                        execution_attempted=True,
+                        execution_success=True,
+                    )
+            return await self._clarify_run(
+                run,
+                "提醒场景走 Scheduler 稳定路径，请补充可执行时间表达式和提醒内容。",
+                reason=decision.clarification_reason or "scheduler_unavailable_or_incomplete",
+                capability=decision.skill_name,
+            )
+
+        if decision.handling_outcome == "clarified":
+            return await self._clarify_run(
+                run,
+                decision.reply,
+                reason=decision.clarification_reason or "clarification_required",
+                capability=decision.skill_name,
+            )
+
+        return await self._succeed_without_learning(
+            run,
+            decision.reply,
+            skill_name=decision.skill_name,
+            artifacts=decision.artifacts,
+            handling_outcome=decision.handling_outcome,
+            execution_attempted=decision.handling_outcome == "executed",
+            execution_success=decision.handling_outcome == "executed",
+        )
 
     async def _block_invalid_or_incomplete_plan(
         self,
@@ -630,6 +630,10 @@ class LearningEngine:
             f"需要补充信息：{reply}",
             skill_name=capability,
             artifacts=artifacts,
+            handling_outcome="clarified",
+            execution_attempted=False,
+            execution_success=False,
+            clarification_reason=reason,
         )
 
     def _infer_scenario_id(self, run: LearningRun, user_message: str) -> str | None:
@@ -926,6 +930,10 @@ class LearningEngine:
         result = await self._approval_engine.review(approval_task, metadata=meta, risk_level="high")
         run.approval_id = result.approval_id
         run.approval_status = result.status.value
+        run.decision_success = True
+        run.handling_outcome = "executed"
+        run.execution_attempted = False
+        run.execution_success = False
 
         if result.approved:
             self._save_run(run)
@@ -1029,6 +1037,10 @@ class LearningEngine:
         except Exception as e:
             return await self._fail_run(run, f"❌ Skill 安装失败：{e}", str(e))
 
+        run.handling_outcome = "executed"
+        run.decision_success = True
+        run.execution_attempted = True
+        run.execution_success = False
         self._save_run(run, status=LearningRunStatus.EXECUTING)
         exec_result = await self._execute_learned_skill(task, skill_name, user_message)
         if not exec_result.get("success"):
@@ -1096,6 +1108,10 @@ class LearningEngine:
             reply += f"\n⏰ 已创建定时任务：{run.schedule_created}"
 
         run.execution_result = exec_result
+        run.decision_success = True
+        run.execution_attempted = True
+        run.execution_success = True
+        run.clarification_reason = None
         run.first_pass = run.repair_count == 0
         run.final_success = True
         run.failure_code = None
@@ -1177,6 +1193,10 @@ class LearningEngine:
             return None
 
         run.skill_name = skill_name
+        run.handling_outcome = "reused"
+        run.decision_success = True
+        run.execution_attempted = True
+        run.execution_success = False
         self._save_run(run, status=LearningRunStatus.EXECUTING)
         exec_result = await self._execute_learned_skill(task, skill_name, user_message)
         if not exec_result.get("success"):
@@ -1185,6 +1205,8 @@ class LearningEngine:
 
         reply = f"📋 复用已有学习经验，直接使用技能「{skill_name}」。\n\n{exec_result.get('reply', '')}"
         run.execution_result = exec_result
+        run.execution_success = True
+        run.clarification_reason = None
         score, detail = evaluate_quality(
             run.scenario_id,
             analysis=run.analysis,

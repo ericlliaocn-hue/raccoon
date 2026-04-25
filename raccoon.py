@@ -500,7 +500,32 @@ def _cmd_doctor() -> None:
         else:
             print("  ✅ LearningRun 无卡死记录")
 
-        failures = [r for r in recent_runs if not r.final_success and r.failure_code]
+        execution_runs = [r for r in recent_runs if r.execution_attempted]
+        if execution_runs:
+            recent_window = execution_runs[:50]
+            previous_window = execution_runs[50:100]
+            recent_rate = (
+                sum(1 for r in recent_window if r.execution_success) / len(recent_window)
+                if recent_window
+                else 0.0
+            )
+            previous_rate = (
+                sum(1 for r in previous_window if r.execution_success) / len(previous_window)
+                if previous_window
+                else None
+            )
+            if previous_rate is not None and previous_rate >= 0.5 and recent_rate + 0.1 < previous_rate:
+                print(
+                    "  ⚠️  最近执行成功率下滑: "
+                    f"{recent_rate * 100:.1f}% (前一窗口 {previous_rate * 100:.1f}%)"
+                )
+                issues.append("execution_success 下滑")
+            else:
+                print(f"  ✅ 执行成功率稳定 ({recent_rate * 100:.1f}%)")
+        else:
+            print("  ℹ️  最近无执行样本，无法评估 execution_success 趋势")
+
+        failures = [r for r in execution_runs if not r.execution_success and r.failure_code]
         if failures:
             counts: dict[str, int] = {}
             for run in failures:
@@ -514,6 +539,28 @@ def _cmd_doctor() -> None:
                 print("  ✅ 失败码分布正常")
         else:
             print("  ✅ 最近无集中失败码")
+
+        degraded: list[str] = []
+        by_scenario: dict[str, list] = {}
+        for run in execution_runs:
+            if run.scenario_id:
+                by_scenario.setdefault(run.scenario_id, []).append(run)
+        for scenario_id, runs in by_scenario.items():
+            recent = runs[:20]
+            previous = runs[20:40]
+            if len(recent) < 5 or len(previous) < 5:
+                continue
+            recent_rate = sum(1 for r in recent if r.execution_success) / len(recent)
+            previous_rate = sum(1 for r in previous if r.execution_success) / len(previous)
+            if recent_rate + 0.15 < previous_rate:
+                degraded.append(
+                    f"{scenario_id}({recent_rate * 100:.1f}%<-{previous_rate * 100:.1f}%)"
+                )
+        if degraded:
+            print(f"  ⚠️  场景退化告警: {', '.join(degraded)}")
+            issues.append("核心场景执行成功率退化")
+        else:
+            print("  ✅ 核心场景无明显退化")
 
         candidates = store.list_new_skill_candidates(days=7, min_failures=5, min_conversations=2, limit=20)
         if candidates:
@@ -594,7 +641,10 @@ def _cmd_benchmark(args) -> None:
 
     config = load_config()
     store = LearningRunStore(config)
-    report = build_core_scenario_report(store.aggregate_core_scenarios())
+    report = build_core_scenario_report(
+        store.aggregate_core_scenarios(),
+        store.top_failure_clusters(days=7, limit=10),
+    )
 
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
@@ -603,20 +653,35 @@ def _cmd_benchmark(args) -> None:
     overall = report["overall"]
     print("🧪 核心场景基准报告\n")
     print(f"  样本数: {overall['runs']}")
-    print(f"  首轮命中率: {overall['first_pass_rate'] * 100:.1f}%")
-    print(f"  最终成功率: {overall['final_success_rate'] * 100:.1f}%")
-    print(f"  浏览器链路成功率: {overall['browser_chain_success_rate'] * 100:.1f}%")
+    print(f"  决策成功率: {overall['decision_success_rate'] * 100:.1f}%")
+    print(f"  执行成功率: {overall['execution_success_rate'] * 100:.1f}%")
+    print(f"  浏览器链路执行成功率: {overall['browser_chain_execution_success_rate'] * 100:.1f}%")
+    print(f"  卡死率: {overall['stuck_rate'] * 100:.2f}%")
     print(f"  发布门禁: {'✅ 通过' if overall['pass'] else '❌ 未通过'}")
     print()
     print("场景明细:")
     for row in report["scenarios"]:
+        outcomes = row.get("handling_outcomes", {})
         print(
             f"  - {row['name']:<10} runs={row['runs']:<3d} "
-            f"first={row['first_pass_rate'] * 100:>5.1f}% "
-            f"final={row['final_success_rate'] * 100:>5.1f}% "
+            f"decision={row['decision_success_rate'] * 100:>5.1f}% "
+            f"exec={row['execution_success_rate'] * 100:>5.1f}% "
+            f"stuck={row['stuck_rate'] * 100:>4.1f}% "
             f"repair={row['avg_repair_count']:.2f} "
-            f"quality={row['avg_quality_score']:.2f}"
+            f"quality={row['avg_quality_score']:.2f} "
+            f"outcomes(c/r/e/f)={outcomes.get('clarified', 0)}/"
+            f"{outcomes.get('reused', 0)}/"
+            f"{outcomes.get('executed', 0)}/"
+            f"{outcomes.get('failed', 0)}"
         )
+
+    if report.get("failure_code_topn"):
+        print("\nfailure_code TopN:")
+        for item in report["failure_code_topn"]:
+            print(
+                f"  - {item.get('failure_code', 'unknown')}: "
+                f"{item.get('failures', 0)} 次 / {item.get('conversations', 0)} 会话"
+            )
 
     if not overall["pass"]:
         print("\n⚠️ 未达平衡档门槛，建议先修复集中失败码后再打版本标签。")
