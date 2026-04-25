@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.10] - 2026-04-25
+
+### 🌐 浏览器链路硬化（登录态信号 + checkpoint 恢复 + 失败证据增强）
+
+> 目标：把登录/提交流程的长链路失败从“偶发中断难复盘”压到“可阻断、可恢复、可定位”。
+
+- **版本先行同步**：`pyproject.toml`、`src/__init__.py`、静态资源版本参数和 UI 版本文案统一到 `0.5.10`
+- **登录态治理增强**：`BrowserEngine` 增加域名健康详情、认证失败信号（HTTP 401/403/407/419/440）与最近证据窗口；执行前会基于信号阻断高风险后续动作，避免“登录失效还硬跑”
+- **链路时序与重试可观测**：每个动作新增结构化执行轨迹（wait/action/assert 分段耗时、重试次数、失败原因），并写入结果 `artifacts`
+- **checkpoint 恢复细化**：恢复逻辑支持从上次最后成功 checkpoint 的下一步继续（即使未记录 `failed_step` 也可恢复），减少整条链路重跑
+- **失败证据增强**：失败归档新增当前动作指纹、最近网络失败/认证异常、控制台错误摘要，提升复盘与修复效率
+- **回归测试补齐**：新增浏览器硬化单测（认证信号阻断、执行轨迹写入、checkpoint 回退恢复）并通过
+
 ## [0.5.9] - 2026-04-25
 
 ### 🎯 学习闭环提纯（failure_code 修复模板 + 复用召回增强）

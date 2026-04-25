@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -495,3 +496,104 @@ async def test_browser_engine_custom_text_assertion():
     )
     assert ok2 is False
     assert "text_assert_failed" in reason2
+
+
+def test_web_automate_resume_falls_back_to_last_success_checkpoint():
+    from types import SimpleNamespace
+
+    from skills.web_automate.main import _resolve_resume_plan
+
+    session = SimpleNamespace(
+        last_run={
+            "owner": "conv-3",
+            "action_list": [
+                {"action": "open", "url": "https://fixture.local/login"},
+                {"action": "type", "selector": "#username", "text": "demo"},
+                {"action": "click", "selector": "#submit"},
+                {"action": "screenshot"},
+            ],
+            "failed_step": None,
+            "runtime": {
+                "checkpoints": [
+                    {"step_index": 0, "stage": "after", "success": True},
+                    {"step_index": 1, "stage": "after", "success": True},
+                    {"step_index": 2, "stage": "after", "success": False},
+                ]
+            },
+        }
+    )
+
+    actions, resume_from, resumed = _resolve_resume_plan(
+        origin="继续",
+        params={},
+        action_list=[{"action": "screenshot"}],
+        session=session,
+        owner="conv-3",
+    )
+
+    assert resumed is True
+    assert resume_from == 2
+    assert actions == session.last_run["action_list"][2:]
+
+
+@pytest.mark.asyncio
+async def test_browser_engine_blocks_on_recent_auth_failures():
+    from skills.web_automate.browser_engine import BrowserEngine
+
+    class _Page:
+        url = "https://fixture.local/orders"
+
+    engine = BrowserEngine("headless")
+    engine._page = _Page()
+    engine._recent_network_events.append(
+        {
+            "timestamp": time.time(),
+            "domain": "fixture.local",
+            "url": "https://fixture.local/api/orders",
+            "status": 401,
+            "kind": "response",
+        }
+    )
+
+    blocked, reason = await engine._should_block_for_login("read_page")
+
+    assert blocked is True
+    assert "认证失败" in reason
+
+
+@pytest.mark.asyncio
+async def test_browser_engine_reliable_execution_includes_trace():
+    from skills.web_automate.actions import ActionResult
+    from skills.web_automate.browser_engine import BrowserEngine
+
+    class _Page:
+        url = "https://fixture.local/report"
+
+        async def wait_for_selector(self, selector, timeout=1000, state="visible"):
+            return None
+
+        async def wait_for_load_state(self, state="domcontentloaded", timeout=1000):
+            return None
+
+        async def wait_for_timeout(self, ms):
+            return None
+
+    engine = BrowserEngine("headless")
+    engine._page = _Page()
+
+    async def _fake_action(act, action_type):
+        return ActionResult(success=True, message="ok", data={"text": "done"})
+
+    engine._do_action = _fake_action  # type: ignore[assignment]
+
+    result = await engine._execute_action_reliable(
+        0,
+        {"action": "read_page", "retries": 1, "timeout_ms": 2000},
+        "read_page",
+    )
+
+    assert result.success is True
+    trace = result.data.get("execution_trace", {})
+    assert trace.get("attempt_count") == 1
+    assert trace.get("retries") == 1
+    assert len(trace.get("attempts", [])) == 1

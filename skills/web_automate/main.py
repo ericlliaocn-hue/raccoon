@@ -218,6 +218,30 @@ def _clear_persisted_last_run(owner: str, output_dir: Path | None = None) -> Non
         path.unlink()
 
 
+def _infer_resume_step(last_run: dict[str, Any]) -> int | None:
+    failed_step = last_run.get("failed_step")
+    if isinstance(failed_step, int) and failed_step >= 0:
+        return failed_step
+
+    runtime = last_run.get("runtime") if isinstance(last_run.get("runtime"), dict) else {}
+    checkpoints = runtime.get("checkpoints") if isinstance(runtime, dict) else None
+    if not isinstance(checkpoints, list) or not checkpoints:
+        return None
+
+    last_success = -1
+    for checkpoint in checkpoints:
+        if not isinstance(checkpoint, dict):
+            continue
+        if checkpoint.get("stage") != "after":
+            continue
+        if checkpoint.get("success") is not True:
+            continue
+        step_index = checkpoint.get("step_index")
+        if isinstance(step_index, int):
+            last_success = max(last_success, step_index)
+    return (last_success + 1) if last_success >= 0 else None
+
+
 def _resolve_resume_plan(
     *,
     origin: str,
@@ -245,9 +269,9 @@ def _resolve_resume_plan(
     if str(last_run.get("owner") or "") != str(owner):
         return action_list, 0, False
 
-    failed_step = last_run.get("failed_step")
     prev_actions = last_run.get("action_list")
-    if not isinstance(failed_step, int) or failed_step < 0:
+    resume_step = _infer_resume_step(last_run)
+    if not isinstance(resume_step, int) or resume_step < 0:
         return action_list, 0, False
 
     should_resume = _is_resume_intent(origin)
@@ -256,9 +280,9 @@ def _resolve_resume_plan(
         return action_list, 0, False
 
     base_actions = prev_actions if isinstance(prev_actions, list) and prev_actions else action_list
-    if failed_step >= len(base_actions):
+    if resume_step >= len(base_actions):
         return action_list, 0, False
-    return base_actions[failed_step:], failed_step, True
+    return base_actions[resume_step:], resume_step, resume_step > 0
 
 
 def _build_result(
@@ -348,7 +372,11 @@ def _persist_failure_evidence(
         "failed_steps": failed_steps,
         "checkpoints": runtime_artifacts.get("checkpoints", []),
         "domain_health": runtime_artifacts.get("domain_health", {}),
+        "domain_health_detail": runtime_artifacts.get("domain_health_detail", {}),
         "artifacts": runtime_artifacts.get("artifacts", []),
+        "recent_network_signals": runtime_artifacts.get("recent_network_signals", []),
+        "recent_console_signals": runtime_artifacts.get("recent_console_signals", []),
+        "last_success_checkpoint": runtime_artifacts.get("last_success_checkpoint"),
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return str(path)

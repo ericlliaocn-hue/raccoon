@@ -11,11 +11,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import platform
 import subprocess
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -33,6 +35,12 @@ CDP_INCOGNITO_PROFILE_DIR = Path.home() / ".raccoon" / "chrome_incognito_profile
 
 # 截图输出目录
 OUTPUT_DIR = Path(__file__).parent.parent.parent / "output"
+
+_LOGIN_URL_TOKENS = ("/login", "signin", "passport", "auth", "oauth")
+_LOGIN_MESSAGE_TOKENS = ("登录", "signin", "expired", "unauthorized", "forbidden")
+_LOGIN_SUCCESS_TOKENS = ("登录成功", "sign in success", "signed in", "authenticated")
+_AUTH_FAILURE_STATUSES = {401, 403, 407, 419, 440}
+_INTERACTIVE_LOGIN_ACTIONS = {"open", "type", "click", "press_key"}
 
 
 def _detect_chrome_path() -> str:
@@ -164,6 +172,10 @@ class BrowserEngine:
         self._checkpoints: list[dict[str, Any]] = []
         self._artifacts: list[dict[str, Any]] = []
         self._domain_health: dict[str, str] = {}
+        self._domain_health_detail: dict[str, dict[str, Any]] = {}
+        self._recent_network_events: deque[dict[str, Any]] = deque(maxlen=200)
+        self._recent_console_events: deque[dict[str, Any]] = deque(maxlen=120)
+        self._bound_page_ids: set[int] = set()
 
     @property
     def actions(self) -> Actions:
@@ -226,6 +238,7 @@ class BrowserEngine:
             return f"❌ 未知模式：{self._mode}，支持 headless / headed / cdp / cdp_incognito"
 
         self._actions = Actions(self._page, OUTPUT_DIR)
+        self._bind_page_observers()
         return f"✅ 浏览器已启动（模式：{self._mode}）"
 
     async def stop(self) -> str:
@@ -278,6 +291,7 @@ class BrowserEngine:
             return False
         self._page = page
         self._actions = Actions(self._page, OUTPUT_DIR)
+        self._bind_page_observers()
         return True
 
     def _reuse_patterns(self, pattern: str) -> list[str]:
@@ -425,18 +439,175 @@ class BrowserEngine:
             self._context = await self._browser.new_context()
             self._page = await self._context.new_page()
 
-    def _current_domain(self) -> str:
-        if not self._page:
-            return ""
+    def _domain_from_url(self, value: str) -> str:
         try:
-            return urlparse(self._page.url).netloc.lower()
+            return urlparse(value).netloc.lower()
         except Exception:
             return ""
 
-    def _record_checkpoint(self, index: int, action_type: str, stage: str, result: ActionResult | None = None) -> dict[str, Any]:
+    def _current_domain(self) -> str:
+        if not self._page:
+            return ""
+        return self._domain_from_url(str(self._page.url or ""))
+
+    def _action_fingerprint(self, act: dict[str, Any]) -> str:
+        try:
+            payload = json.dumps(act, sort_keys=True, ensure_ascii=False)
+        except Exception:
+            payload = str(act)
+        return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
+
+    def _bind_page_observers(self) -> None:
+        if not self._page:
+            return
+        page_id = id(self._page)
+        if page_id in self._bound_page_ids:
+            return
+        on = getattr(self._page, "on", None)
+        if not callable(on):
+            return
+        try:
+            on("response", self._on_page_response)
+            on("requestfailed", self._on_page_request_failed)
+            on("console", self._on_page_console)
+            self._bound_page_ids.add(page_id)
+        except Exception:
+            logger.debug("page_observer_bind_failed", exc_info=True)
+
+    def _on_page_response(self, response) -> None:
+        try:
+            url = str(getattr(response, "url", "") or "")
+            status = int(getattr(response, "status", 0) or 0)
+        except Exception:
+            return
+        domain = self._domain_from_url(url)
+        entry = {
+            "timestamp": time.time(),
+            "domain": domain,
+            "url": url,
+            "status": status,
+            "kind": "response",
+        }
+        self._recent_network_events.append(entry)
+        if status in _AUTH_FAILURE_STATUSES and domain:
+            self._set_domain_health(
+                domain,
+                "invalid",
+                reason=f"auth_status_{status}",
+                bump_failures=True,
+            )
+
+    def _on_page_request_failed(self, request) -> None:
+        try:
+            url = str(getattr(request, "url", "") or "")
+            failure = getattr(request, "failure", None)
+            text = ""
+            if isinstance(failure, dict):
+                text = str(failure.get("errorText", "") or "")
+            elif failure is not None:
+                text = str(failure)
+        except Exception:
+            return
+        entry = {
+            "timestamp": time.time(),
+            "domain": self._domain_from_url(url),
+            "url": url,
+            "kind": "request_failed",
+            "error": text,
+        }
+        self._recent_network_events.append(entry)
+
+    def _on_page_console(self, message) -> None:
+        try:
+            msg_type = str(getattr(message, "type", "") or "").lower()
+            text = str(getattr(message, "text", "") or "")
+            location = getattr(message, "location", None) or {}
+            location_url = str(location.get("url", "") or "") if isinstance(location, dict) else ""
+        except Exception:
+            return
+        self._recent_console_events.append(
+            {
+                "timestamp": time.time(),
+                "type": msg_type,
+                "text": text[:800],
+                "url": location_url,
+                "domain": self._domain_from_url(location_url),
+            }
+        )
+
+    def _set_domain_health(
+        self,
+        domain: str,
+        state: str,
+        *,
+        reason: str,
+        bump_failures: bool = False,
+        reset_failures: bool = False,
+    ) -> None:
+        if not domain:
+            return
+        self._domain_health[domain] = state
+        detail = self._domain_health_detail.get(domain, {})
+        failure_count = int(detail.get("failure_count", 0) or 0)
+        if reset_failures:
+            failure_count = 0
+        elif bump_failures:
+            failure_count += 1
+        self._domain_health_detail[domain] = {
+            "state": state,
+            "reason": reason,
+            "failure_count": failure_count,
+            "updated_at": time.time(),
+        }
+
+    def _recent_auth_failures(self, domain: str, window_seconds: int = 240) -> list[dict[str, Any]]:
+        if not domain:
+            return []
+        now = time.time()
+        return [
+            item
+            for item in self._recent_network_events
+            if item.get("domain") == domain
+            and int(item.get("status") or 0) in _AUTH_FAILURE_STATUSES
+            and (now - float(item.get("timestamp") or 0)) <= window_seconds
+        ]
+
+    def _recent_network_for_domain(self, domain: str, limit: int = 12) -> list[dict[str, Any]]:
+        if not domain:
+            return []
+        rows = [item for item in self._recent_network_events if item.get("domain") == domain]
+        return rows[-limit:]
+
+    def _recent_console_errors(self, domain: str, limit: int = 8) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for item in reversed(self._recent_console_events):
+            msg_type = str(item.get("type") or "")
+            if msg_type not in {"error", "warning"}:
+                continue
+            item_domain = str(item.get("domain") or "")
+            if domain and item_domain and item_domain != domain:
+                continue
+            rows.append(item)
+            if len(rows) >= limit:
+                break
+        rows.reverse()
+        return rows
+
+    def _record_checkpoint(
+        self,
+        index: int,
+        action_type: str,
+        stage: str,
+        *,
+        act: dict[str, Any] | None = None,
+        result: ActionResult | None = None,
+    ) -> dict[str, Any]:
+        payload = act or {"action": action_type}
         checkpoint = {
             "step_index": index,
             "action": action_type,
+            "action_fingerprint": self._action_fingerprint(payload),
+            "checkpoint_key": str(payload.get("checkpoint_key") or ""),
             "stage": stage,
             "timestamp": time.time(),
             "url": self._page.url if self._page else "",
@@ -453,16 +624,42 @@ class BrowserEngine:
         if not domain:
             return
 
-        state = self._domain_health.get(domain, "valid")
         message = str(result.message or "").lower()
-        if any(tag in message for tag in ("登录", "signin", "expired", "unauthorized", "forbidden")):
-            self._domain_health[domain] = "invalid"
+        if any(tag in message for tag in _LOGIN_MESSAGE_TOKENS):
+            self._set_domain_health(domain, "invalid", reason="login_message_signal", bump_failures=True)
             return
-        if action_type in {"open", "type", "click", "press_key"} and result.success:
+        if not result.success:
+            self._set_domain_health(
+                domain,
+                "suspected_expired",
+                reason="action_failed",
+                bump_failures=True,
+            )
+            return
+
+        if action_type in _INTERACTIVE_LOGIN_ACTIONS:
+            state = self._domain_health.get(domain, "valid")
             if state in {"invalid", "suspected_expired"}:
-                self._domain_health[domain] = "suspected_expired"
+                self._set_domain_health(
+                    domain,
+                    "suspected_expired",
+                    reason="interactive_recovered",
+                )
             else:
-                self._domain_health[domain] = "valid"
+                self._set_domain_health(
+                    domain,
+                    "valid",
+                    reason="interactive_ok",
+                    reset_failures=True,
+                )
+
+        if any(token in message for token in _LOGIN_SUCCESS_TOKENS):
+            self._set_domain_health(
+                domain,
+                "valid",
+                reason="login_success_signal",
+                reset_failures=True,
+            )
 
     async def _wait_visible_and_stable(self, action_type: str, act: dict[str, Any], timeout_ms: int) -> None:
         if not self._page:
@@ -491,17 +688,64 @@ class BrowserEngine:
             return False, ""
         domain = self._current_domain()
         state = self._domain_health.get(domain, "valid")
-        if state == "invalid" and action_type not in {"open", "type", "click", "press_key"}:
+        if state == "invalid" and action_type not in _INTERACTIVE_LOGIN_ACTIONS:
             return True, "登录态失效，需先执行补登流程"
 
+        auth_failures = self._recent_auth_failures(domain)
+        if auth_failures and action_type not in _INTERACTIVE_LOGIN_ACTIONS:
+            latest = auth_failures[-1]
+            status = latest.get("status")
+            self._set_domain_health(
+                domain,
+                "invalid",
+                reason=f"recent_auth_status_{status}",
+                bump_failures=True,
+            )
+            return True, f"检测到近期认证失败（HTTP {status}），需先补登"
+
         url_lower = str(self._page.url or "").lower()
-        if any(token in url_lower for token in ("/login", "signin", "passport", "auth")):
-            if action_type not in {"open", "type", "click", "press_key"}:
-                self._domain_health[domain] = "suspected_expired"
+        if any(token in url_lower for token in _LOGIN_URL_TOKENS):
+            if action_type not in _INTERACTIVE_LOGIN_ACTIONS:
+                self._set_domain_health(
+                    domain,
+                    "suspected_expired",
+                    reason="login_url_signal",
+                )
                 return True, "当前页面在登录入口，建议先完成登录后再继续"
         return False, ""
 
-    async def _collect_failure_artifacts(self, index: int, action_type: str, reason: str) -> dict[str, Any]:
+    def _sanitize_action_payload(self, act: dict[str, Any]) -> dict[str, Any]:
+        safe: dict[str, Any] = {}
+        for key in (
+            "action",
+            "url",
+            "selector",
+            "checkpoint_key",
+            "expected_url_contains",
+            "expected_url_not_contains",
+            "assert_selector",
+            "assert_text_contains",
+            "timeout",
+            "timeout_ms",
+            "retries",
+        ):
+            if key in act:
+                safe[key] = act.get(key)
+        text = str(act.get("text", "") or "")
+        if text:
+            safe["text_preview"] = text[:120]
+            safe["text_length"] = len(text)
+        return safe
+
+    async def _collect_failure_artifacts(
+        self,
+        index: int,
+        action_type: str,
+        reason: str,
+        *,
+        act: dict[str, Any] | None = None,
+        attempt_trace: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         artifact: dict[str, Any] = {
             "step_index": index,
             "action": action_type,
@@ -509,6 +753,19 @@ class BrowserEngine:
             "url": self._page.url if self._page else "",
             "domain": self._current_domain(),
         }
+        if act:
+            artifact["action_fingerprint"] = self._action_fingerprint(act)
+            artifact["action_payload"] = self._sanitize_action_payload(act)
+        if attempt_trace:
+            artifact["attempt_trace"] = list(attempt_trace)
+
+        domain = str(artifact.get("domain") or "")
+        if domain:
+            artifact["domain_health_state"] = self._domain_health.get(domain, "valid")
+            artifact["domain_health_detail"] = self._domain_health_detail.get(domain, {})
+            artifact["recent_auth_failures"] = self._recent_auth_failures(domain)
+            artifact["recent_network"] = self._recent_network_for_domain(domain)
+            artifact["console_errors"] = self._recent_console_errors(domain)
         if not self._page:
             return artifact
 
@@ -546,51 +803,116 @@ class BrowserEngine:
         retries = max(0, int(act.get("retries", 2)))
         timeout_ms = max(500, int(act.get("timeout_ms", act.get("timeout", 12000))))
         last_reason = "action_failed"
+        attempt_trace: list[dict[str, Any]] = []
+        total_started = time.perf_counter()
 
         blocked, block_reason = await self._should_block_for_login(action_type)
         if blocked:
-            artifact = await self._collect_failure_artifacts(index, action_type, block_reason)
+            artifact = await self._collect_failure_artifacts(
+                index,
+                action_type,
+                block_reason,
+                act=act,
+                attempt_trace=attempt_trace,
+            )
             self._artifacts.append(artifact)
             return ActionResult(
                 success=False,
                 message=f"❌ {block_reason}",
-                data={"failure_code": "login_state_invalid", "artifacts": artifact},
+                data={
+                    "failure_code": "login_state_invalid",
+                    "artifacts": artifact,
+                    "execution_trace": {
+                        "attempt_count": 0,
+                        "retries": retries,
+                        "attempts": attempt_trace,
+                        "total_elapsed_ms": int((time.perf_counter() - total_started) * 1000),
+                    },
+                },
             )
 
         for attempt in range(retries + 1):
+            trace_item: dict[str, Any] = {
+                "attempt": attempt + 1,
+                "timings_ms": {},
+            }
+            wait_started = time.perf_counter()
             try:
                 await self._wait_visible_and_stable(action_type, act, timeout_ms)
+                trace_item["timings_ms"]["wait"] = int((time.perf_counter() - wait_started) * 1000)
             except Exception as e:
                 last_reason = f"wait_visible_or_stable_failed: {e}"
+                trace_item["timings_ms"]["wait"] = int((time.perf_counter() - wait_started) * 1000)
+                trace_item["failure_stage"] = "wait"
+                trace_item["failure_reason"] = last_reason
+                attempt_trace.append(trace_item)
                 if attempt >= retries:
                     break
                 await asyncio.sleep(0.25 * (attempt + 1))
                 continue
 
+            action_started = time.perf_counter()
             try:
                 result = await asyncio.wait_for(self._do_action(act, action_type), timeout=timeout_ms / 1000)
+                trace_item["timings_ms"]["action"] = int((time.perf_counter() - action_started) * 1000)
             except Exception as e:
                 last_reason = f"action_timeout_or_error: {e}"
+                trace_item["timings_ms"]["action"] = int((time.perf_counter() - action_started) * 1000)
+                trace_item["failure_stage"] = "action"
+                trace_item["failure_reason"] = last_reason
+                attempt_trace.append(trace_item)
                 if attempt >= retries:
                     break
                 await asyncio.sleep(0.25 * (attempt + 1))
                 continue
 
             self._update_domain_health(action_type, result)
+            assert_started = time.perf_counter()
             assert_ok, assert_reason = await self._assert_action_result(action_type, act, result)
+            trace_item["timings_ms"]["assert"] = int((time.perf_counter() - assert_started) * 1000)
+            trace_item["result_success"] = bool(result.success)
             if result.success and assert_ok:
+                trace_item["result"] = "success"
+                attempt_trace.append(trace_item)
+                trace_data = {
+                    "attempt_count": attempt + 1,
+                    "retries": retries,
+                    "attempts": attempt_trace,
+                    "total_elapsed_ms": int((time.perf_counter() - total_started) * 1000),
+                }
+                result_data = dict(result.data or {})
+                result_data["execution_trace"] = trace_data
+                result = ActionResult(success=result.success, message=result.message, data=result_data)
                 return result
 
             last_reason = assert_reason if result.success else result.message
+            trace_item["failure_stage"] = "assert" if result.success else "action_result"
+            trace_item["failure_reason"] = last_reason
+            attempt_trace.append(trace_item)
             if attempt < retries:
                 await asyncio.sleep(0.25 * (attempt + 1))
 
-        artifact = await self._collect_failure_artifacts(index, action_type, last_reason)
+        artifact = await self._collect_failure_artifacts(
+            index,
+            action_type,
+            last_reason,
+            act=act,
+            attempt_trace=attempt_trace,
+        )
         self._artifacts.append(artifact)
         return ActionResult(
             success=False,
             message=f"❌ {action_type} 失败（重试{retries}次后）: {last_reason}",
-            data={"failure_code": "browser_action_failed", "artifacts": artifact},
+            data={
+                "failure_code": "browser_action_failed",
+                "artifacts": artifact,
+                "execution_trace": {
+                    "attempt_count": len(attempt_trace),
+                    "retries": retries,
+                    "attempts": attempt_trace,
+                    "total_elapsed_ms": int((time.perf_counter() - total_started) * 1000),
+                },
+            },
         )
 
     async def _assert_action_result(
@@ -646,10 +968,19 @@ class BrowserEngine:
         return True, ""
 
     def get_runtime_artifacts(self) -> dict[str, Any]:
+        last_success_checkpoint = None
+        for checkpoint in reversed(self._checkpoints):
+            if checkpoint.get("stage") == "after" and checkpoint.get("success") is True:
+                last_success_checkpoint = checkpoint
+                break
         return {
             "checkpoints": list(self._checkpoints),
             "artifacts": list(self._artifacts),
             "domain_health": dict(self._domain_health),
+            "domain_health_detail": dict(self._domain_health_detail),
+            "recent_network_signals": list(self._recent_network_events)[-40:],
+            "recent_console_signals": list(self._recent_console_events)[-20:],
+            "last_success_checkpoint": last_success_checkpoint,
         }
 
     # ── 执行动作序列 ─────────────────────────────────
@@ -668,9 +999,15 @@ class BrowserEngine:
         for offset, act in enumerate(action_list):
             index = start_index + offset
             action_type = act.get("action", "")
-            self._record_checkpoint(index, action_type, "before")
+            self._record_checkpoint(index, action_type, "before", act=act)
             result = await self._execute_action_reliable(index, act, action_type)
-            checkpoint = self._record_checkpoint(index, action_type, "after", result)
+            checkpoint = self._record_checkpoint(
+                index,
+                action_type,
+                "after",
+                act=act,
+                result=result,
+            )
             results.append({
                 "action": action_type,
                 "success": result.success,
