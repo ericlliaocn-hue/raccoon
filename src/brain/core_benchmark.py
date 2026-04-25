@@ -46,17 +46,41 @@ def normalize_intent_phrase(text: str) -> str:
     synonyms = {
         "截屏": "截图",
         "截个图": "截图",
+        "屏幕截图": "截图",
         "看一下": "查看",
+        "看下": "查看",
         "瞅一下": "查看",
+        "查一下": "查看",
+        "查下": "查看",
         "获取": "抓取",
         "拿一下": "抓取",
+        "收集": "采集",
         "写个": "生成",
         "弄个": "生成",
         "监测": "监控",
         "跟踪": "监控",
+        "追踪": "监控",
+        "提醒一下": "提醒",
+        "提醒下": "提醒",
     }
     for src, target in synonyms.items():
         value = value.replace(src, target)
+    regex_synonyms = {
+        r"\bscreenshot\b": "截图",
+        r"\bscreen\s*shot\b": "截图",
+        r"\bsummary\b": "简报",
+        r"\bsummarize\b": "简报",
+        r"\bdigest\b": "简报",
+        r"\bmonitor(?:ing)?\b": "监控",
+        r"\btrack(?:ing)?\b": "监控",
+        r"\balert\b": "提醒",
+        r"\bnotify\b": "提醒",
+        r"\bcollect(?:ion)?\b": "采集",
+        r"\bcrawl(?:ing)?\b": "抓取",
+    }
+    for pattern, target in regex_synonyms.items():
+        value = re.sub(pattern, target, value)
+    value = re.sub(r"\s+", " ", value).strip()
     return value
 
 

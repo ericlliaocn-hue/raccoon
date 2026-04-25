@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.9] - 2026-04-25
+
+### 🎯 学习闭环提纯（failure_code 修复模板 + 复用召回增强）
+
+> 目标：在不引入长时压测成本的前提下，优先提升“先复用、再学习”的命中率与失败可修复性。
+
+- **版本先行同步**：`pyproject.toml`、`src/__init__.py`、静态资源版本参数和 UI 版本文案统一到 `0.5.9`
+- **复用召回增强**：`LearningEngine._search_experience()` 升级为多查询变体（用户域 + learning_engine 域）检索与候选打分；写经验时补充 alias key，提升相似请求命中
+- **复用安全闸门**：经验复用新增 `reuse_confidence` 下限与 `scenario_id` 一致性检查，降低“命中错经验”的误复用
+- **failure_code 定向修复增强**：保留细分 `execution_contract_*` 失败码（不再全部折叠），新增 `dependency_requires_approval` / `skill_runner_missing` / `vault_unavailable` 等模板化修复指引
+- **意图归一增强**：扩展中英文同义归一（summary/screenshot/monitor/notify 等），减少因表达差异导致的复用漏召回
+- **回归测试补充**：新增学习闭环召回与失败码细分测试，核心回归通过
+
 ## [0.5.8] - 2026-04-25
 
 ### 🛠️ 双向修复（平衡档契约）+ 真实外站压测固化

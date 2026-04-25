@@ -34,6 +34,42 @@ _FAILURE_GUIDANCE: dict[str, dict[str, str]] = {
         "hint": "质量门未达标。结果缺结构化字段、来源说明或新鲜度信息。",
         "action": "按场景质量规则补齐输出模板。",
     },
+    "execution_contract_price_target_missing": {
+        "hint": "价格监控执行证据缺失，未体现目标信息或监控创建信号。",
+        "action": "补齐 target/url/sku/snapshot_id，并在回复中明确“监控已创建/快照已创建”。",
+    },
+    "execution_contract_login_submit_missing": {
+        "hint": "登录链路缺少明确的登录/提交完成信号。",
+        "action": "增加登录/提交成功断言并输出结构化步骤结果。",
+    },
+    "execution_contract_checkpoint_missing": {
+        "hint": "长链路缺少 checkpoint 证据，失败不可恢复。",
+        "action": "每个关键步骤记录 checkpoint，失败时从最近检查点续跑。",
+    },
+    "execution_contract_trace_missing": {
+        "hint": "远程执行缺少可追踪证据（command/trace/task/exit）。",
+        "action": "返回结构化 artifacts，至少包含 command 和 trace/task_id/exit_code 之一。",
+    },
+    "execution_contract_schedule_missing": {
+        "hint": "提醒场景缺少调度创建信号，无法证明任务已落库。",
+        "action": "返回 schedule_created/cron/name，并在回复中显示创建结果。",
+    },
+    "playbook_skill_missing": {
+        "hint": "命中稳定编排但没有可执行 skill_name。",
+        "action": "修正 playbook 的场景→skill 映射，缺失时先澄清再执行。",
+    },
+    "skill_runner_missing": {
+        "hint": "技能元数据存在，但执行 Runner 未注册。",
+        "action": "检查 Skill 安装与 Vault 注册状态，恢复 runner 后再执行。",
+    },
+    "vault_unavailable": {
+        "hint": "Vault 不可用，学习链路无法进入执行态。",
+        "action": "先恢复 VaultManager，再重试学习执行。",
+    },
+    "dependency_requires_approval": {
+        "hint": "依赖安装需要审批，当前被策略阻断。",
+        "action": "先进入审批确认依赖清单，批准后再安装。",
+    },
     "compile_failed": {
         "hint": "代码编译失败。先清理 Markdown 围栏/无效文本，再做语法修复。",
         "action": "运行 compile 检查并修复语法错误。",

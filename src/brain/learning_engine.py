@@ -42,7 +42,7 @@ import structlog
 
 from src.brain.core_benchmark import detect_core_scenario_id, evaluate_quality, normalize_intent_phrase
 from src.brain.core_scenario_playbook import CoreScenarioPlaybook
-from src.brain.failure_guidance import failure_hint
+from src.brain.failure_guidance import failure_hint, guidance_for_failure
 from src.brain.scenario_contracts import (
     contract_for,
     evaluate_execution_contract,
@@ -162,7 +162,7 @@ class LearningEngine:
             if preflight:
                 return preflight
 
-            experience = await self._search_experience(user_message)
+            experience = await self._search_experience(user_message, user_id=task.user_id)
             if experience:
                 reused = await self._try_reuse_experience(task, user_message, run, experience)
                 if reused:
@@ -1789,6 +1789,23 @@ class LearningEngine:
         skill_name = str(experience.get("skill_name") or "")
         if not skill_name or not self._vault or not self._vault.get_skill_runner(skill_name):
             return None
+        reuse_confidence = float(experience.get("reuse_confidence") or 0.0)
+        if 0 < reuse_confidence < 0.45:
+            logger.info(
+                "experience_reuse_skipped_low_confidence",
+                skill=skill_name,
+                confidence=reuse_confidence,
+            )
+            return None
+        exp_scenario = str(experience.get("scenario_id") or "").strip()
+        if run.scenario_id and exp_scenario and run.scenario_id != exp_scenario:
+            logger.info(
+                "experience_reuse_skipped_scenario_mismatch",
+                skill=skill_name,
+                run_scenario=run.scenario_id,
+                experience_scenario=exp_scenario,
+            )
+            return None
 
         run.skill_name = skill_name
         run.handling_outcome = "reused"
@@ -1862,31 +1879,185 @@ class LearningEngine:
 
     # ─── 经验检索 ────────────────────────────────────────────────
 
-    async def _search_experience(self, message: str) -> dict | None:
-        """从 MemCore 检索相关经验"""
+    async def _search_experience(self, message: str, user_id: str | None = None) -> dict | None:
+        """从 MemCore 检索相关经验（多查询变体 + 语义打分）。"""
         if not self._memcore_writer:
             return None
         normalized = normalize_intent_phrase(message)
+        variants = self._experience_query_variants(normalized or message)
+        if not variants:
+            return None
+        scenario_hint = detect_core_scenario_id(message)
+        query_tokens = self._extract_experience_tokens(normalized or message)
+        if scenario_hint:
+            query_tokens.append(scenario_hint)
+        query_tokens = list(dict.fromkeys(token for token in query_tokens if token))
+
         reader: MemCoreReader | None = None
         try:
             reader = MemCoreReader(self._config)
             await reader.init()
-            results = await reader.search("learning_engine", normalized or message)
-            if results:
-                top = results[0]
-                payload = top.value
-                if isinstance(payload, str):
-                    try:
-                        payload = json.loads(payload)
-                    except json.JSONDecodeError:
-                        payload = {"raw": top.value}
-                return {"key": top.key, "value": top.value, **(payload if isinstance(payload, dict) else {})}
+
+            candidate_map: dict[str, dict[str, Any]] = {}
+            for scope in self._experience_user_scopes(user_id):
+                for query in variants:
+                    results = await reader.search(scope, query)
+                    for entry in results[:12]:
+                        payload = self._decode_experience_payload(entry.value)
+                        score = self._score_experience_candidate(
+                            entry=entry,
+                            payload=payload,
+                            query_tokens=query_tokens,
+                            scenario_hint=scenario_hint,
+                        )
+                        existing = candidate_map.get(entry.memory_id)
+                        if not existing or score > float(existing.get("score", 0.0)):
+                            candidate_map[entry.memory_id] = {
+                                "entry": entry,
+                                "payload": payload,
+                                "score": score,
+                            }
+
+            if not candidate_map:
+                return None
+
+            ranked = sorted(
+                candidate_map.values(),
+                key=lambda item: (
+                    float(item.get("score", 0.0)),
+                    float(getattr(item.get("entry"), "confidence", 0.0)),
+                    int(getattr(item.get("entry"), "access_count", 0)),
+                ),
+                reverse=True,
+            )
+            top = ranked[0]
+            confidence = float(top.get("score", 0.0))
+            if confidence < 0.45:
+                logger.info(
+                    "experience_candidate_rejected",
+                    confidence=round(confidence, 3),
+                    key=getattr(top.get("entry"), "key", ""),
+                )
+                return None
+
+            entry: MemoryEntry = top["entry"]
+            payload = top.get("payload") if isinstance(top.get("payload"), dict) else {}
+            return {
+                "key": entry.key,
+                "value": entry.value,
+                "reuse_confidence": round(confidence, 3),
+                **payload,
+            }
         except Exception as e:
             logger.warning("experience_search_failed", error=str(e))
         finally:
             if reader is not None:
                 await reader.close()
         return None
+
+    def _experience_user_scopes(self, user_id: str | None) -> list[str]:
+        scopes: list[str] = []
+        uid = str(user_id or "").strip()
+        if uid and uid != "learning_engine":
+            scopes.append(uid)
+        scopes.append("learning_engine")
+        return list(dict.fromkeys(scopes))
+
+    def _experience_query_variants(self, text: str) -> list[str]:
+        normalized = normalize_intent_phrase(text)
+        variants: list[str] = []
+
+        def _add(value: str) -> None:
+            item = str(value or "").strip()
+            if item and item not in variants:
+                variants.append(item)
+
+        _add(normalized or text)
+        scenario = detect_core_scenario_id(normalized or text)
+        if scenario:
+            _add(scenario)
+        for token in self._extract_experience_tokens(normalized or text):
+            _add(token)
+
+        tokens = self._extract_experience_tokens(normalized or text)
+        if len(tokens) >= 2:
+            _add(f"{tokens[0]} {tokens[1]}")
+        return variants[:12]
+
+    def _extract_experience_tokens(self, text: str) -> list[str]:
+        normalized = normalize_intent_phrase(text)
+        if not normalized:
+            return []
+        stopwords = {
+            "帮我",
+            "一下",
+            "现在",
+            "这个",
+            "那个",
+            "今天",
+            "请",
+            "可以",
+            "然后",
+            "继续",
+            "进行",
+            "需要",
+            "我要",
+        }
+        raw = re.findall(r"[a-z0-9_]{3,}|[\u4e00-\u9fff]{2,}", normalized)
+        tokens: list[str] = []
+        for item in raw:
+            if item in stopwords:
+                continue
+            if item not in tokens:
+                tokens.append(item)
+        return tokens[:10]
+
+    @staticmethod
+    def _decode_experience_payload(value: Any) -> dict[str, Any]:
+        payload: Any = value
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except json.JSONDecodeError:
+                return {"raw": value}
+        if isinstance(payload, dict):
+            return payload
+        return {"raw": value}
+
+    def _score_experience_candidate(
+        self,
+        *,
+        entry: MemoryEntry,
+        payload: dict[str, Any],
+        query_tokens: list[str],
+        scenario_hint: str | None,
+    ) -> float:
+        haystack_parts = [
+            str(entry.key or ""),
+            str(payload.get("request_text") or ""),
+            str(payload.get("skill_name") or ""),
+            " ".join(str(item) for item in (payload.get("trigger_words") or []) if item),
+            str(entry.value or ""),
+        ]
+        haystack = normalize_intent_phrase(" ".join(part for part in haystack_parts if part))
+        overlap = sum(1 for token in query_tokens if token and token in haystack)
+        overlap_ratio = overlap / max(len(query_tokens), 1)
+
+        score = 0.20
+        score += max(0.0, min(float(entry.confidence), 1.0)) * 0.25
+        score += min(max(int(entry.access_count), 0), 20) * 0.01
+        score += overlap_ratio * 0.45
+
+        payload_scenario = str(payload.get("scenario_id") or "").strip()
+        if scenario_hint and payload_scenario:
+            if payload_scenario == scenario_hint:
+                score += 0.18
+            else:
+                score -= 0.12
+        if payload.get("skill_name"):
+            score += 0.05
+
+        return max(0.0, min(score, 1.0))
 
     # ─── LLM 需求分析 ────────────────────────────────────────────
 
@@ -3039,9 +3210,43 @@ Skill 名称：{skill_name}
                     source="learning_engine",
                 )
             )
+            for alias in self._experience_alias_keys(skill_name, normalized_key, value):
+                await self._memcore_writer.write(
+                    MemoryEntry(
+                        user_id="learning_engine",
+                        key=f"learned:{skill_name}:{alias}",
+                        value=value,
+                        confidence=0.72,
+                        source="learning_engine",
+                    )
+                )
             logger.info("experience_written", skill=skill_name)
         except Exception as e:
             logger.warning("experience_write_failed", error=str(e))
+
+    def _experience_alias_keys(self, skill_name: str, normalized_key: str, value: str) -> list[str]:
+        aliases: list[str] = []
+        payload = self._decode_experience_payload(value)
+        scenario_id = str(payload.get("scenario_id") or "").strip()
+        if scenario_id:
+            aliases.append(f"scenario:{scenario_id}")
+        aliases.append(normalize_intent_phrase(skill_name))
+        trigger_words = payload.get("trigger_words")
+        if isinstance(trigger_words, list):
+            for item in trigger_words[:4]:
+                normalized = normalize_intent_phrase(str(item))
+                if normalized:
+                    aliases.append(normalized)
+        for token in self._extract_experience_tokens(normalized_key)[:3]:
+            aliases.append(token)
+        deduped = []
+        for alias in aliases:
+            alias_value = str(alias or "").strip()
+            if not alias_value or alias_value == normalized_key:
+                continue
+            if alias_value not in deduped:
+                deduped.append(alias_value)
+        return deduped[:6]
 
     # ─── Schedule 创建 ──────────────────────────────────────────
 
@@ -3146,12 +3351,23 @@ cron 示例：
         msg = str(error or "").lower()
         if not msg:
             return "unknown_error"
+        contract_match = re.search(r"execution_contract_[a-z_]+", msg)
+        if contract_match:
+            return contract_match.group(0)
         if "quality_gate_failed" in msg:
             return "quality_gate_failed"
         if "metadata_invalid" in msg:
             return "metadata_invalid"
         if "compile_failed" in msg or "syntaxerror" in msg:
             return "compile_failed"
+        if "playbook_skill_missing" in msg:
+            return "playbook_skill_missing"
+        if "skill_runner_missing" in msg:
+            return "skill_runner_missing"
+        if "vault_unavailable" in msg:
+            return "vault_unavailable"
+        if "dependency_install_requires_post_approval" in msg:
+            return "dependency_requires_approval"
         if "missing_schedule_target" in msg:
             return "missing_schedule_target"
         if "missing_form_context" in msg or "missing_form_target" in msg:
@@ -3175,7 +3391,12 @@ cron 示例：
         return "unknown_error"
 
     def _repair_hint_for_failure(self, failure_code: str | None) -> str:
-        return f"修复方向：{failure_hint(failure_code)}"
+        guidance = guidance_for_failure(failure_code)
+        hint = str(guidance.get("hint") or failure_hint(failure_code))
+        action = str(guidance.get("action") or "").strip()
+        if action:
+            return f"修复方向：{hint} 操作建议：{action}"
+        return f"修复方向：{hint}"
 
     def _repair_template_for_failure(self, failure_code: str | None) -> str:
         code = str(failure_code or "unknown_error")
@@ -3184,8 +3405,17 @@ cron 示例：
             "auth_failed": "- 不要硬猜签名参数\n- 优先切到公开接口或可复用已有 Skill\n- 需要登录态时输出清晰追问而不是返回空壳数据",
             "data_hollow": "- 检测空壳默认值并主动失败\n- 增加字段完整性检查，缺关键字段直接报错\n- 回复中包含数据来源或采集时间",
             "dependency_missing": "- 仅声明真实依赖（# requires）\n- 对缺依赖路径加降级逻辑\n- 不要在运行时静默安装依赖",
+            "dependency_requires_approval": "- 不要尝试静默安装依赖\n- 先输出依赖清单并进入审批\n- 依赖安装失败时必须回滚并保留 staging 证据",
             "timeout": "- 拆分动作，单步超时可控\n- 网络请求增加重试上限和退避\n- 浏览器链路增加 checkpoint 与可恢复点",
             "execution_contract_failed": "- 补齐场景契约输出：price 需目标信息，login 需 checkpoint，remote 需 trace，schedule 需创建信号",
+            "execution_contract_price_target_missing": "- 输出监控目标证据（target/url/sku/snapshot_id）\n- subcmd 必须为 snapshot/check/check_all 之一\n- 回复中显式包含“监控已创建”或“快照已创建”",
+            "execution_contract_login_submit_missing": "- 登录链路必须包含“登录成功/提交成功”之一\n- 对提交流程增加成功断言（URL/selector/text）\n- 不满足时返回明确失败而不是模糊成功",
+            "execution_contract_checkpoint_missing": "- 执行产物必须带 checkpoints 或回复包含 checkpoint/resume 信号\n- 长链路每个关键动作后保存可恢复点\n- 失败后优先从最近 checkpoint 恢复",
+            "execution_contract_trace_missing": "- 远程执行必须带 command + (trace/task_id/exit_code)\n- 回复中保留 trace/run_id 便于审计\n- 缺少结构化证据时直接判失败",
+            "execution_contract_schedule_missing": "- 调度场景必须返回 schedule_created 或 cron 创建信号\n- 回复中显示任务名和 cron\n- 创建失败时返回可重试原因",
+            "playbook_skill_missing": "- Playbook 命中后必须给出可执行 skill_name\n- 命中规则与技能映射保持一致\n- 缺映射时回退到澄清，不要直接失败",
+            "skill_runner_missing": "- 校验 Skill 是否已注册且 Runner 可用\n- 执行前先做 runner 预检查\n- 缺失时提示可恢复动作（重载 vault/安装 skill）",
+            "vault_unavailable": "- VaultManager 不可用时禁止执行路径\n- 先恢复 vault，再进入执行\n- 输出降级路径（澄清或延期）",
         }
         return templates.get(code, "- 保持协议输出稳定\n- 优先保证可执行，再做优化")
 
