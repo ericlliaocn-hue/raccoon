@@ -144,6 +144,11 @@ raccoon status
 # 诊断检查
 raccoon doctor
 
+# 飞书接入初始化/检查
+raccoon feishu init --mode websocket --app-id cli_xxx --app-secret xxx
+raccoon feishu init --mode callback --callback-base https://bot.example.com
+raccoon feishu check
+
 # 核心场景基准（发布门禁）
 raccoon benchmark core
 raccoon benchmark core --json
@@ -162,6 +167,7 @@ raccoon logs --audit    # 审计日志
 
 - 路线图：`docs/roadmap.md`（`0.5.3 -> 0.5.8` 周更）
 - `0.6.0` 通道标准化计划：`docs/roadmap-0.6.0.md`
+- 飞书快速接入：`docs/integrations/feishu-quickstart.md`
 - 分段压测指南（可关机续跑）：`docs/soak-mobile-runbook.md`
 - 分段压测脚本：`scripts/soak_segment.sh`
 - 核心场景离线样本包：`benchmarks/core/offline_sample_pack.json`
@@ -199,6 +205,47 @@ raccoon skills info <skill-name>
 # 卸载 Skill
 raccoon skills uninstall <skill-name>
 ```
+
+### 飞书快速接入（0.6.0）
+
+目标：安装后让用户自己选择通道模式，不改代码只改配置。
+
+1. 选择模式并初始化（自动写入 `config.json`）：
+
+```bash
+# 方案 A：WebSocket（本机开发推荐，不需要公网回调）
+raccoon feishu init \
+  --mode websocket \
+  --app-id cli_xxx \
+  --app-secret xxx \
+  --domain feishu \
+  --webhook https://open.feishu.cn/open-apis/bot/v2/hook/xxx
+
+# 方案 B：Callback（保留备选，需要公网可达地址）
+raccoon feishu init \
+  --mode callback \
+  --callback-base https://bot.example.com \
+  --webhook https://open.feishu.cn/open-apis/bot/v2/hook/xxx \
+  --webhook-secret sec_xxx
+```
+
+2. 在飞书开放平台配置事件订阅：
+   - websocket 模式：选择长连接（WebSocket）
+   - callback 模式：回调 URL 为 `https://bot.example.com/channels/feishu/events`，Token 用 `feishu_verification_token`
+   - 事件类型：至少开启 `im.message.receive_v1`
+
+3. 启动服务并检查：
+
+```bash
+raccoon --http
+raccoon feishu check
+```
+
+说明：
+- 默认群聊要求 `@机器人` 才触发（可在初始化时加 `--no-mention-gate` 关闭）
+- 支持 `chat_id/user_id` allowlist（`--allow-chat-id` / `--allow-user-id`）
+- 默认优先按 `chat_id` 动态回原会话（`feishu_reply_via_api=true`），失败再走 webhook 兜底
+- callback 模式默认异步处理（`feishu_async_process=true`），避免飞书重试风暴
 
 ## 内置 Skill
 

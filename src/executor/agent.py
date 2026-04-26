@@ -292,6 +292,25 @@ class Executor:
         for key in ("schedule_id", "run_id", "schedule_name", "cron", "is_retry"):
             if key in event.payload and key not in context:
                 context[key] = event.payload[key]
+
+        # 多通道上下文（如飞书 chat_id）透传到任务，便于 TASK_COMPLETED 后做渠道回传。
+        source = str(event.payload.get("source") or "").strip().lower()
+        channel_event = event.payload.get("channel_event")
+        if source and "channel_source" not in context:
+            context["channel_source"] = source
+        if isinstance(channel_event, dict):
+            chat_id = str(channel_event.get("chat_id") or "").strip()
+            account_id = str(channel_event.get("account_id") or "").strip()
+            sender_id = str(channel_event.get("sender_id") or "").strip()
+            message_id = str(channel_event.get("message_id") or "").strip()
+            if chat_id and "channel_chat_id" not in context:
+                context["channel_chat_id"] = chat_id
+            if account_id and "channel_account_id" not in context:
+                context["channel_account_id"] = account_id
+            if sender_id and "channel_sender_id" not in context:
+                context["channel_sender_id"] = sender_id
+            if message_id and "channel_message_id" not in context:
+                context["channel_message_id"] = message_id
         return run_params, context
 
     async def _review_or_schedule_task(

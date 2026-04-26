@@ -55,6 +55,22 @@ class RaccoonConfig(BaseSettings):
     # ─── Gateway ───
     gateway_token: str = ""  # 入站网关认证 Token，为空则不启用
 
+    # ─── Feishu Channel ───
+    feishu_enabled: bool = False
+    feishu_mode: str = "callback"  # callback / websocket（用户可选）
+    feishu_verification_token: str = ""  # 事件订阅 token（URL 验证 + 事件 token 校验）
+    feishu_encrypt_key: str = ""  # 预留：加密回调解密密钥
+    feishu_app_id: str = ""  # websocket 模式必填（或用于会话映射与追踪）
+    feishu_app_secret: str = ""  # websocket 模式必填
+    feishu_domain: str = "feishu"  # feishu / lark / 自定义域名（https://...）
+    feishu_ws_auto_reconnect: bool = True
+    feishu_mention_required_in_group: bool = True
+    feishu_allow_chat_ids: list[str] = Field(default_factory=list)
+    feishu_allow_user_ids: list[str] = Field(default_factory=list)
+    feishu_reply_via_api: bool = True  # 优先按 chat_id 动态回发到原会话
+    feishu_reply_via_webhook: bool = True  # 动态回发失败时，是否允许 webhook 兜底
+    feishu_async_process: bool = True  # 飞书回调是否异步处理（推荐开启，避免平台超时重试）
+
     # ─── Workflow ───
     workflows_dir: Path = Field(default=PROJECT_ROOT / "workflows")
 

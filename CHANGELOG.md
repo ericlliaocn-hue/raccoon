@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1] - 2026-04-26
+
+### 🔧 飞书通道补全 + 调度竞态修复 + SSE/前端稳定性
+
+> 目标：补齐飞书通道落地细节（API 回发 + WS 长连接生命周期），修复调度器竞态条件，增强前端 SSE 与调度面板健壮性。
+
+- **版本先行同步**：`pyproject.toml`、`src/__init__.py` 统一到 `0.6.1`
+- **飞书 API 动态回发**：新增 `FeishuApiClient`，支持按 `chat_id` 回发文本消息到原会话；回发失败自动走 webhook 兜底
+- **飞书 WS 长连接生命周期**：`FeishuWebSocketBridge` 接入 FastAPI lifespan，启动/关闭自动管理；断线自动重连
+- **飞书回调路由完整接入**：新增 `/channels/feishu/events` 端点，支持 URL 验证、消息事件归一化、群聊 @ 门控、allowlist 与异步处理
+- **飞书回调鉴权豁免**：`/channels/feishu/` 路径不要求 HTTP Auth Token，避免飞书平台回调被拦截
+- **多通道上下文透传**：`Executor` 将 `channel_source`/`channel_chat_id`/`channel_sender_id`/`channel_message_id` 写入 Task.context，便于 TASK_COMPLETED 后按渠道回传
+- **飞书任务结果回传**：新增 `on_task_finished_reply_to_feishu` 事件监听，任务完成/失败后自动通过飞书 API 或 webhook 回传结果
+- **调度器竞态修复**：触发前重新读取最新 entry 防止使用过期快照；获取锁后二次确认避免"删后回写"；重试时使用最新 entry 避免竞态
+- **SSE 断线重连防抖**：前端 SSE 重连改为防抖模式，避免抖动时堆积重连定时器；页面关闭前主动清理
+- **调度面板增强**：创建调度按钮防重复点击；加载失败时显示错误提示而非静默；调度卡片显示 schedule_id 前缀
+- **新增文件**：`src/channels/adapters/feishu.py`、`src/channels/adapters/feishu_api_client.py`、`src/channels/adapters/feishu_ws_client.py`、`docs/integrations/feishu-quickstart.md`
+- **新增测试**：`test_feishu_adapter.py`、`test_feishu_api_client.py`、`test_feishu_ws_client.py`、`test_auth_routes.py`
+
 ## [0.6.0] - 2026-04-26
 
 ### 🚀 通道标准化与长任务交付（第一批落地）
@@ -13,6 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **版本先行同步**：`pyproject.toml`、`src/__init__.py`、静态资源版本参数与 UI 文案统一到 `0.6.0`
 - **`Channel Contract v1` 基础模型**：新增统一入站/出站消息信封、附件模型与通道能力声明，作为后续 Feishu/Telegram/Slack 适配器共同契约
+- **飞书回调适配层**：新增 `parse_feishu_callback` 与 `/channels/feishu/events`，支持 URL 验证、消息事件归一化、群聊 @ 门控、allowlist 与异步处理
+- **飞书 WS 双模式接入**：新增 `feishu_mode=callback|websocket` 可选模式；websocket 通过官方 `lark-oapi` 长连接接收事件（无需公网回调），callback 保留为备选
+- **飞书动态回发**：新增 Feishu OpenAPI 回发客户端，默认优先按 `chat_id` 回原会话；当 API 回发失败时自动走 webhook 兜底
+- **飞书接入助手命令**：新增 `raccoon feishu init/check`，一键初始化 `config.json` 并输出回调配置要点
 - **长任务 `Job` 基础框架**：新增后台任务状态模型与管理器（`queued/running/waiting/uploading/delivered/failed/cancelled`），支持创建、进度更新、完成/失败/取消
 - **Job 持久化存储**：新增 `JobStore`（SQLite），`jobs` 与 `job_artifacts` 全量落库，重启后任务与交付产物可恢复
 - **交付重试协调器**：新增 `JobDeliveryCoordinator`，支持 `pending/retry/sent/dlq` 生命周期、指数退避重试与 DLQ 收敛
@@ -20,7 +43,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **事件可观测性增强**：新增 `JOB_CREATED/JOB_PROGRESS/JOB_COMPLETED/JOB_FAILED/JOB_CANCELLED` 事件，统一进入 EventBus/SSE 观测链路
 - **通道安全默认收口**：`/jobs` 纳入受保护 API，遵循现有 token 认证策略
 - **`0.6.0` 计划文档落盘**：新增 `docs/roadmap-0.6.0.md`，固定里程碑、门禁指标与风险回滚策略
-- **回归验证**：`python3.11 -m compileall`、`ruff check`、`pytest -m "not integration"` 均通过（491 passed）
+- **接入文档补齐**：新增 `docs/integrations/feishu-quickstart.md`
+- **回归验证**：`python3.11 -m compileall`、`ruff check`、`pytest -m "not integration"` 均通过（508 passed）
 
 ## [0.5.11] - 2026-04-25
 

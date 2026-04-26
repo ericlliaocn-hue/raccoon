@@ -34,6 +34,7 @@ let convId = null, sending = false, paused = false;
 let currentAbortController = null;  // 用于中断流式请求
 const history = [];
 let autoSaveTimer = null;
+let creatingSchedule = false;
 
 // ─── DOM ───────────────────────────────────────────────
 const $ = id => document.getElementById(id);
@@ -57,19 +58,52 @@ document.addEventListener('DOMContentLoaded', () => {
 
 // ─── SSE ───────────────────────────────────────────────
 let sseConnection = null;
+let sseReconnectTimer = null;
 
 function setupSSE() {
   connectSSE();
+  window.addEventListener('beforeunload', () => {
+    if (sseReconnectTimer) {
+      clearTimeout(sseReconnectTimer);
+      sseReconnectTimer = null;
+    }
+    if (sseConnection) {
+      sseConnection.close();
+      sseConnection = null;
+    }
+  });
+}
+
+function scheduleSSEReconnect(delayMs = 3000) {
+  if (sseReconnectTimer) return;
+  sseReconnectTimer = setTimeout(() => {
+    sseReconnectTimer = null;
+    connectSSE();
+  }, delayMs);
 }
 
 function connectSSE() {
+  if (sseReconnectTimer) {
+    clearTimeout(sseReconnectTimer);
+    sseReconnectTimer = null;
+  }
   if (sseConnection) { sseConnection.close(); sseConnection = null; }
   const url = convId ? `/events?conversation_id=${encodeURIComponent(convId)}` : '/events';
   sseConnection = new EventSource(authUrl(url));
   sseConnection.onmessage = e => { try { handleSSE(JSON.parse(e.data)); } catch {} };
+  sseConnection.onopen = () => {
+    if (sseReconnectTimer) {
+      clearTimeout(sseReconnectTimer);
+      sseReconnectTimer = null;
+    }
+  };
   sseConnection.onerror = () => {
-    // 断线重连
-    setTimeout(connectSSE, 3000);
+    // 断线重连（防抖，避免抖动时堆积重连定时器）
+    if (sseConnection) {
+      sseConnection.close();
+      sseConnection = null;
+    }
+    scheduleSSEReconnect(3000);
   };
 }
 
@@ -896,7 +930,11 @@ async function loadLLM() {
 
 async function loadSchedules() {
   try {
-    const res = await fetch('/schedules'), schedules = await res.json();
+    const res = await fetch('/schedules');
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+    const schedules = await res.json();
     const list = $('schedules-list'), empty = $('schedules-empty');
     if (!schedules || !schedules.length) { if (empty) empty.style.display = ''; list.innerHTML = ''; return; }
     if (empty) empty.style.display = 'none';
@@ -909,6 +947,8 @@ async function loadSchedules() {
         <div class="sched-cron">${escHtml(s.cron)}</div>
         <div class="sched-msg">${escHtml(s.message)}</div>
         <div class="sched-meta">
+          #${escHtml((s.schedule_id || '').slice(0, 8))}
+          ·
           ${s.last_run ? `上次: ${s.last_run.replace('T', ' ').substring(0, 16)}` : '未运行'}
           ${s.next_run ? ` · 下次: ${s.next_run.replace('T', ' ').substring(0, 16)}` : ''}
         </div>
@@ -918,7 +958,15 @@ async function loadSchedules() {
         </div>
       </div>
     `).join('');
-  } catch {}
+  } catch (e) {
+    const list = $('schedules-list'), empty = $('schedules-empty');
+    if (list) list.innerHTML = '';
+    if (empty) {
+      empty.style.display = '';
+      empty.innerHTML = '<div class="empty-icon">⚠️</div><div>定时任务加载失败</div>';
+    }
+    addMsg('system', '⚠️ 定时任务加载失败: ' + (e?.message || '未知错误'));
+  }
 }
 
 function toggleSchedForm() {
@@ -946,10 +994,12 @@ function toggleSchedForm() {
 }
 
 async function createSchedule() {
+  if (creatingSchedule) return;
   const name = $('sched-name')?.value?.trim();
   const cron = $('sched-cron')?.value?.trim();
   const message = $('sched-msg')?.value?.trim();
   if (!name || !cron || !message) { addMsg('system', '⚠️ 请填写所有字段'); return; }
+  creatingSchedule = true;
   try {
     const res = await fetch('/schedules', {
       method: 'POST',
@@ -966,22 +1016,54 @@ async function createSchedule() {
     loadSchedules();
   } catch (e) {
     addMsg('system', '⚠️ 创建失败: ' + e.message);
+  } finally {
+    creatingSchedule = false;
   }
 }
 
 async function toggleSchedule(id) {
   try {
-    await fetch(`/schedules/${id}/toggle`, { method: 'POST' });
+    const res = await fetch(`/schedules/${id}/toggle`, { method: 'POST' });
+    if (!res.ok) {
+      let msg = `HTTP ${res.status}`;
+      try {
+        const data = await res.json();
+        msg = data?.detail || msg;
+      } catch {}
+      throw new Error(msg);
+    }
     loadSchedules();
-  } catch {}
+  } catch (e) {
+    addMsg('system', `⚠️ 切换失败: ${e.message || '未知错误'}`);
+  }
 }
 
 async function deleteSchedule(id) {
   if (!confirm('确定删除此定时任务？')) return;
   try {
-    await fetch(`/schedules/${id}`, { method: 'DELETE' });
+    const res = await fetch(`/schedules/${id}`, { method: 'DELETE' });
+    let data = null;
+    try { data = await res.json(); } catch {}
+    if (!res.ok) {
+      const detail = data?.detail || `HTTP ${res.status}`;
+      throw new Error(detail);
+    }
+
+    // 二次校验：确认该 id 不再存在，避免“看起来删了、实际还在”的错觉。
+    const verifyRes = await fetch('/schedules');
+    if (verifyRes.ok) {
+      const schedules = await verifyRes.json();
+      const stillExists = (schedules || []).some(s => s.schedule_id === id);
+      if (stillExists) {
+        throw new Error('删除请求已返回成功，但任务仍存在，请重试');
+      }
+    }
+
+    addMsg('system', `✅ 已删除定时任务 #${id.slice(0, 8)}`);
     loadSchedules();
-  } catch {}
+  } catch (e) {
+    addMsg('system', `⚠️ 删除失败: ${e.message || '未知错误'}`);
+  }
 }
 
 // ═════════════════════════════════════════════════════════

@@ -33,6 +33,7 @@ from pydantic import BaseModel as APIModel, Field as APIField
 from src import __version__
 from src.brain.core_benchmark import build_core_scenario_report
 from src.adapters.auth import is_protected_http_endpoint, request_has_auth_token
+from src.channels.adapters import FeishuApiClient, FeishuParseResult, FeishuWebSocketBridge, parse_feishu_callback
 from src.config import load_config, RaccoonConfig, LLM_PRESETS
 from src.conversation_store import ConversationStore
 from src.memcore.writer import MemCoreWriter
@@ -268,10 +269,18 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
 
     # 文件管理器（共享给 Executor 和 HTTP 端点）
     file_manager = FileManager()
+    feishu_ws_bridge: FeishuWebSocketBridge | None = None
+    feishu_api_client: FeishuApiClient | None = None
+    if config.feishu_app_id and config.feishu_app_secret:
+        feishu_api_client = FeishuApiClient(
+            app_id=config.feishu_app_id,
+            app_secret=config.feishu_app_secret,
+            domain=config.feishu_domain,
+        )
 
     # EventBus handler: 将事件推送到 SSE 队列（按 conversation_id 过滤）
     async def on_any_event(event: Event) -> None:
-        for q, conv_ids in sse_subscribers:
+        for q, conv_ids in tuple(sse_subscribers):
             # conv_ids 为 None 表示关注所有事件
             if conv_ids is None or event.conversation_id in conv_ids:
                 try:
@@ -283,11 +292,25 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        nonlocal feishu_ws_bridge
         await memcore_writer.init()
         await event_bus.start()
         await scheduler.start()
         await approval_engine.start()
         await job_delivery_coordinator.start()
+        if config.feishu_enabled and config.feishu_mode == "websocket":
+            async def _on_feishu_ws_event(parsed: FeishuParseResult) -> None:
+                try:
+                    await _process_feishu_event(parsed, transport="websocket")
+                except Exception as e:
+                    logger.error("feishu_ws_event_process_failed", error=str(e))
+
+            feishu_ws_bridge = FeishuWebSocketBridge(
+                config=config,
+                on_parsed_event=_on_feishu_ws_event,
+            )
+            await feishu_ws_bridge.start()
+            app.state.feishu_ws_bridge = feishu_ws_bridge
         try:
             from skills.web_automate.session_manager import get_session_manager
             await get_session_manager().start_cleanup_loop()
@@ -298,6 +321,11 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
         try:
             yield
         finally:
+            if feishu_ws_bridge:
+                await feishu_ws_bridge.stop()
+                app.state.feishu_ws_bridge = None
+            if feishu_api_client:
+                await feishu_api_client.close()
             await job_delivery_coordinator.stop()
             await approval_engine.stop()
             await scheduler.stop()
@@ -341,6 +369,8 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
     app.state.conversation_store = conversation_store
     app.state.memcore_writer = memcore_writer
     app.state.learning_store = learning_store
+    app.state.feishu_api_client = feishu_api_client
+    app.state.feishu_ws_bridge = feishu_ws_bridge
 
     @app.middleware("http")
     async def auth_middleware(request: Request, call_next):
@@ -365,6 +395,237 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
     # ─── Routes ────────────────────────────────────────────────
+
+    async def _resolve_route_for_text(conversation_id: str, text: str) -> RouteResult:
+        # 优先检查 SkillSession 拦截（新机制）
+        if executor.session_manager.should_intercept(conversation_id):
+            return executor.session_manager.intercept_route(conversation_id, text)
+        # 其次检查旧的 pending 机制（need_login）
+        if executor.get_pending_context(conversation_id):
+            pending = executor.get_pending_context(conversation_id)
+            return RouteResult(
+                route_type=RouteType.SKILL,
+                skill_name=pending.skill_name,
+                params={
+                    "action": "continue",
+                    "original_text": text,
+                    "login_step": pending.login_step,
+                    "pending_prompt": pending.pending_prompt,
+                    "pending_params": pending.pending_params,
+                },
+                confidence=0.95,
+            )
+        # 检查待确认的学习请求
+        if executor.intercept_learn_request(conversation_id, text):
+            return executor.intercept_learn_request(conversation_id, text)
+        return await router.route(text)
+
+    async def _execute_inbound_text(
+        *,
+        conversation_id: str,
+        user_id: str,
+        text: str,
+        source: str,
+        extra_payload: dict | None = None,
+    ) -> tuple[Event, RouteResult, str]:
+        payload = {"text": text, "source": source}
+        if extra_payload:
+            payload.update(extra_payload)
+        event = make_event(
+            EventType.USER_MESSAGE,
+            conversation_id=conversation_id,
+            user_id=user_id,
+            payload=payload,
+        )
+        await event_bus.emit(event)
+        route = await _resolve_route_for_text(conversation_id, text)
+        reply = await executor.handle_route_result(route, event) or "(无响应)"
+        return event, route, reply
+
+    async def _reply_via_feishu_api(channel_event, text: str) -> tuple[bool, str]:
+        if not text or not config.feishu_reply_via_api:
+            return False, "api_disabled_or_empty_text"
+        if not feishu_api_client:
+            return False, "api_client_not_configured"
+        chat_id = str(getattr(channel_event, "chat_id", "") or "").strip()
+        if not chat_id:
+            return False, "missing_chat_id"
+        try:
+            ok, detail = await feishu_api_client.send_text(chat_id=chat_id, text=text)
+            return ok, detail
+        except Exception as e:
+            logger.warning("feishu_reply_api_failed", error=str(e))
+            return False, str(e)
+
+    async def _reply_via_feishu_webhook(text: str) -> tuple[bool, str]:
+        if not text or not config.feishu_reply_via_webhook:
+            return False, "webhook_disabled_or_empty_text"
+        from src.notifier.channels.base import Notification, Priority
+
+        for channel in notifier.channels:
+            if getattr(channel, "channel_type", "") != "feishu":
+                continue
+            notification = Notification(
+                title="Raccoon",
+                body=text,
+                priority=Priority.NORMAL,
+                extra={"msg_type": "text", "content": {"text": text}},
+            )
+            try:
+                ok = await channel.send(notification)
+                return ok, "ok" if ok else "webhook_send_failed"
+            except Exception as e:
+                logger.warning("feishu_reply_failed", error=str(e))
+                return False, str(e)
+        return False, "feishu_webhook_not_configured"
+
+    async def _deliver_feishu_reply(channel_event, text: str) -> tuple[bool, str, str]:
+        """统一回复策略：优先 API 动态回发，失败再 webhook 兜底。"""
+        api_ok, api_detail = await _reply_via_feishu_api(channel_event, text)
+        if api_ok:
+            return True, "api", api_detail
+
+        webhook_ok, webhook_detail = await _reply_via_feishu_webhook(text)
+        if webhook_ok:
+            return True, "webhook_fallback", webhook_detail
+
+        return False, "none", f"api={api_detail};webhook={webhook_detail}"
+
+    def _resolve_output_file_path(rel_path: str) -> Path | None:
+        output_root = (Path(__file__).parent.parent.parent / "output").resolve()
+        candidate = (output_root / rel_path).resolve()
+        if not str(candidate).startswith(str(output_root)):
+            return None
+        if not candidate.exists() or not candidate.is_file():
+            return None
+        return candidate
+
+    async def _reply_feishu_task_outcome(event: Event) -> None:
+        """Task 完成后向飞书会话补发最终结果（含附件）。"""
+        if not feishu_api_client or not config.feishu_reply_via_api:
+            return
+
+        payload = event.payload or {}
+        if str(payload.get("channel_source") or "").lower() != "feishu":
+            return
+
+        chat_id = str(payload.get("channel_chat_id") or "").strip()
+        if not chat_id:
+            return
+
+        task_short = (event.task_id or "")[:8]
+        summary_text = str(payload.get("reply") or "").strip()
+
+        if event.event == EventType.TASK_FAILED:
+            err = str(payload.get("error") or payload.get("reason") or "未知错误").strip()
+            failure_text = summary_text or f"任务 [{task_short}] 执行失败：{err}"
+            ok, detail = await feishu_api_client.send_text(chat_id=chat_id, text=failure_text)
+            audit_logger.log(
+                action="feishu_task_outcome_reply",
+                actor="system",
+                target=event.conversation_id,
+                detail={
+                    "task_id": event.task_id,
+                    "status": "failed",
+                    "sent": ok,
+                    "detail": detail,
+                },
+            )
+            return
+
+        sent_files = 0
+        file_failures: list[str] = []
+        raw_files = payload.get("_files") or []
+        if isinstance(raw_files, list):
+            for item in raw_files:
+                if not isinstance(item, dict):
+                    continue
+                rel_path = str(item.get("path") or "").strip()
+                if not rel_path:
+                    continue
+                local_path = _resolve_output_file_path(rel_path)
+                if not local_path:
+                    file_failures.append(f"missing:{rel_path}")
+                    continue
+                ok, detail = await feishu_api_client.send_local_file(
+                    chat_id=chat_id,
+                    file_path=local_path,
+                    mime_type=str(item.get("mime") or ""),
+                )
+                if ok:
+                    sent_files += 1
+                else:
+                    file_failures.append(f"{local_path.name}:{detail}")
+
+        if summary_text:
+            summary = summary_text
+        elif sent_files > 0:
+            summary = f"任务 [{task_short}] 已完成，已发送 {sent_files} 个文件。"
+        else:
+            summary = f"任务 [{task_short}] 已完成。"
+
+        ok_text, detail_text = await feishu_api_client.send_text(chat_id=chat_id, text=summary)
+        audit_logger.log(
+            action="feishu_task_outcome_reply",
+            actor="system",
+            target=event.conversation_id,
+            detail={
+                "task_id": event.task_id,
+                "status": "completed",
+                "summary_sent": ok_text,
+                "summary_detail": detail_text,
+                "sent_files": sent_files,
+                "file_failures": file_failures[:5],
+            },
+        )
+
+    async def _process_feishu_event(
+        parsed: FeishuParseResult,
+        *,
+        transport: str = "callback",
+    ) -> dict:
+        channel_event = parsed.channel_event
+        if not channel_event:
+            return {"code": 0, "msg": "ok", "status": "ignored", "detail": parsed.detail}
+
+        inbound_text = channel_event.text.strip() or "请处理我刚刚在飞书发送的消息。"
+        event, route, reply = await _execute_inbound_text(
+            conversation_id=channel_event.conversation_id,
+            user_id=f"feishu:{channel_event.sender_id}",
+            text=inbound_text,
+            source="feishu",
+            extra_payload={"channel_event": channel_event.model_dump(mode="json")},
+        )
+
+        reply_text = reply
+        if parsed.reply_hint:
+            reply_text = f"{parsed.reply_hint}\n{reply}"
+        reply_delivered, reply_channel, reply_detail = await _deliver_feishu_reply(channel_event, reply_text)
+
+        audit_logger.log(
+            action=f"feishu_inbound_message_{transport}",
+            actor=f"feishu:{channel_event.sender_id}",
+            target=channel_event.conversation_id,
+            detail={
+                "route_type": route.route_type.value,
+                "message_type": parsed.message_type,
+                "reply_delivered": reply_delivered,
+                "reply_channel": reply_channel,
+                "reply_detail": reply_detail,
+                "transport": transport,
+            },
+        )
+
+        return {
+            "code": 0,
+            "msg": "ok",
+            "status": "processed",
+            "event_id": event.event_id,
+            "conversation_id": channel_event.conversation_id,
+            "route_type": route.route_type.value,
+            "reply_delivered": reply_delivered,
+            "reply_channel": reply_channel,
+        }
 
     @app.post("/message", response_model=MessageResponse)
     async def send_message(req: MessageRequest) -> MessageResponse:
@@ -516,7 +777,7 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
         return StreamingResponse(_single(), media_type="text/event-stream")
 
     @app.get("/events")
-    async def event_stream(conversation_id: str | None = None) -> StreamingResponse:
+    async def event_stream(request: Request, conversation_id: str | None = None) -> StreamingResponse:
         """SSE 事件流，可选按 conversation_id 过滤"""
         queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=100)
         # 如果指定了 conversation_id，只关注该会话的事件
@@ -527,6 +788,8 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
         async def generate() -> AsyncGenerator[str, None]:
             try:
                 while True:
+                    if await request.is_disconnected():
+                        break
                     try:
                         event = await asyncio.wait_for(queue.get(), timeout=30.0)
                         data = event.model_dump_json()
@@ -534,7 +797,10 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
                     except asyncio.TimeoutError:
                         yield ": keepalive\n\n"
             finally:
-                sse_subscribers.remove(subscriber)
+                try:
+                    sse_subscribers.remove(subscriber)
+                except ValueError:
+                    pass
 
         return StreamingResponse(generate(), media_type="text/event-stream")
 
@@ -1419,6 +1685,14 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
     event_bus.on(EventType.TASK_COMPLETED, on_scheduled_task_finished)
     event_bus.on(EventType.TASK_FAILED, on_scheduled_task_finished)
 
+    async def on_task_finished_reply_to_feishu(event: Event) -> None:
+        if event.event not in {EventType.TASK_COMPLETED, EventType.TASK_FAILED}:
+            return
+        await _reply_feishu_task_outcome(event)
+
+    event_bus.on(EventType.TASK_COMPLETED, on_task_finished_reply_to_feishu)
+    event_bus.on(EventType.TASK_FAILED, on_task_finished_reply_to_feishu)
+
     @app.get("/schedules", response_model=list[ScheduleInfo])
     async def list_schedules() -> list[ScheduleInfo]:
         """列出所有定时任务"""
@@ -1687,6 +1961,40 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
         }
 
     # ─── Gateway Inbound ────────────────────────────────────────
+
+    @app.post("/channels/feishu/events")
+    async def feishu_events(request: Request) -> dict:
+        """飞书事件回调入口（URL 验证 + 消息事件）。"""
+        if not config.feishu_enabled:
+            raise HTTPException(status_code=404, detail="feishu_channel_disabled")
+        if config.feishu_mode == "websocket":
+            raise HTTPException(status_code=409, detail="feishu_mode_websocket")
+
+        try:
+            payload = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="invalid_json")
+
+        parsed = parse_feishu_callback(
+            payload,
+            verification_token=config.feishu_verification_token,
+            mention_required_in_group=config.feishu_mention_required_in_group,
+            allow_chat_ids=config.feishu_allow_chat_ids,
+            allow_user_ids=config.feishu_allow_user_ids,
+        )
+
+        if parsed.is_url_verification:
+            return {"challenge": parsed.challenge}
+        if not parsed.ok:
+            raise HTTPException(status_code=parsed.status_code, detail=parsed.detail)
+        if not parsed.channel_event:
+            return {"code": 0, "msg": "ok", "status": "ignored", "detail": parsed.detail}
+
+        if config.feishu_async_process:
+            asyncio.create_task(_process_feishu_event(parsed, transport="callback"))
+            return {"code": 0, "msg": "ok", "status": "accepted_async", "detail": parsed.detail}
+
+        return await _process_feishu_event(parsed, transport="callback")
 
     class GatewayInboundRequest(APIModel):
         text: str

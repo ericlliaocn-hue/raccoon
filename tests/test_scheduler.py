@@ -581,6 +581,56 @@ class TestScheduler:
         assert got.retry_count == 1
 
     @pytest.mark.asyncio
+    async def test_retry_does_not_resurrect_removed_schedule(self, components):
+        """删除后不应被延迟重试回写复活。"""
+        event_bus, store, scheduler = components
+        entry = ScheduleEntry(
+            name="删除后不复活",
+            cron="@daily",
+            message="test",
+            conversation_id="c1",
+            retry_policy=RetryPolicy(max_retries=1, retry_interval_seconds=1),
+        )
+        await scheduler.add_schedule(entry)
+
+        run_id = store.record_run_start(entry.schedule_id)
+        await scheduler.record_run_result(entry.schedule_id, run_id, success=False, error="boom")
+        removed = await scheduler.remove_schedule(entry.schedule_id)
+        assert removed is not None
+
+        await asyncio.sleep(1.2)
+
+        assert store.get(entry.schedule_id) is None
+        runs = store.get_recent_runs(entry.schedule_id, limit=10)
+        assert len(runs) == 1
+
+    @pytest.mark.asyncio
+    async def test_check_schedules_skips_removed_snapshot_entry(self, components, monkeypatch):
+        """轮询拿到旧快照时，已删除任务不应继续触发/回写。"""
+        event_bus, store, scheduler = components
+        entry = ScheduleEntry(
+            name="快照竞态测试",
+            cron="* * * * *",
+            message="test",
+            conversation_id="conv-snapshot",
+        )
+        await scheduler.add_schedule(entry)
+        await scheduler.remove_schedule(entry.schedule_id)
+
+        monkeypatch.setattr(store, "get_enabled", lambda: [entry])
+        emitted = []
+
+        async def _capture(event: Event):
+            emitted.append(event)
+
+        monkeypatch.setattr(event_bus, "emit", _capture)
+
+        await scheduler._check_schedules()
+
+        assert store.get(entry.schedule_id) is None
+        assert len(emitted) == 0
+
+    @pytest.mark.asyncio
     async def test_get_schedule_runs(self, components):
         """测试获取执行记录"""
         event_bus, store, scheduler = components

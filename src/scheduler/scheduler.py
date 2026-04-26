@@ -89,6 +89,11 @@ class Scheduler:
         now_minute = now.strftime("%Y-%m-%d %H:%M")
 
         for entry in self._store.get_enabled():
+            # 防止使用过期快照：删除/暂停后不应继续触发或回写。
+            live_entry = self._store.get(entry.schedule_id)
+            if not live_entry or not live_entry.enabled:
+                continue
+            entry = live_entry
             try:
                 cron = CronParser(entry.cron)
                 if not cron.matches(now):
@@ -105,6 +110,12 @@ class Scheduler:
                     continue
 
                 try:
+                    # 获取锁后再确认一次，避免删除操作与当前轮询竞态导致“删后回写”。
+                    live_entry = self._store.get(entry.schedule_id)
+                    if not live_entry or not live_entry.enabled:
+                        continue
+                    entry = live_entry
+
                     # 触发
                     self._last_triggered[entry.schedule_id] = now_minute
                     entry.last_run = now
@@ -130,7 +141,8 @@ class Scheduler:
 
                     # 更新调度状态
                     entry.last_run_result = "triggered"
-                    self._store.update(entry)
+                    if self._store.get(entry.schedule_id):
+                        self._store.update(entry)
 
                     logger.info(
                         "schedule_triggered",
@@ -246,25 +258,32 @@ class Scheduler:
                 # 延迟后重新触发
                 async def _retry():
                     await asyncio.sleep(policy.retry_interval_seconds)
-                    if entry.enabled and entry.retry_count <= policy.max_retries:
-                        retry_run_id = self._store.record_run_start(entry.schedule_id)
-                        entry.last_run = datetime.now(timezone.utc)
-                        self._store.update(entry)
-                        retry_event = make_event(
-                            EventType.SCHEDULE_TRIGGERED,
-                            conversation_id=entry.conversation_id,
-                            user_id=entry.user_id,
-                            payload={
-                                "text": entry.message,
-                                "schedule_id": entry.schedule_id,
-                                "schedule_name": f"{entry.name} (重试#{entry.retry_count})",
-                                "cron": entry.cron,
-                                "run_id": retry_run_id,
-                                "is_retry": True,
-                                "retry_count": entry.retry_count,
-                            },
-                        )
-                        await self._event_bus.emit(retry_event)
+                    latest = self._store.get(entry.schedule_id)
+                    if latest is None or not latest.enabled:
+                        logger.info("schedule_retry_skipped", schedule_id=entry.schedule_id, reason="missing_or_disabled")
+                        return
+                    latest_policy = latest.retry_policy
+                    if latest.retry_count > latest_policy.max_retries:
+                        logger.info("schedule_retry_skipped", schedule_id=entry.schedule_id, reason="retry_limit_exceeded")
+                        return
+                    retry_run_id = self._store.record_run_start(latest.schedule_id)
+                    latest.last_run = datetime.now(timezone.utc)
+                    self._store.update(latest)
+                    retry_event = make_event(
+                        EventType.SCHEDULE_TRIGGERED,
+                        conversation_id=latest.conversation_id,
+                        user_id=latest.user_id,
+                        payload={
+                            "text": latest.message,
+                            "schedule_id": latest.schedule_id,
+                            "schedule_name": f"{latest.name} (重试#{latest.retry_count})",
+                            "cron": latest.cron,
+                            "run_id": retry_run_id,
+                            "is_retry": True,
+                            "retry_count": latest.retry_count,
+                        },
+                    )
+                    await self._event_bus.emit(retry_event)
 
                 asyncio.create_task(_retry())
 

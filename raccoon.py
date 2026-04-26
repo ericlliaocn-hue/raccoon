@@ -13,6 +13,7 @@
   raccoon skills [list|install|uninstall|info]  # Skill 管理
   raccoon logs                     # 查看日志
   raccoon doctor                   # 诊断检查
+  raccoon feishu [init|check]      # 飞书接入助手
   raccoon benchmark core           # 核心场景夹具基准报告
   raccoon benchmark live           # 真实外站压测（稳定包+扰动包）
   raccoon benchmark open_world     # 开放世界样本压测（30+场景）
@@ -27,6 +28,7 @@ import contextlib
 import io
 import json
 import re
+import secrets
 import subprocess
 import sys
 import tomllib
@@ -90,6 +92,33 @@ def main() -> None:
     # ─── doctor ───────────────────────────────────────────────
     sub.add_parser("doctor", help="诊断检查")
 
+    # ─── feishu ───────────────────────────────────────────────
+    p_feishu = sub.add_parser("feishu", help="飞书接入助手")
+    p_feishu.add_argument(
+        "action",
+        nargs="?",
+        default="check",
+        choices=["init", "check"],
+        help="init=初始化配置，check=检查配置",
+    )
+    p_feishu.add_argument(
+        "--mode",
+        default="callback",
+        choices=["callback", "websocket"],
+        help="飞书接入模式：callback 或 websocket",
+    )
+    p_feishu.add_argument("--callback-base", default="", help="公网回调基地址，例如 https://bot.example.com")
+    p_feishu.add_argument("--verification-token", default="", help="飞书事件订阅 Verification Token")
+    p_feishu.add_argument("--app-id", default="", help="飞书应用 App ID（websocket 模式）")
+    p_feishu.add_argument("--app-secret", default="", help="飞书应用 App Secret（websocket 模式）")
+    p_feishu.add_argument("--domain", default="feishu", help="飞书域名：feishu / lark / https://...")
+    p_feishu.add_argument("--webhook", default="", help="飞书机器人 Webhook（用于回消息/通知）")
+    p_feishu.add_argument("--webhook-secret", default="", help="飞书机器人签名 secret（可选）")
+    p_feishu.add_argument("--no-mention-gate", action="store_true", help="群聊不要求 @ 机器人")
+    p_feishu.add_argument("--allow-chat-id", action="append", default=[], help="允许的 chat_id，可重复传入")
+    p_feishu.add_argument("--allow-user-id", action="append", default=[], help="允许的 user_id/open_id，可重复传入")
+    p_feishu.add_argument("--sync", action="store_true", help="关闭异步回调处理（默认异步）")
+
     # ─── benchmark ────────────────────────────────────────────
     p_benchmark = sub.add_parser("benchmark", help="基准测试与报告")
     p_benchmark.add_argument(
@@ -135,6 +164,7 @@ def main() -> None:
         "skills": lambda: _cmd_skills(args),
         "logs": lambda: _cmd_logs(args),
         "doctor": _cmd_doctor,
+        "feishu": lambda: _cmd_feishu(args),
         "benchmark": lambda: _cmd_benchmark(args),
         "schedule": lambda: _cmd_schedule(args),
     }
@@ -181,6 +211,40 @@ def _validate_http_security_guard(host: str, config) -> tuple[bool, str]:
             f"远程监听已拒绝：http_auth_token 长度不足（当前 {len(token)}，要求 >= {min_len}）。",
         )
     return True, ""
+
+
+def _ensure_nofile_limit(min_soft: int = 4096) -> None:
+    """尽量提升进程文件句柄软限制，降低 EMFILE 风险（macOS/Linux）。"""
+    try:
+        import resource  # 仅 Unix 可用
+    except Exception:
+        return
+
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except Exception:
+        return
+
+    target = max(int(min_soft), int(soft))
+    if isinstance(hard, int) and hard > 0:
+        target = min(target, hard)
+
+    if target <= soft:
+        if soft < min_soft:
+            print(
+                f"⚠️ 当前文件句柄上限较低（soft={soft}），"
+                "在高并发/长连接场景可能触发 Too many open files。"
+            )
+        return
+
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+        print(f"🔧 已提升文件句柄上限: {soft} -> {target}")
+    except Exception as e:
+        print(
+            f"⚠️ 无法自动提升文件句柄上限（soft={soft}, target={target}）: {e}\n"
+            "   可手动执行: ulimit -n 65535"
+        )
 
 
 def _cmd_start(args) -> None:
@@ -324,6 +388,168 @@ def _cmd_config(args) -> None:
             json.dump(data, f, indent=2, ensure_ascii=False)
 
         print(f"✅ {args.key} = {value}")
+
+
+def _cmd_feishu(args) -> None:
+    """飞书接入助手：初始化/检查配置。"""
+    from src.config import PROJECT_ROOT
+
+    config_path = PROJECT_ROOT / "config.json"
+    data: dict = {}
+    if config_path.exists():
+        with open(config_path, encoding="utf-8") as f:
+            data = json.load(f)
+
+    if args.action == "init":
+        mode = str(args.mode or data.get("feishu_mode") or "callback").strip().lower()
+        if mode == "websocket":
+            # WS 模式默认不依赖 verification token，避免本地联调时因 token 不一致静默丢消息。
+            token = args.verification_token or ""
+        else:
+            token = (
+                args.verification_token
+                or str(data.get("feishu_verification_token") or "")
+                or secrets.token_urlsafe(24)
+            )
+        data["feishu_enabled"] = True
+        data["feishu_mode"] = mode
+        data["feishu_verification_token"] = token
+        data["feishu_app_id"] = args.app_id or str(data.get("feishu_app_id") or "")
+        data["feishu_app_secret"] = args.app_secret or str(data.get("feishu_app_secret") or "")
+        data["feishu_domain"] = args.domain or str(data.get("feishu_domain") or "feishu")
+        data["feishu_mention_required_in_group"] = not bool(args.no_mention_gate)
+        data["feishu_allow_chat_ids"] = args.allow_chat_id or data.get("feishu_allow_chat_ids", [])
+        data["feishu_allow_user_ids"] = args.allow_user_id or data.get("feishu_allow_user_ids", [])
+        data["feishu_reply_via_api"] = True
+        data["feishu_reply_via_webhook"] = True
+        data["feishu_async_process"] = not bool(args.sync)
+
+        channels = data.get("notify_channels") or []
+        if not isinstance(channels, list):
+            channels = []
+        feishu_channel = None
+        for item in channels:
+            if isinstance(item, dict) and item.get("type") == "feishu":
+                feishu_channel = item
+                break
+        if feishu_channel is None:
+            feishu_channel = {"type": "feishu", "name": "feishu-main", "webhook": "", "secret": ""}
+            channels.append(feishu_channel)
+
+        if args.webhook:
+            feishu_channel["webhook"] = args.webhook
+        if args.webhook_secret:
+            feishu_channel["secret"] = args.webhook_secret
+        data["notify_channels"] = channels
+
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+        callback_base = args.callback_base.rstrip("/")
+        callback_url = f"{callback_base}/channels/feishu/events" if callback_base else "<YOUR_PUBLIC_BASE_URL>/channels/feishu/events"
+
+        print("✅ 飞书基础配置已初始化")
+        print(f"  - config: {config_path}")
+        print("  - feishu_enabled: true")
+        print(f"  - feishu_mode: {mode}")
+        print(f"  - feishu_verification_token: {token or '<EMPTY>'}")
+        if mode == "websocket":
+            print(f"  - feishu_app_id: {data['feishu_app_id'] or '<MISSING>'}")
+            print(f"  - feishu_domain: {data['feishu_domain']}")
+            print("\n下一步（飞书开放平台）：")
+            print("  1) 事件订阅选择『使用长连接接收事件（WebSocket）』")
+            print("  2) 事件类型至少开启 im.message.receive_v1")
+            print("  3) 确保 config.json 中 feishu_app_id / feishu_app_secret 已配置")
+            print("  4) 如需群聊回消息，请在 notify_channels.feishu.webhook 配置 webhook")
+            print("  5) websocket 模式下 verification token 可留空（推荐）")
+        else:
+            print(f"  - callback_url: {callback_url}")
+            print("\n下一步（飞书开放平台）：")
+            print("  1) 事件订阅请求网址填上 callback_url")
+            print("  2) Verification Token 填上 feishu_verification_token")
+            print("  3) 事件类型至少开启 im.message.receive_v1")
+            print("  4) 如需群聊回复，请在 notify_channels.feishu.webhook 配置群机器人 webhook")
+        return
+
+    # check
+    print("🧪 Feishu 配置检查")
+    issues: list[str] = []
+    enabled = bool(data.get("feishu_enabled"))
+    mode = str(data.get("feishu_mode") or "callback").strip().lower()
+    token = str(data.get("feishu_verification_token") or "")
+    app_id = str(data.get("feishu_app_id") or "")
+    app_secret = str(data.get("feishu_app_secret") or "")
+    reply_via_api = bool(data.get("feishu_reply_via_api", True))
+    channels = data.get("notify_channels") or []
+    feishu_channel = None
+    if isinstance(channels, list):
+        for item in channels:
+            if isinstance(item, dict) and item.get("type") == "feishu":
+                feishu_channel = item
+                break
+
+    if enabled:
+        print("  ✅ feishu_enabled 已开启")
+    else:
+        print("  ❌ feishu_enabled 未开启")
+        issues.append("feishu_enabled=false")
+
+    print(f"  ℹ️  feishu_mode = {mode}")
+    print(f"  ℹ️  feishu_reply_via_api = {str(reply_via_api).lower()}")
+
+    if mode == "websocket":
+        if app_id:
+            print("  ✅ feishu_app_id 已配置")
+        else:
+            print("  ❌ feishu_app_id 缺失")
+            issues.append("缺少 feishu_app_id")
+        if app_secret:
+            print("  ✅ feishu_app_secret 已配置")
+        else:
+            print("  ❌ feishu_app_secret 缺失")
+            issues.append("缺少 feishu_app_secret")
+        if token:
+            print("  ⚠️  websocket 模式检测到 feishu_verification_token 非空（建议清空，避免事件误拦截）")
+
+        try:
+            import importlib
+
+            importlib.import_module("lark_oapi")
+            print("  ✅ lark-oapi 依赖可用")
+        except Exception:
+            print("  ❌ lark-oapi 依赖缺失（websocket 模式必需）")
+            issues.append("lark-oapi 未安装")
+    else:
+        if token:
+            print("  ✅ feishu_verification_token 已配置")
+        else:
+            print("  ❌ feishu_verification_token 缺失")
+            issues.append("缺少 Verification Token")
+        if reply_via_api and not (app_id and app_secret):
+            print("  ⚠️  callback 模式已开启动态回发，但 feishu_app_id/app_secret 缺失（将只能 webhook 回发）")
+
+    if feishu_channel:
+        print("  ✅ notify_channels 已包含 feishu 通道")
+        if feishu_channel.get("webhook"):
+            print("  ✅ feishu webhook 已配置（可回消息/通知）")
+        else:
+            if reply_via_api and app_id and app_secret:
+                print("  ℹ️  feishu webhook 未配置（当前仍可通过 chat_id 动态回发）")
+            else:
+                print("  ⚠️  feishu webhook 未配置（动态回发失败时将无兜底通道）")
+    else:
+        if reply_via_api and app_id and app_secret:
+            print("  ℹ️  notify_channels 未配置 feishu 通道（动态回发可用，无 webhook 兜底）")
+        else:
+            print("  ⚠️  notify_channels 未配置 feishu 通道")
+
+    if issues:
+        print("\n❌ 检查未通过：")
+        for item in issues:
+            print(f"  - {item}")
+        sys.exit(1)
+
+    print("\n✅ 检查通过，可开始飞书联调")
 
 
 def _cmd_skills(args) -> None:
@@ -477,6 +703,51 @@ def _cmd_doctor() -> None:
                 else:
                     print(f"  ❌ {reason}")
                     issues.append("远程监听安全闸门未满足")
+
+            # Feishu readiness
+            if bool(getattr(config, "feishu_enabled", False)):
+                print("  ✅ Feishu 通道已启用")
+                feishu_mode = str(getattr(config, "feishu_mode", "callback") or "callback").strip().lower()
+                print(f"  ℹ️  Feishu 模式: {feishu_mode}")
+                if feishu_mode == "websocket":
+                    if getattr(config, "feishu_app_id", "") and getattr(config, "feishu_app_secret", ""):
+                        print("  ✅ Feishu App ID / App Secret 已配置（websocket）")
+                    else:
+                        print("  ❌ Feishu App ID / App Secret 缺失（websocket）")
+                        issues.append("Feishu websocket credentials 缺失")
+                    try:
+                        import importlib
+
+                        importlib.import_module("lark_oapi")
+                        print("  ✅ lark-oapi 依赖可用")
+                    except Exception:
+                        print("  ❌ lark-oapi 依赖缺失（websocket 模式必需）")
+                        issues.append("lark-oapi 依赖缺失")
+                else:
+                    if getattr(config, "feishu_verification_token", ""):
+                        print("  ✅ Feishu Verification Token 已配置")
+                    else:
+                        print("  ❌ Feishu Verification Token 缺失")
+                        issues.append("Feishu Verification Token 缺失")
+                if bool(getattr(config, "feishu_reply_via_api", True)):
+                    if getattr(config, "feishu_app_id", "") and getattr(config, "feishu_app_secret", ""):
+                        print("  ✅ Feishu 动态回发（chat_id）可用")
+                    else:
+                        print("  ⚠️  Feishu 动态回发已启用但缺少 app_id/app_secret（将回退 webhook）")
+                else:
+                    print("  ℹ️  Feishu 动态回发已关闭，仅 webhook 回发")
+
+                feishu_webhook_ready = False
+                for ch in getattr(config, "notify_channels", []):
+                    if isinstance(ch, dict) and ch.get("type") == "feishu" and ch.get("webhook"):
+                        feishu_webhook_ready = True
+                        break
+                if feishu_webhook_ready:
+                    print("  ✅ Feishu webhook 通道可用（支持回消息/通知）")
+                else:
+                    print("  ⚠️  Feishu webhook 未配置（仅收消息，不可主动回发）")
+            else:
+                print("  ℹ️  Feishu 通道未启用")
         except Exception as e:
             print(f"  ❌ 配置加载失败: {e}")
             issues.append("配置加载失败")
@@ -1184,6 +1455,7 @@ def _get_latest_version() -> str | None:
 
 def _run_cli() -> None:
     """前台 CLI 模式"""
+    _ensure_nofile_limit()
     from src.adapters.cli_adapter import run_cli
     run_cli()
 
@@ -1194,6 +1466,7 @@ def _run_http(host: str, port: int) -> None:
     from src.adapters.http_adapter import create_app
     from src.config import load_config
 
+    _ensure_nofile_limit()
     config = load_config()
     ok, reason = _validate_http_security_guard(host, config)
     if not ok:

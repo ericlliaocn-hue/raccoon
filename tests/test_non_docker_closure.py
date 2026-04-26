@@ -47,6 +47,32 @@ def test_http_auth_and_health_public(tmp_path):
         assert authed.status_code == 200
 
 
+def test_feishu_callback_route_rejects_when_mode_is_websocket(tmp_path, monkeypatch):
+    async def _noop_start(self):
+        return None
+
+    async def _noop_stop(self):
+        return None
+
+    monkeypatch.setattr("src.adapters.http_adapter.FeishuWebSocketBridge.start", _noop_start)
+    monkeypatch.setattr("src.adapters.http_adapter.FeishuWebSocketBridge.stop", _noop_stop)
+
+    app = create_app(
+        _test_config(
+            tmp_path,
+            feishu_enabled=True,
+            feishu_mode="websocket",
+            feishu_app_id="cli_test",
+            feishu_app_secret="sec_test",
+        )
+    )
+
+    with TestClient(app) as client:
+        res = client.post("/channels/feishu/events", json={"type": "url_verification"})
+        assert res.status_code == 409
+        assert res.json()["detail"] == "feishu_mode_websocket"
+
+
 def test_upload_rejects_traversal_and_accepts_safe_file(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     app = create_app(_test_config(tmp_path, http_auth_token="secret"))

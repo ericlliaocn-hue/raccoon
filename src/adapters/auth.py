@@ -26,6 +26,8 @@ def is_protected_http_endpoint(path: str, method: str) -> bool:
         return False
     if path == "/gateway/inbound":
         return False
+    if path.startswith("/channels/feishu/"):
+        return False
 
     if path in {"/message", "/chat/stream", "/events", "/upload", "/upload/file"}:
         return True
