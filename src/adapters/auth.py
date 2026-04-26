@@ -29,7 +29,7 @@ def is_protected_http_endpoint(path: str, method: str) -> bool:
 
     if path in {"/message", "/chat/stream", "/events", "/upload", "/upload/file"}:
         return True
-    if path.startswith(("/files/", "/tasks", "/schedules", "/settings/", "/workflows", "/learning", "/benchmarks")):
+    if path.startswith(("/files/", "/tasks", "/jobs", "/schedules", "/settings/", "/workflows", "/learning", "/benchmarks")):
         return True
     if path.startswith("/approvals") or path.startswith("/notify"):
         return True

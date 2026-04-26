@@ -127,6 +127,18 @@ function handleSSE(ev) {
     addMsg('assistant', `❌ 任务失败: ${ev.payload?.error || '未知'}`, source || 'skill', ev.skill_name || '');
   } else if (ev.event === 'task_progress') {
     addMsg('system', `⏳ ${ev.skill_name || '任务'}: ${ev.payload?.message || '处理中...'}`);
+  } else if (ev.event === 'job_created') {
+    addMsg('system', `🧵 后台任务已创建 #${(ev.payload?.job_id || '').slice(0, 8)} (${ev.payload?.kind || 'generic'})`);
+  } else if (ev.event === 'job_progress') {
+    const progress = typeof ev.payload?.progress === 'number' ? `${ev.payload.progress}%` : (ev.payload?.status || '处理中');
+    addMsg('system', `⏳ 后台任务 #${(ev.payload?.job_id || '').slice(0, 8)}: ${progress} ${ev.payload?.message || ''}`.trim());
+  } else if (ev.event === 'job_completed') {
+    const count = Array.isArray(ev.payload?.artifacts) ? ev.payload.artifacts.length : 0;
+    addMsg('system', `✅ 后台任务完成 #${(ev.payload?.job_id || '').slice(0, 8)}${count ? `，产物 ${count} 个` : ''}`);
+  } else if (ev.event === 'job_failed') {
+    addMsg('system', `❌ 后台任务失败 #${(ev.payload?.job_id || '').slice(0, 8)}: ${ev.payload?.error || '未知错误'}`);
+  } else if (ev.event === 'job_cancelled') {
+    addMsg('system', `🚫 后台任务已取消 #${(ev.payload?.job_id || '').slice(0, 8)}`);
   } else if (ev.event === 'session_started') {
     addMsg('system', `🔄 ${ev.payload?.skill_name || 'Skill'} 流程开始 (${ev.payload?.total_steps || 0} 步)`);
   } else if (ev.event === 'session_step') {

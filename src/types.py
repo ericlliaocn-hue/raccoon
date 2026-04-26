@@ -47,6 +47,11 @@ class EventType(str, Enum):
     TASK_COMPLETED = "task_completed"
     TASK_FAILED = "task_failed"
     TASK_PROGRESS = "task_progress"
+    JOB_CREATED = "job_created"
+    JOB_PROGRESS = "job_progress"
+    JOB_COMPLETED = "job_completed"
+    JOB_FAILED = "job_failed"
+    JOB_CANCELLED = "job_cancelled"
     SCHEDULE_TRIGGERED = "schedule_triggered"
     SYSTEM = "system"
     SESSION_STARTED = "session_started"     # Skill 会话开始

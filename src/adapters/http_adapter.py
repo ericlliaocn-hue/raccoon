@@ -6,6 +6,8 @@
 - GET /tasks - 任务列表
 - GET /tasks/{task_id} - 任务详情
 - POST /tasks/{task_id}/cancel - 取消任务
+- POST /jobs - 创建后台长任务
+- GET /jobs / GET /jobs/{job_id} - 长任务查询
 - GET /skills - 已安装 Skill 列表
 """
 
@@ -26,7 +28,7 @@ import structlog
 from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel as APIModel
+from pydantic import BaseModel as APIModel, Field as APIField
 
 from src import __version__
 from src.brain.core_benchmark import build_core_scenario_report
@@ -51,6 +53,15 @@ from src.types import Event, RouteResult, RouteType, ScheduleEntry, WorkflowEntr
 from src.workflow.workflow_engine import WorkflowEngine
 from src.workflow.workflow_store import WorkflowStore
 from src.gateway.inbound import GatewayInbound, GatewayAuthError, GatewayRateLimitError
+from src.jobs import (
+    JobArtifact,
+    JobDeliveryCoordinator,
+    JobDeliveryState,
+    JobManager,
+    JobRecord,
+    JobStatus,
+    JobStore,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -84,6 +95,58 @@ class TaskInfo(APIModel):
     skill_name: str
     status: str
     conversation_id: str
+
+
+class JobCreateRequest(APIModel):
+    kind: str = "generic"
+    conversation_id: str | None = None
+    user_id: str = "http_user"
+    payload: dict = APIField(default_factory=dict)
+    metadata: dict = APIField(default_factory=dict)
+    estimated_seconds: int | None = None
+    message: str = ""
+    delivery_required: bool = False
+    delivery_max_attempts: int = 5
+
+
+class JobProgressRequest(APIModel):
+    progress: int
+    message: str = ""
+
+
+class JobCompleteRequest(APIModel):
+    message: str = ""
+    artifacts: list[dict] = APIField(default_factory=list)
+    delivery_required: bool | None = None
+
+
+class JobFailRequest(APIModel):
+    error: str
+    message: str = ""
+
+
+class JobInfo(APIModel):
+    job_id: str
+    kind: str
+    status: str
+    conversation_id: str
+    user_id: str
+    progress: int
+    message: str
+    error: str | None = None
+    estimated_seconds: int | None = None
+    payload: dict = APIField(default_factory=dict)
+    metadata: dict = APIField(default_factory=dict)
+    artifacts: list[dict] = APIField(default_factory=list)
+    trace_id: str
+    delivery_state: str
+    delivery_attempts: int
+    delivery_max_attempts: int
+    next_delivery_at: str | None = None
+    delivery_last_error: str | None = None
+    created_at: str
+    updated_at: str
+    completed_at: str | None = None
 
 
 class SkillInfo(APIModel):
@@ -166,6 +229,9 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
     )
 
     executor = Executor(event_bus, vault_manager, config, approval_engine=approval_engine)
+    job_store = JobStore(config)
+    job_manager = JobManager(event_bus, store=job_store)
+    job_delivery_coordinator = JobDeliveryCoordinator(job_manager, job_store, config)
 
     # L3 学习引擎
     llm_client = LLMFactory.create(config)
@@ -221,6 +287,7 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
         await event_bus.start()
         await scheduler.start()
         await approval_engine.start()
+        await job_delivery_coordinator.start()
         try:
             from skills.web_automate.session_manager import get_session_manager
             await get_session_manager().start_cleanup_loop()
@@ -231,6 +298,7 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
         try:
             yield
         finally:
+            await job_delivery_coordinator.stop()
             await approval_engine.stop()
             await scheduler.stop()
             try:
@@ -257,6 +325,9 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
     app.state.event_bus = event_bus
     app.state.router = router
     app.state.executor = executor
+    app.state.job_manager = job_manager
+    app.state.job_store = job_store
+    app.state.job_delivery_coordinator = job_delivery_coordinator
     app.state.vault_manager = vault_manager
     app.state.audit_logger = audit_logger
     app.state.sse_subscribers = sse_subscribers
@@ -504,6 +575,122 @@ def create_app(config: RaccoonConfig | None = None) -> FastAPI:
         TaskStateMachine.request_cancel(task)
         executor.task_queue.update(task)
         return {"status": "cancelling", "task_id": task_id}
+
+    def _job_to_info(job: JobRecord) -> JobInfo:
+        return JobInfo(
+            job_id=job.job_id,
+            kind=job.kind,
+            status=job.status.value,
+            conversation_id=job.conversation_id,
+            user_id=job.user_id,
+            progress=job.progress,
+            message=job.message,
+            error=job.error,
+            estimated_seconds=job.estimated_seconds,
+            payload=job.payload,
+            metadata=job.metadata,
+            artifacts=[item.model_dump() for item in job.artifacts],
+            trace_id=job.trace_id,
+            delivery_state=job.delivery_state.value,
+            delivery_attempts=job.delivery_attempts,
+            delivery_max_attempts=job.delivery_max_attempts,
+            next_delivery_at=job.next_delivery_at.isoformat() if job.next_delivery_at else None,
+            delivery_last_error=job.delivery_last_error,
+            created_at=job.created_at.isoformat(),
+            updated_at=job.updated_at.isoformat(),
+            completed_at=job.completed_at.isoformat() if job.completed_at else None,
+        )
+
+    @app.post("/jobs", response_model=JobInfo)
+    async def create_job(req: JobCreateRequest) -> JobInfo:
+        """创建后台长任务（第一批骨架接口）"""
+        conversation_id = req.conversation_id or f"job_{uuid.uuid4().hex[:8]}"
+        job = await job_manager.create_job(
+            kind=req.kind,
+            conversation_id=conversation_id,
+            user_id=req.user_id,
+            payload=req.payload,
+            metadata=req.metadata,
+            estimated_seconds=req.estimated_seconds,
+            message=req.message,
+            delivery_required=req.delivery_required,
+            delivery_max_attempts=req.delivery_max_attempts,
+        )
+        return _job_to_info(job)
+
+    @app.get("/jobs", response_model=list[JobInfo])
+    async def list_jobs(
+        limit: int = 50,
+        status: str | None = None,
+        conversation_id: str | None = None,
+        delivery_state: str | None = None,
+    ) -> list[JobInfo]:
+        """查询任务列表"""
+        parsed_status: JobStatus | None = None
+        parsed_delivery_state: JobDeliveryState | None = None
+        if status:
+            try:
+                parsed_status = JobStatus(status)
+            except ValueError:
+                raise HTTPException(status_code=400, detail=f"invalid status: {status}")
+        if delivery_state:
+            try:
+                parsed_delivery_state = JobDeliveryState(delivery_state)
+            except ValueError:
+                raise HTTPException(status_code=400, detail=f"invalid delivery_state: {delivery_state}")
+        jobs = await job_manager.list_jobs(
+            limit=max(1, min(int(limit), 500)),
+            status=parsed_status,
+            conversation_id=conversation_id,
+            delivery_state=parsed_delivery_state,
+        )
+        return [_job_to_info(job) for job in jobs]
+
+    @app.get("/jobs/{job_id}", response_model=JobInfo)
+    async def get_job(job_id: str) -> JobInfo:
+        """查询任务详情"""
+        job = await job_manager.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return _job_to_info(job)
+
+    @app.post("/jobs/{job_id}/progress", response_model=JobInfo)
+    async def update_job_progress(job_id: str, req: JobProgressRequest) -> JobInfo:
+        """更新任务进度（用于后台 worker 回写）"""
+        job = await job_manager.update_progress(job_id, progress=req.progress, message=req.message or None)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found or already completed")
+        return _job_to_info(job)
+
+    @app.post("/jobs/{job_id}/complete", response_model=JobInfo)
+    async def complete_job(job_id: str, req: JobCompleteRequest) -> JobInfo:
+        """标记任务完成并附带交付产物"""
+        artifacts = [JobArtifact(**item) for item in req.artifacts]
+        job = await job_manager.complete(
+            job_id,
+            message=req.message,
+            artifacts=artifacts,
+            delivery_required=req.delivery_required,
+        )
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return _job_to_info(job)
+
+    @app.post("/jobs/{job_id}/fail", response_model=JobInfo)
+    async def fail_job(job_id: str, req: JobFailRequest) -> JobInfo:
+        """标记任务失败"""
+        job = await job_manager.fail(job_id, error=req.error, message=req.message)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return _job_to_info(job)
+
+    @app.post("/jobs/{job_id}/cancel")
+    async def cancel_job(job_id: str) -> dict:
+        """取消任务"""
+        job = await job_manager.cancel(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return {"status": job.status.value, "job_id": job.job_id}
 
     @app.get("/skills", response_model=list[SkillInfo])
     async def list_skills() -> list[SkillInfo]:

@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-04-26
+
+### 🚀 通道标准化与长任务交付（第一批落地）
+
+> 目标：启动 `0.6.0` 主线，把“多通道聊天”升级为“可稳定交付任务结果”的基础能力。
+
+- **版本先行同步**：`pyproject.toml`、`src/__init__.py`、静态资源版本参数与 UI 文案统一到 `0.6.0`
+- **`Channel Contract v1` 基础模型**：新增统一入站/出站消息信封、附件模型与通道能力声明，作为后续 Feishu/Telegram/Slack 适配器共同契约
+- **长任务 `Job` 基础框架**：新增后台任务状态模型与管理器（`queued/running/waiting/uploading/delivered/failed/cancelled`），支持创建、进度更新、完成/失败/取消
+- **Job 持久化存储**：新增 `JobStore`（SQLite），`jobs` 与 `job_artifacts` 全量落库，重启后任务与交付产物可恢复
+- **交付重试协调器**：新增 `JobDeliveryCoordinator`，支持 `pending/retry/sent/dlq` 生命周期、指数退避重试与 DLQ 收敛
+- **HTTP `jobs` API 增强**：新增 delivery 字段（state/attempts/next/error），`/jobs` 支持 `delivery_state` 过滤，创建与完成接口支持声明 `delivery_required`
+- **事件可观测性增强**：新增 `JOB_CREATED/JOB_PROGRESS/JOB_COMPLETED/JOB_FAILED/JOB_CANCELLED` 事件，统一进入 EventBus/SSE 观测链路
+- **通道安全默认收口**：`/jobs` 纳入受保护 API，遵循现有 token 认证策略
+- **`0.6.0` 计划文档落盘**：新增 `docs/roadmap-0.6.0.md`，固定里程碑、门禁指标与风险回滚策略
+- **回归验证**：`python3.11 -m compileall`、`ruff check`、`pytest -m "not integration"` 均通过（491 passed）
+
 ## [0.5.11] - 2026-04-25
 
 ### 🌍 开放世界泛化 + 执行覆盖率冲刺（按 1→5 顺序落地）

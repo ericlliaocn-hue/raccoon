@@ -14,6 +14,7 @@ from typing import Any
 
 import structlog
 
+from src.channels.normalizer import ChannelNormalizer
 from src.config import RaccoonConfig
 from src.eventbus.bus import EventBus
 from src.eventbus.events import EventType, make_event
@@ -74,6 +75,12 @@ class GatewayInbound:
 
         # 构建事件
         conv_id = conversation_id or f"gateway_{source}"
+        normalized = ChannelNormalizer.from_gateway_payload(
+            source=source,
+            text=text,
+            conversation_id=conv_id,
+            extra=extra or {},
+        )
         event = make_event(
             EventType.USER_MESSAGE,
             conversation_id=conv_id,
@@ -81,6 +88,7 @@ class GatewayInbound:
             payload={
                 "text": text,
                 "source": source,
+                "channel_event": normalized.model_dump(mode="json"),
                 **(extra or {}),
             },
         )
