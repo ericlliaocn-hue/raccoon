@@ -250,3 +250,19 @@ def get_session_manager() -> BrowserSessionManager:
     if _instance is None:
         _instance = BrowserSessionManager()
     return _instance
+
+
+async def shutdown_session_manager(*, reset_instance: bool = True) -> None:
+    """关闭全局会话管理器并按需重置单例。
+
+    用于 CLI/benchmark 多轮 asyncio.run 场景，避免跨事件循环复用旧会话对象。
+    """
+    global _instance
+    manager = _instance
+    if manager is None:
+        return
+    try:
+        await manager.shutdown()
+    finally:
+        if reset_instance:
+            _instance = None

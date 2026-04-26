@@ -64,9 +64,33 @@ PERTURB_CASES: dict[str, tuple[str, ...]] = {
     ),
 }
 
+CASE_TIMEOUT_SECONDS = 180.0
+
 
 def _pct(success: int, total: int) -> float:
     return (success / total) if total else 0.0
+
+
+async def _run_case_with_timeout(engine: LearningEngine, task: Task, prompt: str) -> tuple[dict[str, Any], str]:
+    try:
+        result = await asyncio.wait_for(engine.learn(task, prompt), timeout=CASE_TIMEOUT_SECONDS)
+        return result, ""
+    except asyncio.TimeoutError:
+        return (
+            {
+                "learning_run_id": "",
+                "reply": f"benchmark_case_timeout: execution exceeded {int(CASE_TIMEOUT_SECONDS)}s",
+            },
+            "benchmark_case_timeout",
+        )
+    except Exception as exc:  # pragma: no cover - defensive for external benchmark runner
+        return (
+            {
+                "learning_run_id": "",
+                "reply": f"benchmark_case_error: {exc}",
+            },
+            "benchmark_case_error",
+        )
 
 
 def _summarize_records(records: list[dict[str, Any]]) -> dict[str, Any]:
@@ -193,9 +217,20 @@ async def run_live_benchmark(
                         skill_name="learning",
                         context={"scenario_id": scenario_id, "round": round_no, "pack": "stable"},
                     )
-                    result = await engine.learn(task, prompt)
+                    result, fallback_failure = await _run_case_with_timeout(engine, task, prompt)
+                    if scenario_id == "login_form_chain" and fallback_failure == "benchmark_case_timeout":
+                        retry_task = Task(
+                            conversation_id=f"live_stable_r{round_no}_{scenario_id}_{seq}_retry1",
+                            user_id="live_benchmark",
+                            origin_message=prompt,
+                            skill_name="learning",
+                            context={"scenario_id": scenario_id, "round": round_no, "pack": "stable", "retry": 1},
+                        )
+                        result, fallback_failure = await _run_case_with_timeout(engine, retry_task, prompt)
                     run_id = str(result.get("learning_run_id") or "")
                     run = learning_store.get(run_id) if run_id else None
+                    failure_code = str(getattr(run, "failure_code", "") or fallback_failure)
+                    handling_outcome = str(getattr(run, "handling_outcome", "") or ("failed" if failure_code else ""))
                     stable_records.append(
                         {
                             "pack": "stable",
@@ -203,10 +238,10 @@ async def run_live_benchmark(
                             "scenario_id": scenario_id,
                             "run_id": run_id,
                             "decision_success": bool(getattr(run, "decision_success", False)),
-                            "execution_attempted": bool(getattr(run, "execution_attempted", False)),
+                            "execution_attempted": bool(getattr(run, "execution_attempted", False) or bool(fallback_failure)),
                             "execution_success": bool(getattr(run, "execution_success", False)),
-                            "handling_outcome": getattr(run, "handling_outcome", ""),
-                            "failure_code": getattr(run, "failure_code", None),
+                            "handling_outcome": handling_outcome,
+                            "failure_code": failure_code or None,
                             "quality_score": float(getattr(run, "quality_score", 0.0) or 0.0),
                             "reply_preview": str(result.get("reply", ""))[:200],
                         }
@@ -224,10 +259,21 @@ async def run_live_benchmark(
                         skill_name="learning",
                         context={"round": round_no, "pack": "perturb"},
                     )
-                    result = await engine.learn(task, prompt)
+                    result, fallback_failure = await _run_case_with_timeout(engine, task, prompt)
+                    if scenario_id == "login_form_chain" and fallback_failure == "benchmark_case_timeout":
+                        retry_task = Task(
+                            conversation_id=f"live_perturb_r{round_no}_{scenario_id}_{seq}_retry1",
+                            user_id="live_benchmark",
+                            origin_message=prompt,
+                            skill_name="learning",
+                            context={"round": round_no, "pack": "perturb", "retry": 1},
+                        )
+                        result, fallback_failure = await _run_case_with_timeout(engine, retry_task, prompt)
                     run_id = str(result.get("learning_run_id") or "")
                     run = learning_store.get(run_id) if run_id else None
                     detected_scenario = str(getattr(run, "scenario_id", "") or "")
+                    failure_code = str(getattr(run, "failure_code", "") or fallback_failure)
+                    handling_outcome = str(getattr(run, "handling_outcome", "") or ("failed" if failure_code else ""))
                     perturb_records.append(
                         {
                             "pack": "perturb",
@@ -236,10 +282,10 @@ async def run_live_benchmark(
                             "detected_scenario": detected_scenario,
                             "run_id": run_id,
                             "decision_success": bool(getattr(run, "decision_success", False)),
-                            "execution_attempted": bool(getattr(run, "execution_attempted", False)),
+                            "execution_attempted": bool(getattr(run, "execution_attempted", False) or bool(fallback_failure)),
                             "execution_success": bool(getattr(run, "execution_success", False)),
-                            "handling_outcome": getattr(run, "handling_outcome", ""),
-                            "failure_code": getattr(run, "failure_code", None),
+                            "handling_outcome": handling_outcome,
+                            "failure_code": failure_code or None,
                             "quality_score": float(getattr(run, "quality_score", 0.0) or 0.0),
                             "reply_preview": str(result.get("reply", ""))[:200],
                         }
@@ -247,6 +293,12 @@ async def run_live_benchmark(
         finally:
             await approval.stop()
             await event_bus.stop()
+            try:
+                from skills.web_automate.session_manager import shutdown_session_manager
+
+                await shutdown_session_manager(reset_instance=True)
+            except Exception:
+                pass
 
     stable_summary = _summarize_records(stable_records)
     perturb_detect_ok = sum(

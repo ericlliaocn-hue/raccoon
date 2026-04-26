@@ -65,3 +65,24 @@ def test_login_form_chain_contract_keeps_checkpoint_requirement():
     assert ok is False
     assert reason == "execution_contract_checkpoint_missing"
 
+
+def test_login_form_chain_contract_accepts_submit_checkpoint_evidence():
+    ok, reason = evaluate_execution_contract(
+        "login_form_chain",
+        reply="浏览器自动化完成",
+        execution_result={
+            "artifacts": {
+                "checkpoints": [
+                    {
+                        "stage": "after",
+                        "success": True,
+                        "action": "click",
+                        "checkpoint_key": "login_submit",
+                        "url": "https://httpbin.org/forms/post",
+                    }
+                ]
+            }
+        },
+    )
+    assert ok is True
+    assert reason is None

@@ -18,6 +18,7 @@ import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any
+from urllib.parse import quote
 
 import structlog
 
@@ -217,12 +218,23 @@ class Executor:
             return "错误：路由结果缺少 skill_name"
 
         origin_text = str(event.payload.get("text", "") or "")
+        route_params = dict(route.params or {})
 
-        if skill_name == "shell_exec" and not self._has_concrete_shell_command(origin_text):
-            return (
-                "需要补充具体命令或脚本路径，我不会根据模糊描述自行编命令。\n\n"
-                "例如：`执行 df -h`、`执行 du -sh ~/Downloads`、`执行 bash /path/to/archive.sh`。"
+        if skill_name == "shell_exec":
+            merged_probe = " ".join(
+                part for part in (origin_text, str(route_params.get("rest", "") or "")) if part
             )
+            if not self._has_concrete_shell_command(merged_probe):
+                template_cmd = self._infer_shell_template_command(origin_text)
+                if template_cmd:
+                    route_params["rest"] = template_cmd
+                    route_params["auto_command_template"] = True
+                    route = route.model_copy(update={"params": route_params})
+                else:
+                    return (
+                        "需要补充具体命令或脚本路径，我不会根据模糊描述自行编命令。\n\n"
+                        "例如：`执行 df -h`、`执行 du -sh ~/Downloads`、`执行 bash /path/to/archive.sh`。"
+                    )
 
         preflight_reply, normalized_params = self._preflight_skill_request(
             skill_name,
@@ -897,6 +909,8 @@ confidence 是 0.0-1.0 的小数；只有非常确定时才高于 0.7。"""
 
     def _has_concrete_shell_command(self, text: str) -> bool:
         value = str(text or "").strip()
+        if self._infer_shell_template_command(value):
+            return True
         concrete_patterns = (
             r"\b(ls|pwd|df|du|cat|tail|grep|find|python|python3|bash|sh|git|npm|pnpm|uv|pytest|ruff)\b",
             r"\.sh\b",
@@ -904,6 +918,52 @@ confidence 是 0.0-1.0 的小数；只有非常确定时才高于 0.7。"""
             r"`[^`]+`",
         )
         return any(re.search(pattern, value, re.IGNORECASE) for pattern in concrete_patterns)
+
+    def _infer_shell_template_command(self, text: str) -> str:
+        normalized = normalize_intent_phrase(text)
+        templates = (
+            (("磁盘", "空间"), "df -h"),
+            (("磁盘", "占用"), "du -sh ~/Downloads"),
+            (("当前", "目录"), "pwd"),
+            (("目录", "列表"), "ls -la"),
+            (("进程", "列表"), "ps aux | head -n 20"),
+            (("网络", "连通"), "ping -c 4 8.8.8.8"),
+        )
+        for tokens, command in templates:
+            if all(token in normalized for token in tokens):
+                return command
+        return ""
+
+    def _extract_monitor_query_target(self, text: str) -> str:
+        value = str(text or "").strip()
+        if not value:
+            return ""
+        norm = normalize_intent_phrase(value)
+        if not any(token in norm for token in ("监控", "盯", "降价", "库存", "比价")):
+            return ""
+        if any(token in norm for token in ("这个商品", "那个商品", "这个", "那个")):
+            return ""
+
+        patterns = (
+            r"(?:监控|盯(?:一下)?|关注)\s*([\u4e00-\u9fa5A-Za-z0-9+_. -]{2,48})",
+            r"(?:商品|型号|机型)\s*[:：=]?\s*([\u4e00-\u9fa5A-Za-z0-9+_. -]{2,48})",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, value, re.IGNORECASE)
+            if not match:
+                continue
+            candidate = str(match.group(1) or "").strip(" ，,。;；")
+            if candidate and candidate not in {"价格", "库存", "监控", "提醒"}:
+                return candidate
+
+        fallback = re.search(
+            r"\b(iPhone|MacBook|ThinkPad|RTX|AMD|Intel|华为|小米|联想|索尼|三星|显示器|显卡|手机)\b[^\n，。；;]{0,20}",
+            value,
+            re.IGNORECASE,
+        )
+        if fallback:
+            return fallback.group(0).strip(" ，,。;；")
+        return ""
 
     def _preflight_skill_request(
         self,
@@ -939,6 +999,14 @@ confidence 是 0.0-1.0 的小数；只有非常确定时才高于 0.7。"""
                 )
             normalized.setdefault("rest", url)
             return None, normalized
+
+        if skill_name == "shell_exec":
+            command = str(normalized.get("rest", "") or "").strip()
+            if not command:
+                template = self._infer_shell_template_command(content)
+                if template:
+                    normalized["rest"] = template
+                    normalized["auto_command_template"] = True
 
         if skill_name == "change_detector":
             normalized, clarification = self._prepare_change_detector_params(normalized, content)
@@ -982,6 +1050,12 @@ confidence 是 0.0-1.0 的小数；只有非常确定时才高于 0.7。"""
                 normalized.setdefault("url", target_url)
             elif target_path:
                 normalized.setdefault("path", target_path)
+            else:
+                monitor_query = self._extract_monitor_query_target(text)
+                if monitor_query:
+                    normalized.setdefault("url", f"https://search.jd.com/Search?keyword={quote(monitor_query)}")
+                    normalized.setdefault("target", monitor_query)
+                    normalized.setdefault("target_hint", "query")
             if self._has_placeholder_target(str(normalized.get("url", "")) or text):
                 return (
                     normalized,

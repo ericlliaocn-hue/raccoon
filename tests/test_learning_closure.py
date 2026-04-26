@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -370,6 +371,20 @@ async def test_shell_exec_requires_concrete_command_before_approval():
     assert "具体命令" in reply
 
 
+def test_shell_exec_preflight_autofills_template_command():
+    executor = Executor.__new__(Executor)
+    reply, normalized = Executor._preflight_skill_request(
+        executor,
+        "shell_exec",
+        "请先审批，再执行磁盘空间检查命令并返回结果。",
+        {},
+    )
+
+    assert reply is None
+    assert normalized["rest"] == "df -h"
+    assert normalized["auto_command_template"] is True
+
+
 @pytest.mark.asyncio
 async def test_web_browse_blocks_placeholder_url_before_execution():
     executor = Executor.__new__(Executor)
@@ -638,10 +653,12 @@ def test_shell_command_detection_handles_english_and_paths(tmp_path: Path):
     engine = LearningEngine(config=_make_config(tmp_path), learning_store=LearningRunStore(_make_config(tmp_path)))
     assert engine._has_concrete_shell_command("run df -h /var/log and send summary") is True
     assert engine._has_concrete_shell_command("帮我处理日志问题") is False
+    assert engine._has_concrete_shell_command("请执行磁盘空间检查命令并返回结果") is True
     assert engine._extract_shell_command("please run `du -sh ~/Downloads` now") == "du -sh ~/Downloads"
     assert engine._extract_shell_command("run /usr/local/bin/backup_logs.sh --tail 20").startswith(
         "/usr/local/bin/backup_logs.sh"
     )
+    assert engine._extract_shell_command("请执行磁盘空间检查命令并返回结果") == "df -h"
 
 
 def test_login_form_target_requires_url_and_action_context(tmp_path: Path):
@@ -667,3 +684,131 @@ def test_build_playbook_params_for_web_automate_contains_stable_actions(tmp_path
     assert any(step["action"] == "type" for step in actions)
     assert any(step["action"] == "upload_file" for step in actions)
     assert actions[-1]["action"] == "screenshot"
+
+
+def test_build_login_chain_actions_for_heroku_contains_recovery_assertions(tmp_path: Path):
+    engine = LearningEngine(config=_make_config(tmp_path), learning_store=LearningRunStore(_make_config(tmp_path)))
+    actions = engine._build_login_chain_actions(
+        "后台模式 登录 https://the-internet.herokuapp.com/login ，账号 tomsmith 密码 SuperSecretPassword! 登录后截图。"
+    )
+
+    submit = next(step for step in actions if step.get("checkpoint_key") == "login_submit")
+    assert "/authenticate" in submit["wait_request_contains"]
+    assert "/login" in submit["expected_url_not_contains"]
+    assert any("secure area" in token.lower() for token in submit["assert_text_contains"])
+    assert actions[0]["url"] == "https://the-internet.herokuapp.com/login"
+    assert not any(step.get("checkpoint_key") == "final_submit" for step in actions)
+
+
+def test_extract_url_like_strips_trailing_chinese_punctuation(tmp_path: Path):
+    engine = LearningEngine(config=_make_config(tmp_path), learning_store=LearningRunStore(_make_config(tmp_path)))
+    message = "打开 https://the-internet.herokuapp.com/login，完成登录并继续提交流程，失败可从 checkpoint 续跑。"
+    assert engine._extract_url_like(message) == "https://the-internet.herokuapp.com/login"
+
+
+def test_extract_file_path_like_ignores_http_url_path(tmp_path: Path):
+    engine = LearningEngine(config=_make_config(tmp_path), learning_store=LearningRunStore(_make_config(tmp_path)))
+    message = "后台模式 登录 https://the-internet.herokuapp.com/login ，账号 tomsmith 密码 SuperSecretPassword! 登录后截图。"
+    assert engine._extract_file_path_like(message) is None
+    assert engine._extract_file_path_like("上传 /tmp/demo.pdf 并提交") == "/tmp/demo.pdf"
+
+
+def test_httpbin_login_actions_inject_default_credentials_when_missing(tmp_path: Path):
+    engine = LearningEngine(config=_make_config(tmp_path), learning_store=LearningRunStore(_make_config(tmp_path)))
+    actions = engine._build_login_chain_actions("登录 https://httpbin.org/forms/post ，填表后提交并截图。")
+    typed_values = [step.get("text") for step in actions if step.get("action") == "type"]
+    assert "raccoon-benchmark" in typed_values
+    assert "13800000000" in typed_values
+    submit = next(step for step in actions if step.get("checkpoint_key") == "login_submit")
+    assert "form button" in submit.get("selector", "")
+
+
+@pytest.mark.asyncio
+async def test_execute_learned_skill_honors_skill_timeout_seconds(tmp_path: Path):
+    class _SlowRunner:
+        async def run(self, task, params):
+            await asyncio.sleep(1.2)
+            return {"reply": "ok", "files": []}
+
+    class _Vault:
+        def get_skill_runner(self, name):
+            return _SlowRunner()
+
+        def get_skill(self, name):
+            return SkillMetadata(name=name, timeout_seconds=1)
+
+    config = _make_config(tmp_path)
+    store = LearningRunStore(config)
+    engine = LearningEngine(config=config, vault_manager=_Vault(), learning_store=store)
+    result = await engine._execute_learned_skill(
+        Task(
+            conversation_id="c-timeout",
+            user_id="u-timeout",
+            origin_message="后台模式 登录 https://the-internet.herokuapp.com/login 并截图",
+            skill_name="web_automate",
+        ),
+        "web_automate",
+        "后台模式 登录 https://the-internet.herokuapp.com/login 并截图",
+        params={"prompt": "后台模式 登录 https://the-internet.herokuapp.com/login 并截图"},
+    )
+
+    assert result["success"] is False
+    assert result["error"] == "skill_timeout:web_automate:1s"
+
+
+@pytest.mark.asyncio
+async def test_login_playbook_auto_recovers_after_first_timeout(tmp_path: Path):
+    class _Vault:
+        def get_skill_runner(self, name):
+            return object() if name == "web_automate" else None
+
+        def get_skill(self, name):
+            return SkillMetadata(name=name, timeout_seconds=60)
+
+    config = _make_config(tmp_path)
+    store = LearningRunStore(config)
+    engine = LearningEngine(config=config, vault_manager=_Vault(), learning_store=store)
+    engine._execute_learned_skill = AsyncMock(
+        side_effect=[
+            {"success": False, "error": "skill_timeout:web_automate:5s"},
+            {
+                "success": True,
+                "reply": "✅ 登录成功，checkpoint 已恢复。",
+                "files": [],
+                "artifacts": {"checkpoints": [{"step_index": 2, "stage": "after", "success": True}]},
+            },
+        ]
+    )
+
+    message = "后台模式 登录 https://the-internet.herokuapp.com/login ，账号 tomsmith 密码 SuperSecretPassword! 登录后截图。"
+    result = await engine.learn(
+        Task(
+            conversation_id="c-recover",
+            user_id="u-recover",
+            origin_message=message,
+            skill_name="learning",
+        ),
+        message,
+    )
+
+    run = store.get(result["learning_run_id"])
+    assert run is not None
+    assert run.execution_success is True
+    assert run.artifacts["playbook_recovery"]["attempted"] is True
+    assert run.artifacts["playbook_recovery"]["retry_success"] is True
+    assert engine._execute_learned_skill.await_count == 2
+    assert "自动从 checkpoint 恢复" in result["reply"]
+
+
+def test_build_playbook_params_for_change_detector_supports_query_target(tmp_path: Path):
+    engine = LearningEngine(config=_make_config(tmp_path), learning_store=LearningRunStore(_make_config(tmp_path)))
+    params, reason = engine._build_playbook_exec_params(
+        skill_name="change_detector",
+        user_message="盯一下 iPhone 16 Pro 256G 的价格变化，有波动提醒我。",
+    )
+
+    assert reason is None
+    assert params["subcmd"] == "snapshot"
+    assert params["target_hint"] == "query"
+    assert "search.jd.com/Search?keyword=" in params["url"]
+    assert "iPhone 16 Pro 256G" in params["target"]

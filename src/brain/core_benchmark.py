@@ -31,6 +31,10 @@ CORE_BENCHMARK_THRESHOLDS = {
     "decision_success_rate": 0.95,
     "execution_success_rate": 0.85,
     "browser_chain_execution_success_rate": 0.90,
+    "open_world_execution_success_rate": 0.80,
+    "browser_long_chain_success_rate": 0.90,
+    "false_clarification_rate_max": 0.05,
+    "complete_input_auto_execute_rate": 0.90,
     "stuck_rate_max": 0.01,
     # 兼容旧报告字段
     "first_pass_rate": 0.70,

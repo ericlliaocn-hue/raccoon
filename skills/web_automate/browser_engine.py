@@ -40,7 +40,7 @@ _LOGIN_URL_TOKENS = ("/login", "signin", "passport", "auth", "oauth")
 _LOGIN_MESSAGE_TOKENS = ("登录", "signin", "expired", "unauthorized", "forbidden")
 _LOGIN_SUCCESS_TOKENS = ("登录成功", "sign in success", "signed in", "authenticated")
 _AUTH_FAILURE_STATUSES = {401, 403, 407, 419, 440}
-_INTERACTIVE_LOGIN_ACTIONS = {"open", "type", "click", "press_key"}
+_INTERACTIVE_LOGIN_ACTIONS = {"open", "type", "click", "press_key", "wait_for_selector"}
 
 
 def _detect_chrome_path() -> str:
@@ -680,8 +680,55 @@ class BrowserEngine:
             await self._page.wait_for_selector(selector, timeout=timeout_ms, state="visible")
         if action_type in {"open", "click", "press_key"}:
             await self._page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+            if bool(act.get("wait_network_idle", True)):
+                try:
+                    await self._page.wait_for_load_state("networkidle", timeout=min(timeout_ms, 5000))
+                except Exception:
+                    pass
         # wait-stable
         await self._page.wait_for_timeout(min(500, max(120, timeout_ms // 40)))
+
+    async def _wait_request_signal(self, act: dict[str, Any], timeout_ms: int) -> None:
+        waits = act.get("wait_request_contains")
+        if not waits:
+            return
+        tokens = [str(waits)] if isinstance(waits, str) else [str(item) for item in waits if item]
+        if not tokens:
+            return
+        deadline = time.time() + max(0.3, timeout_ms / 1000)
+        while time.time() < deadline:
+            recent = list(self._recent_network_events)[-40:]
+            if any(
+                any(token in str(item.get("url") or "") for token in tokens)
+                and int(item.get("status") or 200) < 500
+                for item in recent
+            ):
+                return
+            await asyncio.sleep(0.12)
+        raise RuntimeError(f"request_signal_timeout(tokens={tokens})")
+
+    async def _looks_like_login_page(self) -> bool:
+        if not self._page:
+            return False
+        try:
+            return bool(
+                await self._page.evaluate(
+                    """() => {
+                        const hasPassword = !!document.querySelector("input[type='password']");
+                        const forms = Array.from(document.querySelectorAll("form"));
+                        const bodyText = (document.body?.innerText || "").toLowerCase();
+                        const hasLoginText =
+                          bodyText.includes("login") ||
+                          bodyText.includes("sign in") ||
+                          bodyText.includes("账号") ||
+                          bodyText.includes("密码") ||
+                          bodyText.includes("登录");
+                        return hasPassword && (forms.length > 0 || hasLoginText);
+                    }"""
+                )
+            )
+        except Exception:
+            return False
 
     async def _should_block_for_login(self, action_type: str) -> tuple[bool, str]:
         if not self._page:
@@ -712,6 +759,14 @@ class BrowserEngine:
                     reason="login_url_signal",
                 )
                 return True, "当前页面在登录入口，建议先完成登录后再继续"
+
+        if action_type not in _INTERACTIVE_LOGIN_ACTIONS and await self._looks_like_login_page():
+            self._set_domain_health(
+                domain,
+                "suspected_expired",
+                reason="login_dom_signal",
+            )
+            return True, "检测到登录页 DOM 信号，需先完成登录"
         return False, ""
 
     def _sanitize_action_payload(self, act: dict[str, Any]) -> dict[str, Any]:
@@ -928,6 +983,11 @@ class BrowserEngine:
             screenshot = data.get("path")
             if not screenshot or not Path(str(screenshot)).exists():
                 return False, "screenshot_file_missing"
+        try:
+            request_timeout = max(500, int(act.get("timeout_ms", act.get("timeout", 12000))))
+            await self._wait_request_signal(act, timeout_ms=request_timeout)
+        except Exception as exc:
+            return False, str(exc)
         if self._page is not None:
             current_url = str(self._page.url or "")
             if action_type in {"open", "click", "press_key"} and current_url.startswith("about:blank"):

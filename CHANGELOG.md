@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.11] - 2026-04-25
+
+### 🌍 开放世界泛化 + 执行覆盖率冲刺（按 1→5 顺序落地）
+
+> 目标：把“复杂外站可执行性”和“完整输入默认执行覆盖”变成可量化门禁，而不是主观体感。
+
+- **版本先行同步**：`pyproject.toml`、`src/__init__.py`、静态资源版本参数与 UI 文案统一到 `0.5.11`
+- **门槛固化**：新增开放世界门禁指标 `open_world_execution_success_rate`、`browser_long_chain_success_rate`、`false_clarification_rate_max`、`complete_input_auto_execute_rate`
+- **开放世界压测包**：新增 `open_world_pack`（30+ 样本）和 `benchmark open_world`，输出场景识别、执行成功、误追问与 mismatch 样本
+- **浏览器链路再硬化**：补充动态 selector 候选、请求级等待信号和登录页探测，提升长链路连续执行稳定性
+- **执行覆盖率补强**：价格监控支持“商品关键词目标”自动补参；远程执行支持常见命令模板归一，减少可执行请求被误追问
+- **一键门禁收口**：`benchmark all` 联合输出 `core + live + open_world` 报告，用于发布前统一验收
+
 ## [0.5.10] - 2026-04-25
 
 ### 🌐 浏览器链路硬化（登录态信号 + checkpoint 恢复 + 失败证据增强）

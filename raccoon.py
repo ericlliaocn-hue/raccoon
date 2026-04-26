@@ -15,6 +15,8 @@
   raccoon doctor                   # 诊断检查
   raccoon benchmark core           # 核心场景夹具基准报告
   raccoon benchmark live           # 真实外站压测（稳定包+扰动包）
+  raccoon benchmark open_world     # 开放世界样本压测（30+场景）
+  raccoon benchmark all            # 一键运行 core + live + open_world
 """
 
 from __future__ import annotations
@@ -90,7 +92,13 @@ def main() -> None:
 
     # ─── benchmark ────────────────────────────────────────────
     p_benchmark = sub.add_parser("benchmark", help="基准测试与报告")
-    p_benchmark.add_argument("suite", nargs="?", default="core", choices=["core", "live"], help="基准套件")
+    p_benchmark.add_argument(
+        "suite",
+        nargs="?",
+        default="core",
+        choices=["core", "live", "open_world", "all"],
+        help="基准套件",
+    )
     p_benchmark.add_argument("--json", action="store_true", help="输出 JSON")
     p_benchmark.add_argument(
         "--store-only",
@@ -99,6 +107,7 @@ def main() -> None:
     )
     p_benchmark.add_argument("--stable-rounds", type=int, default=5, help="live 稳定包轮数")
     p_benchmark.add_argument("--perturb-rounds", type=int, default=3, help="live 扰动包轮数")
+    p_benchmark.add_argument("--open-world-rounds", type=int, default=1, help="open_world 轮数")
 
     # ─── schedule ─────────────────────────────────────────────
     p_schedule = sub.add_parser("schedule", help="定时任务管理")
@@ -719,7 +728,7 @@ def _cmd_doctor() -> None:
 
 def _cmd_benchmark(args) -> None:
     """核心场景基准报告。默认跑双包夹具基准并输出 mismatch。"""
-    if args.suite not in {"core", "live"}:
+    if args.suite not in {"core", "live", "open_world", "all"}:
         print(f"❌ 不支持的基准套件: {args.suite}")
         sys.exit(1)
 
@@ -787,6 +796,118 @@ def _cmd_benchmark(args) -> None:
                     f"actual={item.get('detected_scenario')}"
                 )
         sys.exit(0 if overall.get("pass") else 2)
+
+    if args.suite == "open_world":
+        from src.brain.open_world_benchmark_runner import run_open_world_benchmark_sync
+
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            report = run_open_world_benchmark_sync(
+                config,
+                rounds=max(1, int(args.open_world_rounds)),
+            )
+        if report.get("error"):
+            if args.json:
+                print(json.dumps(report, ensure_ascii=False, indent=2))
+            else:
+                print(f"❌ {report.get('message') or report.get('error')}")
+            sys.exit(2)
+
+        if args.json:
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            sys.exit(0 if report.get("overall", {}).get("pass") else 2)
+
+        overall = report.get("overall", {})
+        print("🌎 开放世界压测报告（open_world）\n")
+        print(f"  总运行数: {overall.get('total_runs', 0)}")
+        print(f"  完整输入样本: {overall.get('complete_runs', 0)}")
+        print(f"  决策成功率: {overall.get('decision_success_rate', 0.0) * 100:.1f}%")
+        print(f"  开放世界执行成功率: {overall.get('open_world_execution_success_rate', 0.0) * 100:.1f}%")
+        print(f"  浏览器长链路成功率: {overall.get('browser_long_chain_success_rate', 0.0) * 100:.1f}%")
+        print(f"  误追问率(false clarification): {overall.get('false_clarification_rate', 0.0) * 100:.1f}%")
+        print(f"  完整输入自动执行率: {overall.get('complete_input_auto_execute_rate', 0.0) * 100:.1f}%")
+        print(f"  场景识别准确率: {overall.get('scenario_detect_accuracy', 0.0) * 100:.1f}%")
+        print(f"  发布门禁: {'✅ 通过' if overall.get('pass') else '❌ 未通过'}")
+        if report.get("failed_samples"):
+            print("\n执行失败样本 Top10:")
+            for item in report["failed_samples"][:10]:
+                print(
+                    f"  - [{item.get('case_id')}] {item.get('scenario_id')} "
+                    f"code={item.get('failure_code')} outcome={item.get('handling_outcome')}"
+                )
+        if report.get("mismatch_samples"):
+            print("\n识别偏差样本 Top10:")
+            for item in report["mismatch_samples"][:10]:
+                print(
+                    f"  - [{item.get('case_id')}] expected={item.get('expected_scenario')} "
+                    f"actual={item.get('detected_scenario')}"
+                )
+        sys.exit(0 if overall.get("pass") else 2)
+
+    if args.suite == "all":
+        from src.brain.core_benchmark_runner import run_core_benchmark_packs
+        from src.brain.live_benchmark_runner import run_live_benchmark
+        from src.brain.open_world_benchmark_runner import run_open_world_benchmark
+
+        async def _run_all_benchmarks() -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
+            core_bundle = await run_core_benchmark_packs(config)
+            live_report = await run_live_benchmark(
+                config,
+                stable_rounds=max(1, int(args.stable_rounds)),
+                perturb_rounds=max(1, int(args.perturb_rounds)),
+            )
+            open_world_report = await run_open_world_benchmark(
+                config,
+                rounds=max(1, int(args.open_world_rounds)),
+            )
+            return core_bundle, live_report, open_world_report
+
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            core_bundle, live_report, open_world_report = asyncio.run(_run_all_benchmarks())
+
+        payload = {
+            "mode": "all",
+            "generated_at": core_bundle.get("generated_at"),
+            "pipelines": {
+                "core": core_bundle,
+                "live": live_report,
+                "open_world": open_world_report,
+            },
+        }
+
+        core_pass = bool(core_bundle.get("benchmark_report", {}).get("overall", {}).get("pass"))
+        live_pass = bool(live_report.get("overall", {}).get("pass")) and not bool(live_report.get("error"))
+        ow_pass = bool(open_world_report.get("overall", {}).get("pass")) and not bool(open_world_report.get("error"))
+        payload["overall_pass"] = core_pass and live_pass and ow_pass
+
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+            sys.exit(0 if payload["overall_pass"] else 2)
+
+        print("🧪 一键门禁报告（core + live + open_world）\n")
+        print(f"  core: {'✅' if core_pass else '❌'}")
+        if live_report.get("error"):
+            print(f"  live: ❌ {live_report.get('message') or live_report.get('error')}")
+        else:
+            print(
+                "  live: "
+                f"{'✅' if live_pass else '❌'} "
+                f"(decision={live_report.get('overall', {}).get('decision_success_rate', 0.0) * 100:.1f}% "
+                f"exec={live_report.get('overall', {}).get('execution_success_rate', 0.0) * 100:.1f}% "
+                f"browser={live_report.get('overall', {}).get('browser_chain_execution_success_rate', 0.0) * 100:.1f}%)"
+            )
+        if open_world_report.get("error"):
+            print(f"  open_world: ❌ {open_world_report.get('message') or open_world_report.get('error')}")
+        else:
+            print(
+                "  open_world: "
+                f"{'✅' if ow_pass else '❌'} "
+                f"(exec={open_world_report.get('overall', {}).get('open_world_execution_success_rate', 0.0) * 100:.1f}% "
+                f"browser={open_world_report.get('overall', {}).get('browser_long_chain_success_rate', 0.0) * 100:.1f}% "
+                f"false_clar={open_world_report.get('overall', {}).get('false_clarification_rate', 0.0) * 100:.1f}% "
+                f"auto_exec={open_world_report.get('overall', {}).get('complete_input_auto_execute_rate', 0.0) * 100:.1f}%)"
+            )
+        print(f"\n  总门禁: {'✅ 通过' if payload['overall_pass'] else '❌ 未通过'}")
+        sys.exit(0 if payload["overall_pass"] else 2)
 
     if args.store_only:
         from src.brain.core_benchmark import build_core_scenario_report

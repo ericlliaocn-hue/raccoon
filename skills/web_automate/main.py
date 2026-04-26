@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sys
@@ -218,7 +219,18 @@ def _clear_persisted_last_run(owner: str, output_dir: Path | None = None) -> Non
         path.unlink()
 
 
-def _infer_resume_step(last_run: dict[str, Any]) -> int | None:
+def _action_fingerprint(action: dict[str, Any]) -> str:
+    try:
+        payload = json.dumps(action, sort_keys=True, ensure_ascii=False)
+    except Exception:
+        payload = str(action)
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
+
+
+def _infer_resume_step(
+    last_run: dict[str, Any],
+    action_list: list[dict[str, Any]] | None = None,
+) -> int | None:
     failed_step = last_run.get("failed_step")
     if isinstance(failed_step, int) and failed_step >= 0:
         return failed_step
@@ -227,6 +239,35 @@ def _infer_resume_step(last_run: dict[str, Any]) -> int | None:
     checkpoints = runtime.get("checkpoints") if isinstance(runtime, dict) else None
     if not isinstance(checkpoints, list) or not checkpoints:
         return None
+
+    if action_list:
+        fp_index: dict[str, int] = {}
+        key_index: dict[str, int] = {}
+        for idx, action in enumerate(action_list):
+            if isinstance(action, dict):
+                fp_index[_action_fingerprint(action)] = idx
+                checkpoint_key = str(action.get("checkpoint_key") or "")
+                if checkpoint_key:
+                    key_index[checkpoint_key] = idx
+
+        matched = -1
+        for checkpoint in checkpoints:
+            if not isinstance(checkpoint, dict):
+                continue
+            if checkpoint.get("stage") != "after" or checkpoint.get("success") is not True:
+                continue
+
+            checkpoint_key = str(checkpoint.get("checkpoint_key") or "")
+            if checkpoint_key and checkpoint_key in key_index:
+                matched = max(matched, key_index[checkpoint_key])
+                continue
+
+            fingerprint = str(checkpoint.get("action_fingerprint") or "")
+            if fingerprint and fingerprint in fp_index:
+                matched = max(matched, fp_index[fingerprint])
+
+        if matched >= 0:
+            return matched + 1
 
     last_success = -1
     for checkpoint in checkpoints:
@@ -270,7 +311,12 @@ def _resolve_resume_plan(
         return action_list, 0, False
 
     prev_actions = last_run.get("action_list")
-    resume_step = _infer_resume_step(last_run)
+    has_explicit_actions = isinstance(params.get("actions"), list) and bool(params.get("actions"))
+    if has_explicit_actions:
+        base_actions = action_list
+    else:
+        base_actions = prev_actions if isinstance(prev_actions, list) and prev_actions else action_list
+    resume_step = _infer_resume_step(last_run, base_actions)
     if not isinstance(resume_step, int) or resume_step < 0:
         return action_list, 0, False
 
@@ -279,7 +325,6 @@ def _resolve_resume_plan(
     if not should_resume and not (not params.get("actions") and len(action_list) <= 1):
         return action_list, 0, False
 
-    base_actions = prev_actions if isinstance(prev_actions, list) and prev_actions else action_list
     if resume_step >= len(base_actions):
         return action_list, 0, False
     return base_actions[resume_step:], resume_step, resume_step > 0

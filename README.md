@@ -161,6 +161,8 @@ raccoon logs --audit    # 审计日志
 ### 0.5.x 发布节奏与基线
 
 - 路线图：`docs/roadmap.md`（`0.5.3 -> 0.5.8` 周更）
+- 分段压测指南（可关机续跑）：`docs/soak-mobile-runbook.md`
+- 分段压测脚本：`scripts/soak_segment.sh`
 - 核心场景离线样本包：`benchmarks/core/offline_sample_pack.json`
 - 核心场景真实任务样本包：`benchmarks/core/real_task_sample_pack.json`
 - 发布报告模板：`benchmarks/core/baseline_report_template.md`

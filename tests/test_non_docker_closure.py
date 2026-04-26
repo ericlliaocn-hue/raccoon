@@ -597,3 +597,163 @@ async def test_browser_engine_reliable_execution_includes_trace():
     assert trace.get("attempt_count") == 1
     assert trace.get("retries") == 1
     assert len(trace.get("attempts", [])) == 1
+
+
+@pytest.mark.asyncio
+async def test_actions_dynamic_selector_fallback_for_plain_text(tmp_path):
+    from skills.web_automate.actions import Actions
+
+    class _Page:
+        async def wait_for_selector(self, selector, timeout=1000, state="visible"):
+            # 仅 text=xxx 视为可命中，模拟陌生站点动态 selector 场景
+            if selector.startswith("text="):
+                return None
+            raise RuntimeError("selector_not_found")
+
+    actions = Actions(_Page(), tmp_path)
+    selected = await actions._try_selectors("登录")
+    assert selected == "text=登录"
+
+
+@pytest.mark.asyncio
+async def test_browser_engine_wait_request_signal_uses_recent_network_events():
+    from skills.web_automate.browser_engine import BrowserEngine
+
+    engine = BrowserEngine("headless")
+    engine._recent_network_events.append(
+        {
+            "timestamp": time.time(),
+            "domain": "fixture.local",
+            "url": "https://fixture.local/api/submit",
+            "status": 200,
+            "kind": "response",
+        }
+    )
+    await engine._wait_request_signal({"wait_request_contains": "api/submit"}, timeout_ms=400)
+
+
+@pytest.mark.asyncio
+async def test_browser_engine_allows_wait_for_selector_on_login_page():
+    from skills.web_automate.browser_engine import BrowserEngine
+
+    class _Page:
+        url = "https://fixture.local/login"
+
+    engine = BrowserEngine("headless")
+    engine._page = _Page()
+
+    blocked, reason = await engine._should_block_for_login("wait_for_selector")
+
+    assert blocked is False
+    assert reason == ""
+
+
+@pytest.mark.asyncio
+async def test_browser_engine_wait_request_signal_checked_after_action():
+    from skills.web_automate.actions import ActionResult
+    from skills.web_automate.browser_engine import BrowserEngine
+
+    class _Page:
+        url = "https://fixture.local/form"
+
+        async def wait_for_selector(self, selector, timeout=1000, state="visible"):
+            return None
+
+        async def wait_for_load_state(self, state="domcontentloaded", timeout=1000):
+            return None
+
+        async def wait_for_timeout(self, ms):
+            return None
+
+    engine = BrowserEngine("headless")
+    engine._page = _Page()
+
+    async def _fake_action(act, action_type):
+        engine._recent_network_events.append(
+            {
+                "timestamp": time.time(),
+                "domain": "fixture.local",
+                "url": "https://fixture.local/api/submit",
+                "status": 200,
+                "kind": "response",
+            }
+        )
+        return ActionResult(success=True, message="ok", data={})
+
+    engine._do_action = _fake_action  # type: ignore[assignment]
+
+    result = await engine._execute_action_reliable(
+        1,
+        {
+            "action": "click",
+            "selector": "#submit",
+            "wait_request_contains": ["/api/submit"],
+            "timeout_ms": 800,
+            "retries": 0,
+        },
+        "click",
+    )
+
+    assert result.success is True
+
+
+def test_web_automate_resume_uses_checkpoint_fingerprint_alignment():
+    from types import SimpleNamespace
+
+    from skills.web_automate.main import _action_fingerprint, _resolve_resume_plan
+
+    previous_actions = [
+        {"action": "open", "url": "https://fixture.local/login"},
+        {"action": "type", "selector": "#username", "text": "demo"},
+        {"action": "click", "selector": "#submit", "checkpoint_key": "submit"},
+        {"action": "screenshot"},
+    ]
+    current_actions = [
+        {"action": "open", "url": "https://fixture.local/login"},
+        {"action": "type", "selector": "#username", "text": "demo"},
+        {"action": "wait", "ms": 500},
+        {"action": "click", "selector": "#submit", "checkpoint_key": "submit"},
+        {"action": "screenshot"},
+    ]
+
+    session = SimpleNamespace(
+        last_run={
+            "owner": "conv-fp",
+            "action_list": previous_actions,
+            "runtime": {
+                "checkpoints": [
+                    {
+                        "step_index": 0,
+                        "stage": "after",
+                        "success": True,
+                        "action_fingerprint": _action_fingerprint(previous_actions[0]),
+                    },
+                    {
+                        "step_index": 1,
+                        "stage": "after",
+                        "success": True,
+                        "action_fingerprint": _action_fingerprint(previous_actions[1]),
+                    },
+                    {
+                        "step_index": 2,
+                        "stage": "after",
+                        "success": True,
+                        "action_fingerprint": _action_fingerprint(previous_actions[2]),
+                        "checkpoint_key": "submit",
+                    },
+                ]
+            },
+        }
+    )
+
+    actions, resume_from, resumed = _resolve_resume_plan(
+        origin="继续",
+        params={"actions": current_actions},
+        action_list=current_actions,
+        session=session,
+        owner="conv-fp",
+    )
+
+    assert resumed is True
+    assert resume_from == 4
+    assert actions == current_actions[4:]

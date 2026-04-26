@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -28,23 +29,64 @@ class Actions:
         self._output_dir = output_dir
         self._output_dir.mkdir(parents=True, exist_ok=True)
 
+    def _looks_like_css_selector(self, value: str) -> bool:
+        token = str(value or "").strip()
+        if not token:
+            return False
+        if token.startswith(("text=", "xpath=", "css=")):
+            return True
+        css_markers = ("#", ".", "[", "]", ">", ":", "=", "input", "button", "a", "div", "span")
+        if any(marker in token for marker in css_markers):
+            return True
+        # 纯字母单词（如 submit）容易是业务文案，不当作 CSS
+        if re.fullmatch(r"[a-zA-Z][\w-]*", token):
+            return False
+        return False
+
+    def _selector_variants(self, selector: str) -> list[str]:
+        token = str(selector or "").strip()
+        if not token:
+            return []
+        if self._looks_like_css_selector(token):
+            return [token]
+
+        safe_single = token.replace("'", "\\'")
+        variants = [
+            f"text={token}",
+            f"button:has-text('{safe_single}')",
+            f"[role='button']:has-text('{safe_single}')",
+            f"a:has-text('{safe_single}')",
+            f"label:has-text('{safe_single}')",
+            f"input[placeholder*='{safe_single}']",
+        ]
+        return variants
+
+    def _selector_candidates(self, selector: str) -> list[str]:
+        if "," in selector:
+            base = [s.strip() for s in selector.split(",") if s.strip()]
+        else:
+            base = [selector.strip()]
+
+        candidates: list[str] = []
+        seen: set[str] = set()
+        for item in base:
+            for variant in self._selector_variants(item):
+                if variant and variant not in seen:
+                    seen.add(variant)
+                    candidates.append(variant)
+        return candidates
+
     async def _try_selectors(self, selector: str, timeout: int = 10000) -> str:
         """逗号分隔的 selector 列表，依次尝试，返回第一个匹配的
 
         优先等待 visible，如果超时则回退到 attached（处理百度首页等
         视觉可见但 DOM 标记为 hidden 的特殊情况）
         """
-        # 如果只有一个选择器，直接返回
-        if "," not in selector:
-            try:
-                await self._page.wait_for_selector(selector, timeout=timeout, state="visible")
-            except Exception:
-                await self._page.wait_for_selector(selector, timeout=5000, state="attached")
-            return selector
+        candidates = self._selector_candidates(selector)
+        if not candidates:
+            raise ValueError("selector 不能为空")
 
-        # 多个选择器，依次尝试
-        parts = [s.strip() for s in selector.split(",") if s.strip()]
-        for sel in parts:
+        for sel in candidates:
             try:
                 await self._page.wait_for_selector(sel, timeout=3000, state="visible")
                 return sel
@@ -56,12 +98,12 @@ class Actions:
                 except Exception:
                     continue
 
-        # 全部失败，用第一个选择器抛出异常
+        # 全部失败，用第一个候选选择器抛出异常
         try:
-            await self._page.wait_for_selector(parts[0], timeout=timeout, state="visible")
+            await self._page.wait_for_selector(candidates[0], timeout=timeout, state="visible")
         except Exception:
-            await self._page.wait_for_selector(parts[0], timeout=5000, state="attached")
-        return parts[0]
+            await self._page.wait_for_selector(candidates[0], timeout=5000, state="attached")
+        return candidates[0]
 
     # ── 页面导航 ──────────────────────────────────────
 

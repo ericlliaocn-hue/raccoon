@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Image Gen 联调测试</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f0f0f; color: #e0e0e0; min-height: 100vh; display: flex; flex-direction: column; align-items: center; padding: 40px 20px; }
+  h1 { font-size: 24px; margin-bottom: 8px; }
+  .subtitle { color: #888; margin-bottom: 32px; font-size: 14px; }
+  .panel { background: #1a1a1a; border: 1px solid #333; border-radius: 12px; padding: 24px; width: 100%; max-width: 720px; margin-bottom: 24px; }
+  .panel label { display: block; font-size: 13px; color: #aaa; margin-bottom: 6px; }
+  .panel input, .panel textarea, .panel select { width: 100%; background: #111; border: 1px solid #444; border-radius: 8px; padding: 10px 12px; color: #e0e0e0; font-size: 14px; outline: none; }
+  .panel input:focus, .panel textarea:focus { border-color: #6c5ce7; }
+  .panel textarea { resize: vertical; min-height: 80px; }
+  .row { display: flex; gap: 12px; margin-bottom: 12px; }
+  .row > div { flex: 1; }
+  .btn { background: #6c5ce7; color: #fff; border: none; border-radius: 8px; padding: 12px 24px; font-size: 15px; cursor: pointer; width: 100%; transition: background .2s; }
+  .btn:hover { background: #5a4bd1; }
+  .btn:disabled { background: #444; cursor: not-allowed; }
+  .result-area { margin-top: 16px; text-align: center; }
+  .result-area img { max-width: 100%; border-radius: 8px; margin-top: 12px; }
+  .result-area .placeholder { color: #555; padding: 60px 0; font-size: 14px; }
+  .log { background: #111; border: 1px solid #333; border-radius: 8px; padding: 12px; margin-top: 12px; font-family: 'SF Mono', Menlo, monospace; font-size: 12px; color: #888; max-height: 240px; overflow-y: auto; text-align: left; white-space: pre-wrap; word-break: break-all; }
+  .log .err { color: #ff6b6b; }
+  .log .ok { color: #51cf66; }
+  .log .warn { color: #ffd43b; }
+  .provider-tabs { display: flex; gap: 0; margin-bottom: 0; }
+  .provider-tabs button { flex: 1; background: #222; border: 1px solid #444; color: #999; border-radius: 10px 10px 0 0; padding: 12px 20px; font-size: 14px; cursor: pointer; transition: all .2s; border-bottom: none; }
+  .provider-tabs button.active-openai { background: #1a1a2e; color: #6c5ce7; border-color: #6c5ce7; border-bottom-color: #1a1a2e; }
+  .provider-tabs button.active-google { background: #1a2a1a; color: #34d399; border-color: #34d399; border-bottom-color: #1a2a1a; }
+  .tab-panel { border-top-left-radius: 0 !important; border-top-right-radius: 0 !important; }
+  .info { background: #1a1a2e; border: 1px solid #333; border-radius: 8px; padding: 10px 14px; margin-bottom: 16px; font-size: 12px; color: #888; line-height: 1.6; }
+  .info code { color: #6c5ce7; }
+  .info-g { background: #1a2a1a; }
+  .info-g code { color: #34d399; }
+  .size-presets { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+  .size-presets button { background: #222; border: 1px solid #444; color: #ccc; border-radius: 6px; padding: 6px 14px; font-size: 12px; cursor: pointer; }
+  .size-presets button.active { border-color: #6c5ce7; color: #6c5ce7; }
+  .size-presets button.active-g { border-color: #34d399; color: #34d399; }
+  .mode-tabs { display: flex; gap: 8px; margin-bottom: 16px; }
+  .mode-tabs button { background: #222; border: 1px solid #444; color: #ccc; border-radius: 6px; padding: 8px 16px; font-size: 13px; cursor: pointer; }
+  .mode-tabs button.active { border-color: #6c5ce7; color: #6c5ce7; background: #2a2550; }
+  .quality-row { display: flex; gap: 12px; align-items: center; margin-bottom: 12px; }
+  .quality-row label { margin-bottom: 0; }
+  .quality-row select { width: auto; }
+</style>
+</head>
+<body>
+
+<h1>🎨 Image Gen 联调测试</h1>
+<p class="subtitle">OpenAI gpt-image-2 & Google Gemini 双模型对比</p>
+
+<div class="provider-tabs">
+  <button class="active-openai" onclick="switchProvider('openai', this)">OpenAI · gpt-image-2</button>
+  <button onclick="switchProvider('google', this)">Google · gemini-3.1-flash-image</button>
+</div>
+
+<!-- ========== OpenAI Panel ========== -->
+<div class="panel tab-panel" id="panel-openai">
+  <div class="row">
+    <div>
+      <label>API Base URL</label>
+      <input id="oai-baseUrl" value="https://api.apiqik.online">
+    </div>
+    <div>
+      <label>Model</label>
+      <input id="oai-model" value="gpt-image-2">
+    </div>
+  </div>
+  <div>
+    <label>API Key</label>
+    <input id="oai-apiKey" type="password" value="sk-DG9GryA78FbiluRMbIvMyrk9l6RxgNG1Ld7JCBkcT4xbVxPr">
+  </div>
+
+  <div style="margin-top:16px">
+    <div class="mode-tabs">
+      <button class="active" onclick="setOaiMode('chat', this)">Chat Completions（流式）</button>
+      <button onclick="setOaiMode('images', this)">Images Generations</button>
+    </div>
+    <div class="info" id="oai-modeInfo">
+      <code>POST /v1/chat/completions</code>（stream）— 图片通过流式 chunk 返回，拼接 base64
+    </div>
+  </div>
+
+  <label>Prompt</label>
+  <textarea id="oai-prompt">画个千里江山，水墨风格</textarea>
+
+  <div class="size-presets" id="oai-sizes">
+    <button class="active" onclick="setSize('oai','1024x1024',this)">1024×1024</button>
+    <button onclick="setSize('oai','1024x1792',this)">1024×1792</button>
+    <button onclick="setSize('oai','1792x1024',this)">1792×1024</button>
+  </div>
+
+  <div class="quality-row" id="oai-qualityRow" style="display:none">
+    <label>Quality</label>
+    <select id="oai-quality">
+      <option value="standard">standard</option>
+      <option value="hd">hd</option>
+    </select>
+    <label style="margin-left:16px">Response Format</label>
+    <select id="oai-responseFormat">
+      <option value="url">url</option>
+      <option value="b64_json">b64_json</option>
+    </select>
+  </div>
+
+  <button class="btn" id="oai-genBtn" onclick="generateOpenAI()">🚀 生成图片</button>
+
+  <div class="result-area" id="oai-resultArea">
+    <div class="placeholder">输入 Prompt 后点击生成</div>
+  </div>
+  <div class="log" id="oai-log"></div>
+</div>
+
+<!-- ========== Google Panel ========== -->
+<div class="panel tab-panel" id="panel-google" style="display:none">
+  <div class="row">
+    <div>
+      <label>API Base URL</label>
+      <input id="ggl-baseUrl" value="https://api.apiqik.online">
+    </div>
+    <div>
+      <label>Model</label>
+      <input id="ggl-model" value="gemini-3.1-flash-image-preview">
+    </div>
+  </div>
+  <div>
+    <label>API Key</label>
+    <input id="ggl-apiKey" type="password" value="sk-1TwCLWo6hW07GvYTFwIYlWS1ag2b5zQhX1ifYiU411h3vq18">
+  </div>
+
+  <div style="margin-top:16px">
+    <div class="info info-g" id="ggl-modeInfo">
+      <code>POST /v1/chat/completions</code>（stream）— Gemini 原生生图，走 chat 接口，图片通过 inline_data 返回
+    </div>
+  </div>
+
+  <label>Prompt</label>
+  <textarea id="ggl-prompt">画个千里江山，水墨风格</textarea>
+
+  <div class="size-presets" id="ggl-sizes">
+    <button class="active-g" onclick="setSize('ggl','1024x1024',this)">1024×1024</button>
+    <button onclick="setSize('ggl','1024x1792',this)">1024×1792</button>
+    <button onclick="setSize('ggl','1792x1024',this)">1792×1024</button>
+  </div>
+
+  <button class="btn" style="background:#34d399" id="ggl-genBtn" onclick="generateGoogle()">🚀 生成图片</button>
+
+  <div class="result-area" id="ggl-resultArea">
+    <div class="placeholder">输入 Prompt 后点击生成</div>
+  </div>
+  <div class="log" id="ggl-log"></div>
+</div>
+
+<script>
+// ---- Provider Switch ----
+let currentProvider = 'openai';
+
+function switchProvider(provider, btn) {
+  currentProvider = provider;
+  document.querySelectorAll('.provider-tabs button').forEach(b => {
+    b.className = '';
+  });
+  btn.className = provider === 'openai' ? 'active-openai' : 'active-google';
+  document.getElementById('panel-openai').style.display = provider === 'openai' ? '' : 'none';
+  document.getElementById('panel-google').style.display = provider === 'google' ? '' : 'none';
+}
+
+// ---- Size ----
+const sizes = { oai: '1024x1024', ggl: '1024x1024' };
+
+function setSize(prefix, size, btn) {
+  sizes[prefix] = size;
+  const cls = prefix === 'oai' ? 'active' : 'active-g';
+  btn.parentElement.querySelectorAll('button').forEach(b => b.classList.remove('active', 'active-g'));
+  btn.classList.add(cls);
+}
+
+// ---- OpenAI Mode ----
+let oaiMode = 'chat';
+
+function setOaiMode(mode, btn) {
+  oaiMode = mode;
+  btn.parentElement.querySelectorAll('button').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  const info = document.getElementById('oai-modeInfo');
+  const qRow = document.getElementById('oai-qualityRow');
+  if (mode === 'chat') {
+    info.innerHTML = '<code>POST /v1/chat/completions</code>（stream）— 图片通过流式 chunk 返回，拼接 base64';
+    qRow.style.display = 'none';
+  } else {
+    info.innerHTML = '<code>POST /v1/images/generations</code> — 标准 DALL-E 格式，quality: standard/hd';
+    qRow.style.display = 'flex';
+  }
+}
+
+// ---- Logging ----
+function log(prefix, msg, type = '') {
+  const el = document.getElementById(`${prefix}-log`);
+  const ts = new Date().toLocaleTimeString();
+  el.innerHTML += `<span class="${type}">[${ts}] ${msg}</span>\n`;
+  el.scrollTop = el.scrollHeight;
+}
+
+// ---- OpenAI Chat Stream ----
+async function oaiChatStream() {
+  const baseUrl = document.getElementById('oai-baseUrl').value.replace(/\/+$/, '');
+  const apiKey = document.getElementById('oai-apiKey').value;
+  const model = document.getElementById('oai-model').value;
+  const prompt = document.getElementById('oai-prompt').value.trim();
+
+  const body = { stream: true, model, messages: [{ role: 'user', content: prompt }] };
+  log('oai', `Body: ${JSON.stringify(body)}`);
+
+  const t0 = performance.now();
+  const resp = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+    body: JSON.stringify(body),
+  });
+
+  const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+  log('oai', `HTTP ${resp.status} (${elapsed}s)`, resp.ok ? 'ok' : 'err');
+
+  if (!resp.ok) {
+    const err = await resp.json();
+    log('oai', `Error: ${JSON.stringify(err)}`, 'err');
+    throw new Error(err.error?.message || JSON.stringify(err));
+  }
+
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '', fullContent = '', chunkCount = 0;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || !trimmed.startsWith('data:')) continue;
+      const data = trimmed.slice(5).trim();
+      if (data === '[DONE]') { log('oai', `Stream done, ${chunkCount} chunks`, 'ok'); continue; }
+      try {
+        const json = JSON.parse(data);
+        const delta = json.choices?.[0]?.delta;
+        if (delta?.content) {
+          fullContent += delta.content;
+          chunkCount++;
+          if (chunkCount <= 3 || chunkCount % 20 === 0) log('oai', `Chunk #${chunkCount}, len: ${fullContent.length}`, 'ok');
+        }
+      } catch (e) {}
+    }
+  }
+
+  const total = ((performance.now() - t0) / 1000).toFixed(1);
+  log('oai', `Total: ${total}s, content len: ${fullContent.length}`, 'ok');
+  return fullContent;
+}
+
+// ---- OpenAI Images ----
+async function oaiImages() {
+  const baseUrl = document.getElementById('oai-baseUrl').value.replace(/\/+$/, '');
+  const apiKey = document.getElementById('oai-apiKey').value;
+  const model = document.getElementById('oai-model').value;
+  const prompt = document.getElementById('oai-prompt').value.trim();
+  const quality = document.getElementById('oai-quality').value;
+  const responseFormat = document.getElementById('oai-responseFormat').value;
+
+  const body = { model, prompt, n: 1, size: sizes.oai, quality, response_format: responseFormat };
+  log('oai', `Body: ${JSON.stringify(body)}`);
+
+  const t0 = performance.now();
+  const resp = await fetch(`${baseUrl}/v1/images/generations`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+    body: JSON.stringify(body),
+  });
+
+  const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+  log('oai', `HTTP ${resp.status} (${elapsed}s)`, resp.ok ? 'ok' : 'err');
+  const data = await resp.json();
+  if (!resp.ok) { log('oai', `Error: ${JSON.stringify(data)}`, 'err'); throw new Error(data.error?.message || JSON.stringify(data)); }
+
+  log('oai', `Response keys: ${Object.keys(data).join(', ')}`, 'ok');
+  if (data.data?.length > 0) {
+    const item = data.data[0];
+    if (item.b64_json) { log('oai', `b64_json ${item.b64_json.length} chars`, 'ok'); return { type: 'b64', data: item.b64_json }; }
+    if (item.url) { log('oai', `URL: ${item.url}`, 'ok'); return { type: 'url', data: item.url }; }
+  }
+  return { type: 'raw', data: JSON.stringify(data, null, 2) };
+}
+
+// ---- OpenAI Generate ----
+async function generateOpenAI() {
+  const btn = document.getElementById('oai-genBtn');
+  const resultArea = document.getElementById('oai-resultArea');
+  if (!document.getElementById('oai-prompt').value.trim()) { alert('请输入 Prompt'); return; }
+  btn.disabled = true; btn.textContent = '⏳ 生成中...';
+  resultArea.innerHTML = '<div class="placeholder">请求中，图片生成通常 15-60s...</div>';
+  log('oai', '--- 新请求 ---');
+
+  try {
+    if (oaiMode === 'chat') {
+      log('oai', `POST /v1/chat/completions (stream)`);
+      const content = await oaiChatStream();
+      displayChatResult('oai', content, resultArea);
+    } else {
+      log('oai', `POST /v1/images/generations`);
+      const result = await oaiImages();
+      if (result.type === 'b64') resultArea.innerHTML = `<img src="data:image/png;base64,${result.data}" alt="generated">`;
+      else if (result.type === 'url') resultArea.innerHTML = `<img src="${result.data}" alt="generated">`;
+      else resultArea.innerHTML = `<pre style="text-align:left;color:#aaa;font-size:11px;max-height:400px;overflow:auto">${result.data}</pre>`;
+    }
+  } catch (e) {
+    log('oai', `Error: ${e.message}`, 'err');
+    resultArea.innerHTML = `<div class="placeholder" style="color:#ff6b6b">❌ ${e.message}</div>`;
+  } finally {
+    btn.disabled = false; btn.textContent = '🚀 生成图片';
+  }
+}
+
+// ---- Google Gemini Chat Stream ----
+async function gglChatStream() {
+  const baseUrl = document.getElementById('ggl-baseUrl').value.replace(/\/+$/, '');
+  const apiKey = document.getElementById('ggl-apiKey').value;
+  const model = document.getElementById('ggl-model').value;
+  const prompt = document.getElementById('ggl-prompt').value.trim();
+
+  const body = {
+    stream: true,
+    model,
+    messages: [{ role: 'user', content: prompt }],
+  };
+  log('ggl', `Body: ${JSON.stringify(body)}`);
+
+  const t0 = performance.now();
+  const resp = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+    body: JSON.stringify(body),
+  });
+
+  const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+  log('ggl', `HTTP ${resp.status} (${elapsed}s)`, resp.ok ? 'ok' : 'err');
+
+  if (!resp.ok) {
+    const err = await resp.json();
+    log('ggl', `Error: ${JSON.stringify(err)}`, 'err');
+    throw new Error(err.error?.message || JSON.stringify(err));
+  }
+
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '', fullContent = '', chunkCount = 0;
+  // Gemini may return image as inline_data in parts
+  let inlineImages = [];
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || !trimmed.startsWith('data:')) continue;
+      const data = trimmed.slice(5).trim();
+      if (data === '[DONE]') { log('ggl', `Stream done, ${chunkCount} chunks`, 'ok'); continue; }
+      try {
+        const json = JSON.parse(data);
+        const choice = json.choices?.[0];
+        const delta = choice?.delta;
+
+        // Standard text content
+        if (delta?.content) {
+          fullContent += delta.content;
+          chunkCount++;
+          if (chunkCount <= 3 || chunkCount % 20 === 0) log('ggl', `Chunk #${chunkCount}, len: ${fullContent.length}`, 'ok');
+        }
+
+        // Gemini inline_data image (some proxies convert to content with data URI)
+        if (delta?.content && delta.content.includes('data:image')) {
+          log('ggl', 'Found inline image data in content', 'ok');
+        }
+
+        // Check for multipart content (some proxies pass image as separate part)
+        if (delta?.parts) {
+          for (const part of delta.parts) {
+            if (part.inline_data) {
+              log('ggl', `Inline image: ${part.inline_data.mime_type}, ${part.inline_data.data?.length || 0} chars`, 'ok');
+              inlineImages.push(part.inline_data);
+            }
+          }
+        }
+      } catch (e) {}
+    }
+  }
+
+  const total = ((performance.now() - t0) / 1000).toFixed(1);
+  log('ggl', `Total: ${total}s, content len: ${fullContent.length}, inline images: ${inlineImages.length}`, 'ok');
+
+  return { content: fullContent, inlineImages };
+}
+
+// ---- Google Generate ----
+async function generateGoogle() {
+  const btn = document.getElementById('ggl-genBtn');
+  const resultArea = document.getElementById('ggl-resultArea');
+  if (!document.getElementById('ggl-prompt').value.trim()) { alert('请输入 Prompt'); return; }
+  btn.disabled = true; btn.textContent = '⏳ 生成中...';
+  resultArea.innerHTML = '<div class="placeholder">请求中，图片生成通常 15-60s...</div>';
+  log('ggl', '--- 新请求 ---');
+
+  try {
+    log('ggl', `POST /v1/chat/completions (stream) model=${document.getElementById('ggl-model').value}`);
+    const { content, inlineImages } = await gglChatStream();
+
+    // 1. Inline images from parts
+    if (inlineImages.length > 0) {
+      const img = inlineImages[0];
+      resultArea.innerHTML = `<img src="data:${img.mime_type};base64,${img.data}" alt="generated">`;
+      log('ggl', 'Image displayed from inline_data', 'ok');
+      return;
+    }
+
+    // 2. data:image URI in content
+    const dataUriMatch = content.match(/data:image\/([^;]+);base64,([A-Za-z0-9+/=]+)/);
+    if (dataUriMatch) {
+      resultArea.innerHTML = `<img src="data:image/${dataUriMatch[1]};base64,${dataUriMatch[2]}" alt="generated">`;
+      log('ggl', 'Image extracted from data URI', 'ok');
+      return;
+    }
+
+    // 3. Raw base64
+    if (content.length > 1000 && /^[A-Za-z0-9+/=\s\r\n]+$/.test(content)) {
+      const clean = content.replace(/[\s\r\n]/g, '');
+      resultArea.innerHTML = `<img src="data:image/png;base64,${clean}" alt="generated">`;
+      log('ggl', `Image extracted as raw base64 (${clean.length} chars)`, 'ok');
+      return;
+    }
+
+    // 4. URL
+    const urlMatch = content.match(/https?:\/\/[^\s"']+/);
+    if (urlMatch) {
+      resultArea.innerHTML = `<img src="${urlMatch[0]}" alt="generated">`;
+      log('ggl', `Image URL: ${urlMatch[0]}`, 'ok');
+      return;
+    }
+
+    // 5. Text only
+    log('ggl', 'No image found in response', 'warn');
+    resultArea.innerHTML = `<div style="color:#e0e0e0;padding:20px;text-align:left;white-space:pre-wrap;font-size:14px">${content}</div>`;
+  } catch (e) {
+    log('ggl', `Error: ${e.message}`, 'err');
+    resultArea.innerHTML = `<div class="placeholder" style="color:#ff6b6b">❌ ${e.message}</div>`;
+  } finally {
+    btn.disabled = false; btn.textContent = '🚀 生成图片';
+  }
+}
+
+// ---- Shared: display chat result ----
+function displayChatResult(prefix, content, resultArea) {
+  // 1. data:image URI
+  const dataUriMatch = content.match(/data:image\/([^;]+);base64,([A-Za-z0-9+/=]+)/);
+  if (dataUriMatch) {
+    resultArea.innerHTML = `<img src="data:image/${dataUriMatch[1]};base64,${dataUriMatch[2]}" alt="generated">`;
+    log(prefix, 'Image from data URI', 'ok');
+    return;
+  }
+  // 2. Raw base64
+  if (content.length > 1000 && /^[A-Za-z0-9+/=\s\r\n]+$/.test(content)) {
+    const clean = content.replace(/[\s\r\n]/g, '');
+    resultArea.innerHTML = `<img src="data:image/png;base64,${clean}" alt="generated">`;
+    log(prefix, `Raw base64 (${clean.length} chars)`, 'ok');
+    return;
+  }
+  // 3. URL
+  const urlMatch = content.match(/https?:\/\/[^\s"']+/);
+  if (urlMatch) {
+    resultArea.innerHTML = `<img src="${urlMatch[0]}" alt="generated">`;
+    log(prefix, `URL: ${urlMatch[0]}`, 'ok');
+    return;
+  }
+  // 4. Text
+  log(prefix, 'No image found', 'warn');
+  resultArea.innerHTML = `<div style="color:#e0e0e0;padding:20px;text-align:left;white-space:pre-wrap;font-size:14px">${content}</div>`;
+}
+</script>
+</body>
+</html>

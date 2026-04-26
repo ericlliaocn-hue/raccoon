@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from src.brain.live_benchmark_runner import _build_gate, _summarize_records
+import asyncio
+
+from src.brain import live_benchmark_runner as live_runner
+from src.brain.live_benchmark_runner import _build_gate, _run_case_with_timeout, _summarize_records
 
 
 def test_live_benchmark_summary_and_gate():
@@ -59,3 +62,15 @@ def test_live_benchmark_summary_and_gate():
     assert gate["gates"]["execution_success_rate_ok"] is False
     assert gate["pass"] is False
 
+
+def test_live_runner_case_timeout_returns_timeout_failure(monkeypatch):
+    class SlowEngine:
+        async def learn(self, task, prompt):
+            await asyncio.sleep(0.02)
+            return {"learning_run_id": "x"}
+
+    monkeypatch.setattr(live_runner, "CASE_TIMEOUT_SECONDS", 0.001)
+    result, failure_code = asyncio.run(_run_case_with_timeout(SlowEngine(), object(), "hello"))
+
+    assert failure_code == "benchmark_case_timeout"
+    assert result["learning_run_id"] == ""

@@ -1,0 +1,192 @@
+{
+  "pack_id": "open_world_v1",
+  "type": "open_world",
+  "description": "开放世界泛化样本（真实外站 + 长链路 + 缺参扰动）",
+  "cases": [
+    {
+      "case_id": "ow_daily_001",
+      "scenario_id": "daily_brief",
+      "input_complete": true,
+      "prompt": "给我一份今天 AI 和半导体的盘前简报，列出来源和更新时间。"
+    },
+    {
+      "case_id": "ow_daily_002",
+      "scenario_id": "daily_brief",
+      "input_complete": true,
+      "prompt": "整理今天最重要的 5 条 AI 技术新闻，按来源链接输出。"
+    },
+    {
+      "case_id": "ow_daily_003",
+      "scenario_id": "daily_brief",
+      "input_complete": true,
+      "prompt": "做一份今日科技早报，重点关注模型发布、算力和融资。"
+    },
+    {
+      "case_id": "ow_daily_004",
+      "scenario_id": "daily_brief",
+      "input_complete": false,
+      "prompt": "帮我整理一下。"
+    },
+    {
+      "case_id": "ow_daily_005",
+      "scenario_id": "daily_brief",
+      "input_complete": false,
+      "prompt": "来个简报，但我暂时不说主题。"
+    },
+
+    {
+      "case_id": "ow_price_001",
+      "scenario_id": "price_monitor",
+      "input_complete": true,
+      "prompt": "监控 https://item.jd.com/100012043978.html，降到 4299 立刻提醒。"
+    },
+    {
+      "case_id": "ow_price_002",
+      "scenario_id": "price_monitor",
+      "input_complete": true,
+      "prompt": "请监控 sku=100012043978 的库存恢复并通知我。"
+    },
+    {
+      "case_id": "ow_price_003",
+      "scenario_id": "price_monitor",
+      "input_complete": true,
+      "prompt": "盯一下 iPhone 16 Pro 256G 的价格波动，有变化就提醒。"
+    },
+    {
+      "case_id": "ow_price_004",
+      "scenario_id": "price_monitor",
+      "input_complete": false,
+      "prompt": "给我监控这个商品，降价就说。"
+    },
+    {
+      "case_id": "ow_price_005",
+      "scenario_id": "price_monitor",
+      "input_complete": false,
+      "prompt": "监控一下，后面我再给目标。"
+    },
+
+    {
+      "case_id": "ow_login_001",
+      "scenario_id": "login_form_chain",
+      "input_complete": true,
+      "prompt": "后台模式 登录 https://the-internet.herokuapp.com/login ，账号 tomsmith 密码 SuperSecretPassword! 登录后截图。"
+    },
+    {
+      "case_id": "ow_login_002",
+      "scenario_id": "login_form_chain",
+      "input_complete": true,
+      "prompt": "登录 https://httpbin.org/forms/post ，填表后提交并截图。"
+    },
+    {
+      "case_id": "ow_login_003",
+      "scenario_id": "login_form_chain",
+      "input_complete": true,
+      "prompt": "打开 https://the-internet.herokuapp.com/login，完成登录并继续提交流程，失败可从 checkpoint 续跑。"
+    },
+    {
+      "case_id": "ow_login_004",
+      "scenario_id": "login_form_chain",
+      "input_complete": false,
+      "prompt": "帮我登录后台并提交流程。"
+    },
+    {
+      "case_id": "ow_login_005",
+      "scenario_id": "login_form_chain",
+      "input_complete": false,
+      "prompt": "登录操作先准备着，网址我一会儿给。"
+    },
+
+    {
+      "case_id": "ow_material_001",
+      "scenario_id": "material_collection",
+      "input_complete": true,
+      "prompt": "收集本周 AI 爆款素材并去重，按平台输出。"
+    },
+    {
+      "case_id": "ow_material_002",
+      "scenario_id": "material_collection",
+      "input_complete": true,
+      "prompt": "抓取多源热门内容做素材池，按主题聚类并标注来源。"
+    },
+    {
+      "case_id": "ow_material_003",
+      "scenario_id": "material_collection",
+      "input_complete": true,
+      "prompt": "采集短视频选题素材 20 条，要求去重后给我。"
+    },
+    {
+      "case_id": "ow_material_004",
+      "scenario_id": "material_collection",
+      "input_complete": false,
+      "prompt": "找点素材。"
+    },
+    {
+      "case_id": "ow_material_005",
+      "scenario_id": "material_collection",
+      "input_complete": false,
+      "prompt": "做素材采集，但先不定主题。"
+    },
+
+    {
+      "case_id": "ow_schedule_001",
+      "scenario_id": "reminder_schedule",
+      "input_complete": true,
+      "prompt": "每个工作日 09:30 提醒我检查客户回复。"
+    },
+    {
+      "case_id": "ow_schedule_002",
+      "scenario_id": "reminder_schedule",
+      "input_complete": true,
+      "prompt": "每周五 18:00 提醒我复盘本周失败案例。"
+    },
+    {
+      "case_id": "ow_schedule_003",
+      "scenario_id": "reminder_schedule",
+      "input_complete": true,
+      "prompt": "cron 30 8 * * 1-5 提醒我看盘前信息。"
+    },
+    {
+      "case_id": "ow_schedule_004",
+      "scenario_id": "reminder_schedule",
+      "input_complete": false,
+      "prompt": "帮我设个提醒。"
+    },
+    {
+      "case_id": "ow_schedule_005",
+      "scenario_id": "reminder_schedule",
+      "input_complete": false,
+      "prompt": "提醒功能先准备，时间我晚点补。"
+    },
+
+    {
+      "case_id": "ow_remote_001",
+      "scenario_id": "remote_exec",
+      "input_complete": true,
+      "prompt": "先审批，再执行 `pwd` 并返回结果。"
+    },
+    {
+      "case_id": "ow_remote_002",
+      "scenario_id": "remote_exec",
+      "input_complete": true,
+      "prompt": "审批后执行 `df -h`，把磁盘空间摘要给我。"
+    },
+    {
+      "case_id": "ow_remote_003",
+      "scenario_id": "remote_exec",
+      "input_complete": true,
+      "prompt": "请先审批，再执行磁盘空间检查命令并返回。"
+    },
+    {
+      "case_id": "ow_remote_004",
+      "scenario_id": "remote_exec",
+      "input_complete": false,
+      "prompt": "先审批，帮我执行一下。"
+    },
+    {
+      "case_id": "ow_remote_005",
+      "scenario_id": "remote_exec",
+      "input_complete": false,
+      "prompt": "远程执行先安排，命令稍后补。"
+    }
+  ]
+}

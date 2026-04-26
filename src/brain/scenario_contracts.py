@@ -113,8 +113,24 @@ def evaluate_execution_contract(
         return True, None
 
     if scenario_id == "login_form_chain":
-        has_submit_signal = any(token in text for token in ("登录成功", "提交成功", "上传成功", "submit", "login"))
         checkpoints = artifacts.get("checkpoints")
+        checkpoint_rows = checkpoints if isinstance(checkpoints, list) else []
+        has_submit_checkpoint = any(
+            isinstance(row, dict)
+            and row.get("stage") == "after"
+            and row.get("success") is True
+            and (
+                "submit" in str(row.get("checkpoint_key") or "").lower()
+                or (
+                    str(row.get("action") or "").lower() in {"click", "press_key"}
+                    and "login" in str(row.get("url") or "").lower()
+                )
+            )
+            for row in checkpoint_rows
+        )
+        has_submit_signal = has_submit_checkpoint or any(
+            token in text for token in ("登录成功", "提交成功", "上传成功", "submit", "login")
+        )
         has_checkpoint = bool(checkpoints) or any(
             token in text for token in ("checkpoint", "恢复", "续跑", "resume")
         )
